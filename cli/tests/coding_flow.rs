@@ -14,9 +14,7 @@ fn headless_mock_run_completes_plan_implement_review_flow() {
     let cfg_path = dir.path().join("config.json");
     let sandbox_dir = tempfile::tempdir().unwrap();
 
-    let turn = |content: serde_json::Value| {
-        serde_json::json!({ "content": content.to_string() })
-    };
+    let turn = |content: serde_json::Value| serde_json::json!({ "content": content.to_string() });
 
     let mock_script = vec![
         // 1. router
@@ -84,18 +82,17 @@ fn headless_mock_run_completes_plan_implement_review_flow() {
     });
 
     let mut file = std::fs::File::create(&cfg_path).unwrap();
-    file.write_all(serde_json::to_string(&cfg).unwrap().as_bytes()).unwrap();
+    file.write_all(serde_json::to_string(&cfg).unwrap().as_bytes())
+        .unwrap();
     drop(file);
 
     let output = Command::new(bin())
         .args([
             "--config",
             cfg_path.to_str().unwrap(),
-            "run",
-            "--headless",
             "--skill",
             "router",
-            "--message",
+            "-p",
             "create hello.txt",
         ])
         .output()

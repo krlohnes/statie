@@ -157,9 +157,12 @@ mod tests {
     #[test]
     fn append_and_entries_kind_filter() {
         let log = MemoryLog::new();
-        log.append(entry(1, LogKind::User, json!({"text": "hi"}))).unwrap();
-        log.append(entry(1, LogKind::System, json!({"text": "note"}))).unwrap();
-        log.append(entry(2, LogKind::User, json!({"text": "there"}))).unwrap();
+        log.append(entry(1, LogKind::User, json!({"text": "hi"})))
+            .unwrap();
+        log.append(entry(1, LogKind::System, json!({"text": "note"})))
+            .unwrap();
+        log.append(entry(2, LogKind::User, json!({"text": "there"})))
+            .unwrap();
 
         let all = log.entries(None, 10);
         assert_eq!(all.len(), 3);
@@ -180,10 +183,18 @@ mod tests {
     #[test]
     fn search_is_case_insensitive_substring_over_payload() {
         let log = MemoryLog::new();
-        log.append(entry(1, LogKind::ToolOutput, json!({"text": "The Quick Brown Fox"})))
-            .unwrap();
-        log.append(entry(2, LogKind::ToolOutput, json!({"text": "nothing relevant"})))
-            .unwrap();
+        log.append(entry(
+            1,
+            LogKind::ToolOutput,
+            json!({"text": "The Quick Brown Fox"}),
+        ))
+        .unwrap();
+        log.append(entry(
+            2,
+            LogKind::ToolOutput,
+            json!({"text": "nothing relevant"}),
+        ))
+        .unwrap();
 
         let hits = log.search("quick brown", None, 10);
         assert_eq!(hits.len(), 1);

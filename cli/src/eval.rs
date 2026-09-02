@@ -13,7 +13,9 @@ use std::io::Write;
 use std::sync::Arc;
 
 use statie_augment::TranscriptAugmenter;
-use statie_core::{MemoryLog, SandboxRoot, Session, SessionConfig, SessionLog, TiktokenTokenizer, TokenBudget};
+use statie_core::{
+    MemoryLog, SandboxRoot, Session, SessionConfig, SessionLog, TiktokenTokenizer, TokenBudget,
+};
 use statie_skills::ToyWorkspace;
 use statie_tui::{HeadlessSummary, RunOptions, SkillRegistry};
 
@@ -103,8 +105,8 @@ pub async fn cmd_eval(
     let filter = std::env::var("STATIE_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "warn".to_string());
-    let env_filter =
-        tracing_subscriber::EnvFilter::try_new(filter).unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let env_filter = tracing_subscriber::EnvFilter::try_new(filter)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
@@ -134,16 +136,39 @@ pub async fn cmd_eval(
 fn print_table(result: &EvalResult) {
     println!(
         "{:<10} {:>6} {:>8} {:>10} {:>8} {:>11} {:>9} {:>8} {:>11} {:>15}",
-        "harness", "steps", "success", "est_total", "est_max", "est_growth", "srv_total", "srv_max",
-        "srv_growth", "srv_completion"
+        "harness",
+        "steps",
+        "success",
+        "est_total",
+        "est_max",
+        "est_growth",
+        "srv_total",
+        "srv_max",
+        "srv_growth",
+        "srv_completion"
     );
     for (name, m) in [("statie", &result.statie), ("baseline", &result.baseline)] {
         let has_server = !m.server_prompt_tokens.is_empty();
-        let srv_total = if has_server { m.server_total_prompt_tokens.to_string() } else { "-".to_string() };
-        let srv_max = if has_server { m.server_max_prompt_tokens.to_string() } else { "-".to_string() };
-        let srv_growth = if has_server { m.server_growth.to_string() } else { "-".to_string() };
-        let srv_completion =
-            if has_server { m.server_total_completion_tokens.to_string() } else { "-".to_string() };
+        let srv_total = if has_server {
+            m.server_total_prompt_tokens.to_string()
+        } else {
+            "-".to_string()
+        };
+        let srv_max = if has_server {
+            m.server_max_prompt_tokens.to_string()
+        } else {
+            "-".to_string()
+        };
+        let srv_growth = if has_server {
+            m.server_growth.to_string()
+        } else {
+            "-".to_string()
+        };
+        let srv_completion = if has_server {
+            m.server_total_completion_tokens.to_string()
+        } else {
+            "-".to_string()
+        };
         println!(
             "{:<10} {:>6} {:>8} {:>10} {:>8} {:>11} {:>9} {:>8} {:>11} {:>15}",
             name,
@@ -221,12 +246,19 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
         initial_skill: "toy".to_string(),
         initial_messages: vec!["start".to_string()],
         max_autonomous_steps: cfg.max_autonomous_steps,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
     };
     let mut sink_a = transcript_sink(verbose);
     let summary_a = statie_tui::run_headless(session_a, registry_a, opts_a, &mut sink_a).await?;
     let success_a = {
         let state = &summary_a.final_state;
-        let counter = state.pointer("/agent/counter").and_then(|v| v.as_u64()).unwrap_or(0);
+        let counter = state
+            .pointer("/agent/counter")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         counter >= steps && summary_a.final_outcome == "done"
     };
 
@@ -252,12 +284,19 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
         initial_skill: "toy".to_string(),
         initial_messages: vec!["start".to_string()],
         max_autonomous_steps: cfg.max_autonomous_steps,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
     };
     let mut sink_b = transcript_sink(verbose);
     let summary_b = statie_tui::run_headless(session_b, registry_b, opts_b, &mut sink_b).await?;
     let success_b = {
         let state = &summary_b.final_state;
-        let counter = state.pointer("/agent/counter").and_then(|v| v.as_u64()).unwrap_or(0);
+        let counter = state
+            .pointer("/agent/counter")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         counter >= steps && summary_b.final_outcome == "done"
     };
 
@@ -267,8 +306,7 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
     })
 }
 
-const CODING_TASK_MESSAGE: &str =
-    "Create a file named hello.txt in the repository root containing exactly the line: hello statie";
+const CODING_TASK_MESSAGE: &str = "Create a file named hello.txt in the repository root containing exactly the line: hello statie";
 
 fn coding_success(sandbox: &std::path::Path, outcome: &str) -> bool {
     if outcome != "done" {
@@ -295,11 +333,16 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
         Box::new(TiktokenTokenizer),
         statie_session_config(cfg, root_a),
     );
-    let registry_a: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> = Arc::new(CodingRegistry::new());
+    let registry_a: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> =
+        Arc::new(CodingRegistry::new());
     let opts_a = RunOptions {
         initial_skill: "router".to_string(),
         initial_messages: vec![CODING_TASK_MESSAGE.to_string()],
         max_autonomous_steps: cfg.max_autonomous_steps,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
     };
     let mut sink_a = transcript_sink(verbose);
     let summary_a = statie_tui::run_headless(session_a, registry_a, opts_a, &mut sink_a).await?;
@@ -322,11 +365,16 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
         Box::new(TranscriptAugmenter::new(Arc::clone(&log_b))),
         TokenBudget(UNBOUNDED_BUDGET),
     );
-    let registry_b: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> = Arc::new(CodingRegistry::new());
+    let registry_b: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> =
+        Arc::new(CodingRegistry::new());
     let opts_b = RunOptions {
         initial_skill: "router".to_string(),
         initial_messages: vec![CODING_TASK_MESSAGE.to_string()],
         max_autonomous_steps: cfg.max_autonomous_steps,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
     };
     let mut sink_b = transcript_sink(verbose);
     let summary_b = statie_tui::run_headless(session_b, registry_b, opts_b, &mut sink_b).await?;

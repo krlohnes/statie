@@ -5,12 +5,17 @@ edition.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+globset.workspace = true
+regex.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 statie-core = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "time", "macros", "rt-multi-thread"] }
 tokio-util.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -5,8 +5,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::version::Version;
 use crate::error::PatchError;
+use crate::version::Version;
 
 /// The parsed `patch` field: syntactically schema-shaped JSON, not yet
 /// applied.

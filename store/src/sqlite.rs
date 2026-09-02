@@ -188,7 +188,12 @@ where
             .execute(
                 "UPDATE state SET version = ?1, harness = ?2, agent = ?3 \
                  WHERE id = 1 AND version = ?4",
-                params![new_version.0 as i64, harness_json, agent_json, expect.0 as i64],
+                params![
+                    new_version.0 as i64,
+                    harness_json,
+                    agent_json,
+                    expect.0 as i64
+                ],
             )
             .map_err(backend_err)?;
 
@@ -217,7 +222,13 @@ where
         tx.execute(
             "INSERT INTO patch_log (version, patch, action, harness, ts) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![new_version.0 as i64, patch_json, action_json, harness_json, ts],
+            params![
+                new_version.0 as i64,
+                patch_json,
+                action_json,
+                harness_json,
+                ts
+            ],
         )
         .map_err(backend_err)?;
 
@@ -264,11 +275,9 @@ where
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
 
         let initial_json: Option<String> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'initial'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT value FROM meta WHERE key = 'initial'", [], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(backend_err)?;
         let Some(initial_json) = initial_json else {

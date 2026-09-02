@@ -1,6 +1,7 @@
 //! The session loop: `Session<W>`, activation typestate (`Active<'a, K>`),
 //! and the `step` algorithm (ARCHITECTURE.md "Loop, session, activation").
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -19,6 +20,11 @@ use crate::store::{LoggedPatch, StateStore, apply_fn};
 use crate::tokenizer::{Budgets, TokenBudget, Tokenizer};
 use crate::tool::ToolSet;
 use crate::version::{CommittedState, HarnessState, InboxItem, Version};
+
+/// How many recent committed tool calls the loop guard remembers when
+/// looking for repeated (name, args, output) triples, including
+/// alternating patterns (e.g. A/B/A/B), not just consecutive repeats.
+const TOOL_CALL_HISTORY: usize = 8;
 
 /// A cloneable, shareable handle that can cancel the in-flight `step()`
 /// call. A fresh `CancellationToken` is installed at the start of every
@@ -66,9 +72,11 @@ pub struct Session<W> {
     pub(crate) tokenizer: Box<dyn Tokenizer>,
     pub(crate) config: SessionConfig,
     pending_observation: Option<Observation>,
-    /// (tool name, args, output) of the last tool call and how many times in
-    /// a row it has recurred identically; used to warn the model about loops.
-    last_tool_call: Option<(String, Value, String, u32)>,
+    /// (tool name, args, output) of the last `TOOL_CALL_HISTORY` committed
+    /// tool calls, most-recent-last; used to warn the model when a call
+    /// recurs identically, whether consecutively or in an alternating
+    /// pattern (e.g. A/B/A/B).
+    recent_tool_calls: VecDeque<(String, Value, String)>,
     last_prompt_tokens: Option<usize>,
     last_usage: Option<Usage>,
     failures: u32,
@@ -94,7 +102,7 @@ impl<W> Session<W> {
             tokenizer,
             config,
             pending_observation: None,
-            last_tool_call: None,
+            recent_tool_calls: VecDeque::new(),
             last_prompt_tokens: None,
             last_usage: None,
             failures: 0,
@@ -168,6 +176,7 @@ impl<W> Session<W> {
                         active_tools: skill.tools(),
                         inbox: Vec::new(),
                         step: 0,
+                        last_overflow: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -205,19 +214,12 @@ impl<W> Session<W> {
     }
 
     pub async fn state(&self) -> Result<(CommittedState<W>, Version), SessionError> {
-        self.store
-            .load()
-            .await?
-            .ok_or(SessionError::NoActivation)
+        self.store.load().await?.ok_or(SessionError::NoActivation)
     }
 
     /// Appends a user message to the inbox and logs it.
     pub async fn push_user(&mut self, text: String) -> Result<(), SessionError> {
-        let (cur, _version) = self
-            .store
-            .load()
-            .await?
-            .ok_or(SessionError::NoActivation)?;
+        let (cur, _version) = self.store.load().await?.ok_or(SessionError::NoActivation)?;
         let mut harness = cur.harness;
         let next_id = harness.inbox.iter().map(|i| i.id).max().unwrap_or(0) + 1;
         harness.inbox.push(InboxItem {
@@ -328,12 +330,7 @@ where
         for (augmenter, budget) in &self.session.augmenters {
             let budget = TokenBudget(budget.0);
             let mut got = augmenter
-                .augment(
-                    &cur.agent,
-                    obs_ref,
-                    budget,
-                    self.session.tokenizer.as_ref(),
-                )
+                .augment(&cur.agent, obs_ref, budget, self.session.tokenizer.as_ref())
                 .await;
             snippets.append(&mut got);
         }
@@ -368,16 +365,32 @@ where
         let agent_state = AgentState::new(&cur.agent);
         let harness_view = HarnessView::new(&cur.harness);
 
-        let mut builder = PromptBuilder::new(self.session.tokenizer.as_ref(), cur.harness.budgets, version)
-            .system(&system_prompt)
-            .spec(&self.spec)
-            .tools(&tool_list)
-            .agent(&agent_state)
-            .harness(&harness_view);
+        let mut builder = PromptBuilder::new(
+            self.session.tokenizer.as_ref(),
+            cur.harness.budgets,
+            version,
+        )
+        .system(&system_prompt)
+        .spec(&self.spec)
+        .tools(&tool_list)
+        .agent(&agent_state)
+        .harness(&harness_view);
         if let Some(aug) = &augmentation {
             builder = builder.augmentation(aug);
         }
-        let pending_obs = self.session.pending_observation.take();
+        // Clamp defensively before handing the observation to the builder:
+        // `truncate` already bounds fresh tool output, but harness-authored
+        // messages (`rejection`, `tool_aborted`, ...) are never truncated at
+        // construction time and a long one (e.g. a tool error carrying
+        // stderr, or an unknown-tool name) could otherwise exceed the
+        // section budget and fail the step. The builder's per-section check
+        // stays strict as the real invariant; this is what keeps it true.
+        let pending_obs = self.session.pending_observation.take().map(|obs| {
+            obs.clamp(
+                cur.harness.budgets.observation,
+                self.session.tokenizer.as_ref(),
+            )
+        });
         if let Some(obs) = &pending_obs {
             builder = builder.observation(obs);
         }
@@ -408,6 +421,7 @@ where
         // Recorded immediately after the model call, before parsing, so a
         // rejected output still counts toward real cost per model call.
         self.session.last_usage = raw.usage;
+        let finish_reason = raw.finish_reason.clone();
 
         if let Some(reasoning) = &raw.reasoning {
             entries.push(LogEntry {
@@ -422,10 +436,25 @@ where
         // diagnosed from the session log alone (it never re-enters a prompt).
         let raw_content = raw.content.clone();
         let parsed: ParsedOutput<K::Workspace> =
-            match ParsedOutput::parse::<K::Patch>(raw) {
-                Ok(p) => p,
+            match ParsedOutput::parse_with_fixes::<K::Patch>(raw) {
+                Ok((p, fixes)) => {
+                    if !fixes.is_empty() {
+                        entries.push(system_entry(
+                            step_at_start,
+                            "normalized",
+                            serde_json::json!({"fixes": fixes}),
+                        ));
+                    }
+                    p
+                }
                 Err(e) => {
-                    return Ok(self.reject(entries, step_at_start, e.to_string(), &raw_content));
+                    return Ok(self.reject(
+                        entries,
+                        step_at_start,
+                        e.to_string(),
+                        &raw_content,
+                        finish_reason.as_deref(),
+                    ));
                 }
             };
 
@@ -433,14 +462,20 @@ where
         let validated: ValidatedStep<K::Workspace> = match self.skill.validate(&cur, parsed) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(self.reject(entries, step_at_start, e.to_string(), &raw_content));
+                return Ok(self.reject(entries, step_at_start, e.to_string(), &raw_content, None));
             }
         };
 
         // 8. Commit (B1 stale-version check first).
         let (patch, action, acks) = validated.into_parts();
         if patch.version() != version {
-            return Ok(self.reject(entries, step_at_start, "stale version".to_string(), &raw_content));
+            return Ok(self.reject(
+                entries,
+                step_at_start,
+                "stale version".to_string(),
+                &raw_content,
+                None,
+            ));
         }
 
         let mut next_harness = cur.harness.clone();
@@ -465,7 +500,10 @@ where
         if let Some(usage) = self.session.last_usage
             && let Value::Object(map) = &mut patch_payload
         {
-            map.insert("usage".to_string(), serde_json::to_value(usage).unwrap_or(Value::Null));
+            map.insert(
+                "usage".to_string(),
+                serde_json::to_value(usage).unwrap_or(Value::Null),
+            );
         }
         entries.push(LogEntry {
             step: next_harness.step,
@@ -500,7 +538,11 @@ where
         match executable.into_inner() {
             Action::Tool { name, args } => {
                 // A missing/null `args` means "no arguments".
-                let args = if args.is_null() { Value::Object(Default::default()) } else { args };
+                let args = if args.is_null() {
+                    Value::Object(Default::default())
+                } else {
+                    args
+                };
                 let Some(tool) = self.session.tools.get(&name) else {
                     entries.push(system_entry(
                         step,
@@ -550,30 +592,58 @@ where
                         } else {
                             full.as_ref().to_string()
                         };
-                        // Loop guard: identical call + identical output, repeatedly.
-                        let repeats = match &mut self.session.last_tool_call {
-                            Some((n, a, o, count)) if *n == name && *a == args && *o == full.as_ref() => {
-                                *count += 1;
-                                *count
-                            }
-                            other => {
-                                *other = Some((name.clone(), args.clone(), full.as_ref().to_string(), 1));
-                                1
-                            }
-                        };
-                        if repeats >= 3 {
+                        // Loop guard: identical (name, args, output) triple recurring within
+                        // the recent-history window, whether consecutively or alternating
+                        // (e.g. A/B/A/B).
+                        let current = (name.clone(), args.clone(), full.as_ref().to_string());
+                        let prior_occurrences = self
+                            .session
+                            .recent_tool_calls
+                            .iter()
+                            .filter(|entry| **entry == current)
+                            .count();
+                        if prior_occurrences >= 2 {
+                            let occurrence = prior_occurrences + 1;
                             text.push_str(&format!(
-                                "\n\n[harness] This is call #{repeats} of `{name}` with identical \
-                                 arguments and identical output; nothing has changed. Record what you \
-                                 learned in the workspace and take a different action."
+                                "\n\n[harness] This is occurrence #{occurrence} of `{name}` with \
+                                 identical arguments and identical output within the last \
+                                 {TOOL_CALL_HISTORY} tool calls; nothing has changed. Record what \
+                                 you learned in the workspace and take a different action (if the \
+                                 work is finished, hand off with `next_skill` or set the terminal \
+                                 field)."
                             ));
                         }
-                        let obs = Observation::truncate(
+                        self.session.recent_tool_calls.push_back(current);
+                        if self.session.recent_tool_calls.len() > TOOL_CALL_HISTORY {
+                            self.session.recent_tool_calls.pop_front();
+                        }
+                        let (obs, overflow) = Observation::truncate_with_report(
                             &crate::promptable::ToolOutputFull::new(text),
                             self.session.config.budgets.observation,
                             self.session.tokenizer.as_ref(),
                         );
                         self.session.pending_observation = Some(obs);
+
+                        // Persist a note in the harness view about whether
+                        // this tool's output overflowed the observation
+                        // budget, so the model is told persistently (not
+                        // just in the one prompt where the truncated
+                        // observation is shown).
+                        let note = overflow.map(|o| {
+                            format!(
+                                "step {step}: `{name}` output overflowed ({} chars, ~{} tokens > \
+                                 {} budget); only the head and tail were shown. Narrow the next \
+                                 call or use `filter_last_tool_call`.",
+                                o.total_chars,
+                                o.total_tokens,
+                                self.session.config.budgets.observation
+                            )
+                        });
+                        let (cur, _version) = self.session.state().await?;
+                        let mut harness = cur.harness;
+                        harness.last_overflow = note;
+                        self.session.store.set_harness(harness).await?;
+
                         Ok(Outcome::Continue)
                     }
                     Some(Err(e)) => {
@@ -607,21 +677,46 @@ where
         step: u64,
         reason: String,
         raw_content: &str,
+        finish_reason: Option<&str>,
     ) -> StepRecord {
+        let reason = match finish_reason {
+            Some("length") => {
+                let completion_tokens = self
+                    .session
+                    .last_usage
+                    .map(|u| u.completion_tokens)
+                    .unwrap_or(0);
+                format!(
+                    "{reason}; the server cut the output off (done_reason=length after \
+                     {completion_tokens} tokens). Write less per step: use edit_file for a \
+                     small change instead of write_file for a whole file, or split the file \
+                     across steps."
+                )
+            }
+            Some(other) if other != "stop" => format!("{reason} (done_reason={other})"),
+            _ => reason,
+        };
         self.session.pending_observation = Some(Observation::rejection(&reason));
         self.session.failures += 1;
-        let content: String = raw_content.chars().take(4000).collect();
+        let content: String = raw_content.chars().take(16000).collect();
         let mut rejected_payload = serde_json::json!({"reason": reason, "content": content});
         if let Some(usage) = self.session.last_usage
             && let Value::Object(map) = &mut rejected_payload
         {
-            map.insert("usage".to_string(), serde_json::to_value(usage).unwrap_or(Value::Null));
+            map.insert(
+                "usage".to_string(),
+                serde_json::to_value(usage).unwrap_or(Value::Null),
+            );
         }
         entries.push(system_entry(step, "rejected", rejected_payload));
 
         if self.session.failures > self.session.config.retries {
             self.session.failures = 0;
-            entries.push(system_entry(step, "failure", serde_json::json!({"reason": reason})));
+            entries.push(system_entry(
+                step,
+                "failure",
+                serde_json::json!({"reason": reason}),
+            ));
             StepRecord::new(entries, Outcome::Parked(Park::Failure(reason)))
         } else {
             StepRecord::new(entries, Outcome::Continue)

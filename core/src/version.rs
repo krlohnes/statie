@@ -32,6 +32,12 @@ pub struct HarnessState {
     pub activation: String,
     /// Committed step counter.
     pub step: u64,
+    /// Set when the most recent tool output overflowed the observation
+    /// budget and had to be truncated; cleared back to `None` once a tool
+    /// output fits. `#[serde(default)]` so state persisted before this
+    /// field existed still deserializes.
+    #[serde(default)]
+    pub last_overflow: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

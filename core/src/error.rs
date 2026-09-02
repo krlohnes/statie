@@ -97,4 +97,3 @@ pub enum SessionError {
     #[error("io error: {0}")]
     Io(String),
 }
-

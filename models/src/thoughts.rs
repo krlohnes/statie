@@ -43,8 +43,9 @@ mod tests {
 
     #[test]
     fn with_block_extracts_reasoning_and_remainder() {
-        let (reasoning, content) =
-            strip_thoughts("<thoughts>hmm</thoughts>\n{\"patch\":{},\"action\":{\"type\":\"yield\"}}");
+        let (reasoning, content) = strip_thoughts(
+            "<thoughts>hmm</thoughts>\n{\"patch\":{},\"action\":{\"type\":\"yield\"}}",
+        );
         assert_eq!(reasoning.expect("reasoning").as_ref(), "hmm");
         assert_eq!(content, r#"{"patch":{},"action":{"type":"yield"}}"#);
     }

@@ -118,8 +118,7 @@ mod tests {
         })
         .to_string();
         let raw = RawOutput::new(Version(3), None, content);
-        let parsed =
-            statie_core::ParsedOutput::<Ws>::parse::<Typed<Ws, WsOp>>(raw).unwrap();
+        let parsed = statie_core::ParsedOutput::<Ws>::parse::<Typed<Ws, WsOp>>(raw).unwrap();
         assert_eq!(parsed.version(), Version(3));
         assert!(matches!(parsed.action(), Action::Yield));
     }

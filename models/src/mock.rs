@@ -13,13 +13,20 @@ use statie_core::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// One scripted model response.
+/// One scripted model response, or a scripted failure.
 #[derive(Clone, Debug)]
 pub struct MockTurn {
     pub reasoning: Option<String>,
     pub content: String,
     pub delay: Option<Duration>,
     pub usage: Option<Usage>,
+    /// When set, this turn fails with this message (wrapped as
+    /// `ModelError::Backend`) instead of returning `content`, e.g. to
+    /// simulate a network/IO failure talking to a model server.
+    pub error: Option<String>,
+    /// Why the (simulated) backend stopped generating, e.g. `"stop"` or
+    /// `"length"`. Default `None`.
+    pub finish_reason: Option<String>,
 }
 
 impl MockTurn {
@@ -29,6 +36,22 @@ impl MockTurn {
             content: content.into(),
             delay: None,
             usage: None,
+            error: None,
+            finish_reason: None,
+        }
+    }
+
+    /// A turn that fails the `step` call with `ModelError::Backend(msg)`
+    /// instead of producing output, e.g. to simulate an unreachable model
+    /// server (`io error: error sending request for url (...)`).
+    pub fn error(msg: impl Into<String>) -> Self {
+        MockTurn {
+            reasoning: None,
+            content: String::new(),
+            delay: None,
+            usage: None,
+            error: Some(msg.into()),
+            finish_reason: None,
         }
     }
 
@@ -47,6 +70,11 @@ impl MockTurn {
             prompt_tokens,
             completion_tokens,
         });
+        self
+    }
+
+    pub fn with_finish_reason(mut self, reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(reason.into());
         self
     }
 }
@@ -181,6 +209,10 @@ impl Model for MockModel {
             }
         }
 
+        if let Some(msg) = &turn.error {
+            return Err(ModelError::Backend(msg.clone()));
+        }
+
         if let Some(reasoning) = &turn.reasoning {
             stream_in_chunks(reasoning, |chunk| sink.reasoning_delta(chunk));
         }
@@ -193,6 +225,9 @@ impl Model for MockModel {
         );
         if let Some(u) = turn.usage {
             out = out.with_usage(u);
+        }
+        if let Some(reason) = &turn.finish_reason {
+            out = out.with_finish_reason(reason.clone());
         }
         Ok(out)
     }

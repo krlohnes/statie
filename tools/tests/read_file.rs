@@ -16,10 +16,7 @@ async fn reads_a_whole_small_file() {
     std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
     let ctx = support::ctx_for(dir.path());
 
-    let out = tool()
-        .call(json!({"path": "f.txt"}), &ctx)
-        .await
-        .unwrap();
+    let out = tool().call(json!({"path": "f.txt"}), &ctx).await.unwrap();
     let text = out.to_string();
 
     assert!(text.starts_with("f.txt (5 lines, showing 1-5)\n"));

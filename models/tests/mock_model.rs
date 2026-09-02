@@ -39,6 +39,7 @@ fn build_prompt(version: Version) -> BoundedPrompt {
         budgets: budgets(),
         activation: "toy".to_string(),
         step: 0,
+        last_overflow: None,
     };
     let harness_view = HarnessView::new(&harness);
 
@@ -92,7 +93,10 @@ async fn scripted_turns_return_in_order_and_record_prompts() {
         .await
         .expect("first call succeeds");
     assert_eq!(out0.content, "first content");
-    assert_eq!(out0.reasoning.expect("reasoning").as_ref(), "first reasoning");
+    assert_eq!(
+        out0.reasoning.expect("reasoning").as_ref(),
+        "first reasoning"
+    );
 
     let p1 = build_prompt(Version(1));
     let out1 = model
@@ -100,7 +104,10 @@ async fn scripted_turns_return_in_order_and_record_prompts() {
         .await
         .expect("second call succeeds");
     assert_eq!(out1.content, "second content");
-    assert_eq!(out1.reasoning.expect("reasoning").as_ref(), "second reasoning");
+    assert_eq!(
+        out1.reasoning.expect("reasoning").as_ref(),
+        "second reasoning"
+    );
 
     let prompts = model.prompts();
     assert_eq!(prompts.len(), 2);
@@ -122,11 +129,8 @@ async fn scripted_turns_return_in_order_and_record_prompts() {
 
 #[tokio::test]
 async fn repeat_last_keeps_returning_final_turn() {
-    let model = MockModel::new(vec![
-        MockTurn::new("first"),
-        MockTurn::new("second"),
-    ])
-    .repeat_last(true);
+    let model =
+        MockModel::new(vec![MockTurn::new("first"), MockTurn::new("second")]).repeat_last(true);
     let schema = schema();
 
     for v in 0..2 {
@@ -174,7 +178,11 @@ async fn sink_sees_reassembled_deltas_in_at_least_two_content_chunks() {
     assert_eq!(sink.reasoning, "some reasoning text");
     assert_eq!(sink.content, "hello world content");
     assert_eq!(out.content, "hello world content");
-    assert!(sink.content_deltas >= 2, "expected >=2 content deltas, got {}", sink.content_deltas);
+    assert!(
+        sink.content_deltas >= 2,
+        "expected >=2 content deltas, got {}",
+        sink.content_deltas
+    );
 }
 
 #[tokio::test]
@@ -186,13 +194,23 @@ async fn with_usage_round_trips_to_raw_output() {
     let schema = schema();
 
     let out0 = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect("first call succeeds");
     assert!(out0.usage.is_none(), "usage = {:?}", out0.usage);
 
     let out1 = model
-        .step(build_prompt(Version(1)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(1)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect("second call succeeds");
     assert_eq!(
@@ -206,7 +224,9 @@ async fn with_usage_round_trips_to_raw_output() {
 
 #[tokio::test]
 async fn cancellation_during_delay_returns_cancelled_promptly() {
-    let model = MockModel::new(vec![MockTurn::new("late").with_delay(Duration::from_secs(5))]);
+    let model = MockModel::new(vec![
+        MockTurn::new("late").with_delay(Duration::from_secs(5)),
+    ]);
     let schema = schema();
     let cancel = CancellationToken::new();
 

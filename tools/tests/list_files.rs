@@ -34,6 +34,20 @@ async fn lists_exact_tree_skipping_noise_dirs() {
 }
 
 #[tokio::test]
+async fn skips_pycache_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    make_tree(dir.path());
+    std::fs::create_dir_all(dir.path().join("__pycache__")).unwrap();
+    std::fs::write(dir.path().join("__pycache__/mod.cpython-311.pyc"), "junk").unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool().call(json!({}), &ctx).await.unwrap();
+    let text = out.to_string();
+
+    assert!(!text.contains("__pycache__"), "output was:\n{text}");
+}
+
+#[tokio::test]
 async fn truncates_with_more_line() {
     let dir = tempfile::tempdir().unwrap();
     make_tree(dir.path());

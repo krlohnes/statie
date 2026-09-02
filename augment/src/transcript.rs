@@ -147,8 +147,12 @@ mod tests {
     #[tokio::test]
     async fn snippets_contain_user_patch_tool_output_in_order_and_never_reasoning() {
         let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
-        log.append(entry(1, LogKind::User, serde_json::json!({"id": 1, "text": "do the thing"})))
-            .unwrap();
+        log.append(entry(
+            1,
+            LogKind::User,
+            serde_json::json!({"id": 1, "text": "do the thing"}),
+        ))
+        .unwrap();
         log.append(entry(
             1,
             LogKind::Reasoning,
@@ -215,6 +219,9 @@ mod tests {
             .iter()
             .map(|s| tok.count(&format!("[{}]\n{}", s.source, s.text)))
             .sum();
-        assert!(total <= budget_tokens, "total {total} exceeded budget {budget_tokens}");
+        assert!(
+            total <= budget_tokens,
+            "total {total} exceeded budget {budget_tokens}"
+        );
     }
 }

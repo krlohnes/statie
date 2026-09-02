@@ -76,6 +76,8 @@ struct ChatError {
 struct ChatChoice {
     #[serde(default)]
     delta: ChatDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -96,7 +98,11 @@ impl OpenAiCompatModel {
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs))
             .build()
             .map_err(|e| ModelError::Backend(e.to_string()))?;
-        Ok(OpenAiCompatModel { cfg, api_key, client })
+        Ok(OpenAiCompatModel {
+            cfg,
+            api_key,
+            client,
+        })
     }
 
     fn chat_url(&self) -> String {
@@ -153,14 +159,18 @@ impl Model for OpenAiCompatModel {
             }
         }
 
-        let request_text = serde_json::to_string(&body).map_err(|e| ModelError::Io(e.to_string()))?;
-        tracing::debug!(chars = request_text.chars().count(), "openai-compat request");
+        let request_text =
+            serde_json::to_string(&body).map_err(|e| ModelError::Io(e.to_string()))?;
+        tracing::debug!(
+            chars = request_text.chars().count(),
+            "openai-compat request"
+        );
 
         tokio::select! {
             result = self.run_request(&body, sink) => result,
             _ = cancel.cancelled() => Err(ModelError::Cancelled),
         }
-        .map(|(reasoning_native, content, usage)| {
+        .map(|(reasoning_native, content, usage, finish_reason)| {
             let (reasoning, content) = if reasoning_native.is_some() {
                 (reasoning_native, content)
             } else {
@@ -169,6 +179,9 @@ impl Model for OpenAiCompatModel {
             let mut out = RawOutput::new(prompt.version(), reasoning, content);
             if let Some(u) = usage {
                 out = out.with_usage(u);
+            }
+            if let Some(reason) = finish_reason {
+                out = out.with_finish_reason(reason);
             }
             out
         })
@@ -180,13 +193,16 @@ impl OpenAiCompatModel {
         &self,
         body: &Value,
         sink: &mut dyn StepSink,
-    ) -> Result<(Option<Reasoning>, String, Option<Usage>), ModelError> {
+    ) -> Result<(Option<Reasoning>, String, Option<Usage>, Option<String>), ModelError> {
         let mut req = self.client.post(self.chat_url()).json(body);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
 
-        let response = req.send().await.map_err(|e| ModelError::Io(e.to_string()))?;
+        let response = req
+            .send()
+            .await
+            .map_err(|e| ModelError::Io(e.to_string()))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -201,6 +217,7 @@ impl OpenAiCompatModel {
         let mut content_buf = String::new();
         let mut line_buf = String::new();
         let mut usage: Option<Usage> = None;
+        let mut finish_reason: Option<String> = None;
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -217,12 +234,20 @@ impl OpenAiCompatModel {
                 if line.is_empty() {
                     continue;
                 }
-                match self.process_line(line, &mut reasoning_buf, &mut content_buf, &mut usage, sink)? {
+                match self.process_line(
+                    line,
+                    &mut reasoning_buf,
+                    &mut content_buf,
+                    &mut usage,
+                    &mut finish_reason,
+                    sink,
+                )? {
                     LineOutcome::Done => {
                         return Ok((
                             (!reasoning_buf.is_empty()).then(|| Reasoning::new(reasoning_buf)),
                             content_buf,
                             usage,
+                            finish_reason,
                         ));
                     }
                     LineOutcome::Continue => {}
@@ -234,24 +259,30 @@ impl OpenAiCompatModel {
             (!reasoning_buf.is_empty()).then(|| Reasoning::new(reasoning_buf)),
             content_buf,
             usage,
+            finish_reason,
         ))
     }
 
     /// Parses one SSE line. Returns `Ok(LineOutcome::Done)` on `data:
     /// [DONE]`. Updates `*usage` when a chunk carries a `usage` object
     /// (the final chunk before `[DONE]` when `stream_options.include_usage`
-    /// is set).
+    /// is set), and `*finish_reason` when a chunk's first choice carries a
+    /// non-null `finish_reason`.
     fn process_line(
         &self,
         line: &str,
         reasoning_buf: &mut String,
         content_buf: &mut String,
         usage: &mut Option<Usage>,
+        finish_reason: &mut Option<String>,
         sink: &mut dyn StepSink,
     ) -> Result<LineOutcome, ModelError> {
         tracing::trace!(line, "openai-compat sse line");
 
-        let Some(data) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
+        let Some(data) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        else {
             // Not a data line (e.g. an SSE comment or event field); ignore.
             return Ok(LineOutcome::Continue);
         };
@@ -261,8 +292,8 @@ impl OpenAiCompatModel {
             return Ok(LineOutcome::Done);
         }
 
-        let parsed: ChatChunk =
-            serde_json::from_str(data).map_err(|e| ModelError::Backend(format!("invalid sse chunk: {e}")))?;
+        let parsed: ChatChunk = serde_json::from_str(data)
+            .map_err(|e| ModelError::Backend(format!("invalid sse chunk: {e}")))?;
 
         if let Some(err) = parsed.error {
             return Err(ModelError::Backend(err.message));
@@ -292,6 +323,10 @@ impl OpenAiCompatModel {
             {
                 reasoning_buf.push_str(reasoning);
                 sink.reasoning_delta(reasoning);
+            }
+
+            if let Some(reason) = choice.finish_reason {
+                *finish_reason = Some(reason);
             }
         }
 

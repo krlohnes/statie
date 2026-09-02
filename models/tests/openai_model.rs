@@ -78,13 +78,22 @@ async fn happy_path_streams_reasoning_and_content_and_captures_request() {
 
     assert_eq!(body["model"], serde_json::json!("test-model"));
     assert_eq!(body["stream"], serde_json::json!(true));
-    assert_eq!(body["stream_options"]["include_usage"], serde_json::json!(true));
+    assert_eq!(
+        body["stream_options"]["include_usage"],
+        serde_json::json!(true)
+    );
     assert_eq!(
         &body["response_format"]["json_schema"]["schema"],
         schema.as_value()
     );
-    assert_eq!(body["response_format"]["type"], serde_json::json!("json_schema"));
-    assert_eq!(body["response_format"]["json_schema"]["strict"], serde_json::json!(true));
+    assert_eq!(
+        body["response_format"]["type"],
+        serde_json::json!("json_schema")
+    );
+    assert_eq!(
+        body["response_format"]["json_schema"]["strict"],
+        serde_json::json!(true)
+    );
     assert_eq!(body["temperature"], serde_json::json!(0));
 
     let messages = body["messages"].as_array().expect("messages array");
@@ -122,7 +131,12 @@ async fn no_native_reasoning_extracts_thoughts_block_from_content() {
     let schema = schema();
 
     let out = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect("step succeeds");
 
@@ -145,7 +159,12 @@ async fn non_2xx_status_returns_backend_error() {
     let schema = schema();
 
     let err = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect_err("expected backend error");
 
@@ -167,7 +186,12 @@ async fn error_chunk_returns_backend_error_with_message() {
     let schema = schema();
 
     let err = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect_err("expected backend error");
 
@@ -187,11 +211,16 @@ async fn cancellation_returns_cancelled_promptly() {
         let _ = read_request_body(&mut stream).await;
         // Send one SSE event, then hang well past the test's cancellation point.
         let line = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n";
-        let response_head =
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
-        stream.write_all(response_head.as_bytes()).await.expect("write head");
+        let response_head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
+        stream
+            .write_all(response_head.as_bytes())
+            .await
+            .expect("write head");
         let chunked = format!("{:x}\r\n{}\r\n", line.len(), line);
-        stream.write_all(chunked.as_bytes()).await.expect("write chunk");
+        stream
+            .write_all(chunked.as_bytes())
+            .await
+            .expect("write chunk");
         tokio::time::sleep(Duration::from_secs(5)).await;
     });
 
@@ -210,8 +239,57 @@ async fn cancellation_returns_cancelled_promptly() {
         .await;
     let elapsed = start.elapsed();
 
-    assert!(matches!(result, Err(ModelError::Cancelled)), "result = {result:?}");
+    assert!(
+        matches!(result, Err(ModelError::Cancelled)),
+        "result = {result:?}"
+    );
     assert!(elapsed < Duration::from_secs(1), "elapsed = {elapsed:?}");
+}
+
+/// A chunk whose first choice carries `finish_reason: "length"` (the server
+/// cut generation off at a token/length limit, as opposed to a clean
+/// `"stop"`) must surface as `RawOutput.finish_reason`, so the harness can
+/// explain the resulting parse failure instead of leaving the model to
+/// guess why its JSON was truncated.
+#[tokio::test]
+async fn finish_reason_length_is_reported() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request_body(&mut stream).await;
+        write_sse_response(
+            &mut stream,
+            &[
+                r#"{"choices":[{"delta":{"content":"{\"patch\":{}"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":100,"completion_tokens":1100}}"#,
+            ],
+        )
+        .await;
+    });
+
+    let model = OpenAiCompatModel::new(cfg_for(addr)).expect("build model");
+    let schema = schema();
+
+    let out = model
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("step succeeds");
+
+    assert_eq!(out.finish_reason.as_deref(), Some("length"));
+    assert_eq!(
+        out.usage,
+        Some(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 1100,
+        })
+    );
 }
 
 #[tokio::test]
@@ -238,7 +316,12 @@ async fn use_json_schema_format_false_omits_response_format_and_capability() {
 
     let schema = schema();
     let out = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect("step succeeds");
     assert_eq!(out.content, r#"{"patch":{},"action":{"type":"done"}}"#);

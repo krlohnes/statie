@@ -4,7 +4,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use statie_augment::SessionLogBm25;
-use statie_core::{Augmenter, HeuristicTokenizer, LogEntry, LogKind, MemoryLog, SessionLog, TokenBudget};
+use statie_core::{
+    Augmenter, HeuristicTokenizer, LogEntry, LogKind, MemoryLog, SessionLog, TokenBudget,
+};
 
 #[derive(Serialize)]
 struct S {
@@ -34,8 +36,12 @@ fn make_log() -> Arc<MemoryLog> {
         json!({"text": "parser parser parser parser"}),
     ))
     .unwrap();
-    log.append(entry(3, LogKind::User, json!({"text": "please fix the parser"})))
-        .unwrap();
+    log.append(entry(
+        3,
+        LogKind::User,
+        json!({"text": "please fix the parser"}),
+    ))
+    .unwrap();
     log
 }
 
@@ -63,7 +69,9 @@ async fn augment_includes_tool_output_and_user_but_never_reasoning() {
         snippets.iter().map(|s| &s.source).collect::<Vec<_>>()
     );
     assert!(
-        !snippets.iter().any(|s| s.text.contains("parser parser parser")),
+        !snippets
+            .iter()
+            .any(|s| s.text.contains("parser parser parser")),
         "no snippet should contain the reasoning text: {:?}",
         snippets.iter().map(|s| &s.text).collect::<Vec<_>>()
     );
@@ -95,5 +103,9 @@ async fn constructing_with_reasoning_in_kinds_still_yields_no_reasoning_snippets
         "kinds=[Reasoning] should be stripped to empty, yielding no snippets: {:?}",
         snippets.iter().map(|s| &s.source).collect::<Vec<_>>()
     );
-    assert!(!snippets.iter().any(|s| s.text.contains("parser parser parser")));
+    assert!(
+        !snippets
+            .iter()
+            .any(|s| s.text.contains("parser parser parser"))
+    );
 }

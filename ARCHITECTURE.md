@@ -16,7 +16,7 @@ statie/
 ├── patch/     statie-patch    Replace, JsonMergePatch, JsonPatch, Typed
 ├── augment/   statie-augment  RepoBm25, SessionLogBm25
 ├── models/    statie-models   OllamaModel, OpenAiCompatModel, MockModel
-├── tools/     statie-tools    read, write, shell, test, recall
+├── tools/     statie-tools    read, write, edit, search, filter, shell, test, recall
 ├── skills/    statie-skills   toy, coding (plan/implement/review), router
 ├── tui/       statie-tui      ratatui frontend, StepSink impl, slash commands
 └── cli/       statie          binary: config loading, wiring, `statie` commands
@@ -449,6 +449,221 @@ when `!native_thinking`, schema text when `!schema_constrained`.
 - `recent_summary`: model-owned; coding skill's `rules` caps it at 1200 chars.
 - Inbox acks: explicit `ack_inbox: [ids]` on the step output.
 - Embeddings: out of scope; BM25 only.
+
+## Milestone 9 (design): guides and subagents
+
+Goal: let one bounded agent call a second bounded agent for a self-contained
+job and get back a small, typed result — without a messaging fabric, without
+concurrent agents, and without the parent's prompt growing. Subagents are
+**state composition**: a child's result is a value stored in the parent's
+workspace, written by the harness, never by the model. Guides are the
+procedural text a child (or, briefly, the parent) works from, loaded only
+while needed.
+
+Non-goals for this milestone: parallel children, child-to-child messaging,
+children that talk to the user, Rust-defined child workspace types.
+
+### Guides (on-demand procedure text)
+
+A guide is a named text blob with a token cap. Guides live in config, not
+code:
+
+```json
+"guides": {
+  "ui-review": { "path": "guides/ui-review.md", "max_tokens": 600 },
+  "rust-testing": { "text": "Run `cargo test` first ...", "max_tokens": 200 }
+}
+```
+
+- Always-on cost is one line in the Harness View: `guides: ui-review,
+  rust-testing (call \`guide\` to load one)`, omitted when no guides exist.
+- `guide` tool, args `{ "name": string | null }`: pins the guide (or unpins
+  with `null`). The pinned text renders in a new prompt section **Pinned**
+  (after Spec, before Tools), budgeted by its own `max_tokens` and counted
+  against `budgets.total`. A pin has a TTL of `guides.ttl_steps` (default 6)
+  committed steps, refreshed by calling `guide` again; expiry is silent
+  except for the `pinned:` line disappearing from the Harness View.
+- Pin state is harness-owned: `HarnessState.pinned: Option<Pinned { name,
+  expires_at_step }>`. Patches cannot touch it.
+- A skill may declare a guide as permanently pinned for itself
+  (`SkillSpec::with_guide(name)` in Rust, `"guide": "ui-review"` for a
+  configured child skill). That is how a subagent carries its procedure
+  without the parent ever seeing it.
+- TUI: `/guide <name>` and `/guide` (unpin) send the same request through
+  the driver; the Harness View line shows `pinned: ui-review (4 steps left)`.
+
+### Report: the one shape a child returns
+
+```rust
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct Report {
+    pub agent: String,                    // child skill name
+    pub task: String,                     // the parent's delegation text, verbatim
+    pub outcome: ReportOutcome,           // Done | Blocked | Failed | Capped
+    pub summary: String,                  // <= 1200 chars; also the parent's observation
+    pub findings: Vec<String>,            // empty = nothing to fix
+    pub files: Vec<FileNote>,             // touched or judged relevant
+    pub data: serde_json::Map<String, Value>, // skill-specific, schema-checked (below)
+    pub stats: ReportStats,               // steps, server prompt/completion tokens, wall_ms
+}
+pub enum ReportOutcome { Done, Blocked, Failed, Capped }
+```
+
+Deliberately general: `findings` and `files` are first-class because the
+coding rules and the TUI already understand them; everything else goes in
+`data`. Nothing about a review, a UI check, or a research task is encoded in
+the type — those differences live in the child's config and its `data`
+schema.
+
+**The child's workspace is the Report.** A configured child runs as
+`Session<ReportWorkspace>` where `ReportWorkspace` is `Report` minus the
+harness-filled fields (`agent`, `task`, `stats`) plus `recent_summary` and
+`done`. Its rules: `done` requires non-empty `summary`, `outcome != Done`
+requires non-empty `findings` or a `data.reason`, and `data` must validate
+against the child's declared JSON schema (via the `jsonschema` crate;
+validation errors are rejections with the schema path, like patch errors).
+No new generics: every child is the same Rust type; the schema for `data` is
+the only per-child variation.
+
+### Configured child skills
+
+```json
+"subagents": {
+  "ui-review": {
+    "instructions": "Build the app, take a screenshot, and report ...",
+    "tools": ["shell", "read_file", "search", "screenshot", "filter_last_tool_call"],
+    "guide": "ui-review",
+    "data_schema": { "type": "object", "properties": { "renders": {"type":"boolean"},
+                     "issues": {"type":"array","items":{"type":"string"}} },
+                     "required": ["renders"] },
+    "budgets": { "total": 12000, "observation": 2000, "augmentation": 800 },
+    "max_steps": 30
+  }
+}
+```
+
+A child skill is instructions + tools + optional guide + optional `data`
+schema + budgets + a step cap. Rust-defined skills (`ToySkill`, the coding
+four) are not delegation targets in this milestone; a child is always a
+config stanza.
+
+### The `delegate` action
+
+```rust
+pub enum Action { Tool{..}, AskUser{..}, Yield, Done,
+                  Delegate { skill: String, task: String } }
+```
+
+Handled by the session in `execute`, not by a tool (tools have no model or
+registry). Semantics:
+
+1. Validation: the parent skill must list the child in
+   `allowed_delegates()` (new provided `Skill` method, default empty; the
+   coding skills list the configured children they may call). Depth: a
+   child may not delegate (`max_depth = 1` in this milestone; the field
+   exists so 2 can be enabled later). Unknown child or depth violation →
+   rejection, not a failure.
+2. The parent's patch is committed first (step N), exactly like a tool call.
+   The delegation is logged as Action `{"type":"delegate","skill","task"}`.
+3. The session builds the child: `Session<ReportWorkspace>` over a **child
+   store** (`memory` for `--memory`, otherwise a second sqlite region keyed by
+   agent path `implement/ui-review#3`), the **shared** log (entries carry
+   `agent: "<path>"`; the parent's entries carry none; `recall` defaults to
+   the caller's own path and accepts `agent: "*"`), the shared model, the
+   shared tool set restricted to the child's list, the shared sandbox, the
+   child's budgets, and a fresh `CancelHandle` chained to the parent's (parent
+   cancel cancels the child). `Session.model` becomes `Arc<dyn Model>` to
+   allow this.
+4. The child runs to `Done`, `Parked(Failure)`, its step cap, or cancel, with
+   `Event::User(task)` as its first event. `ask_user` and `yield` are
+   rejected in children (`allows_yield() == false`, `allows_ask_user() ==
+   false`, new provided method); a blocked child sets `outcome: Blocked` and
+   says why in `summary`/`data.reason`. The TUI receives the child's stream
+   through the same `StepSink`, tagged with the agent path, and renders it as
+   one collapsible block: `▸ subagent ui-review · 12 steps · 3.1k tok`.
+5. On return, the harness (not the model) writes the parent's
+   `reports[<child name>] = Report` — parent workspaces that want delegation
+   carry `#[serde(default)] pub reports: BTreeMap<String, Report>`, and the
+   harness reaches it through a new provided `Skill` method
+   `fn absorb_report(&self, ws: &mut W, report: Report)` whose default for
+   the coding workspace inserts into `reports`. This write bypasses the
+   model's patch path but still runs `rules`; it is committed as step N+1
+   with a Patch log entry marked `"source":"subagent"` so replay is exact.
+6. The parent's pending observation becomes
+   `subagent ui-review finished (done, 12 steps): <summary>. Merged into
+   reports["ui-review"]: findings (2), files (1), data keys [renders, issues].`
+   It is truncated like any tool output and charged to the observation
+   budget. Outcome `Continue`.
+
+Cancel mid-child: the child's partial state is committed as `outcome:
+Capped` with whatever `summary` it had (or a harness-written one), the
+parent parks `Cancelled` as today. Re-delegating the same child overwrites
+`reports[name]`; the old report stays in the patch log.
+
+### Rules over reports (no Rust required)
+
+Parent rules stay Rust for the coding skills, but configured children need a
+way to gate the parent without code. A small predicate language in the
+skill's config stanza, evaluated by `validate_default` after `rules`:
+
+```json
+"rules": [
+  { "when": { "action": "done" },
+    "require": { "pointer": "/reports/review/outcome", "eq": "done" },
+    "message": "run delegate(review) and get a clean report before done" },
+  { "when": { "action": "done" },
+    "require": { "pointer": "/reports/review/findings", "empty": true } }
+]
+```
+
+Predicates: `eq`, `ne`, `exists`, `empty`, `non_empty`, `gt/lt` on numbers;
+`when` matches on action type and optionally on the patch touching a
+pointer. Messages are shown to the model verbatim as rule violations. This
+is intentionally not a general expression language.
+
+### Prompt and budget accounting
+
+- Parent prompt: unchanged sections plus **Pinned** when a guide is pinned.
+  `reports` renders inside AgentState like any field; a report's `summary`
+  is capped at 1200 chars and `data` at 600 tokens when rendered (the full
+  value stays in state; the rendering truncates with a marker).
+- Child prompt: its own `BoundedPrompt` with its own budgets. The parent
+  pays only for the observation and the `reports` entry.
+- Server usage from child steps is summed into `ReportStats` and shown in
+  the TUI block header; `eval` reports parent and child totals separately.
+
+### Changes to existing types (summary)
+
+- `Action::Delegate`; `Skill::{allowed_delegates, allows_ask_user,
+  absorb_report}` (provided); `HarnessState::pinned`; `Session.model:
+  Arc<dyn Model>`; `LogEntry.agent: Option<String>`; a `ChildSkill`
+  (configured) type in `statie-skills` implementing `Skill<Workspace =
+  ReportWorkspace>`; `Report`/`ReportWorkspace`/`ReportStats` in
+  `statie-core`; `SqliteStore` gains a `region` (agent path) so one file
+  holds parent and children; `RunOptions`/CLI gain nothing new (children are
+  reached only through delegation).
+- New tool `guide`; new tool `screenshot` (Playwright via `npx`, PNG into
+  the sandbox) and an image-bearing observation (`Observation::Image { path,
+  caption }`, sent as Ollama `images`, budgeted at a fixed 512 tokens) so a
+  vision-capable child can look at what it built. The image never enters the
+  log; the path does.
+
+### Testing plan
+
+- Unit: `Report` schema has no `required` inside `MergePatch`; `data_schema`
+  validation rejects with a path; predicate evaluation table-tested;
+  `Pinned` TTL expiry and refresh; `guide` tool pins/unpins.
+- Session: parent delegates to a mock-scripted child; assert the child's
+  prompts are bounded and never contain the parent's workspace; the parent's
+  next prompt contains the observation line and `reports["x"]`; the patch log
+  has a `source: subagent` entry; replay reproduces the parent state; cancel
+  mid-child yields `Capped`; a child that tries `ask_user` is rejected;
+  depth-2 delegation is rejected.
+- CLI: a `subagents` stanza round-trips through `config show`; a mock
+  headless run that delegates prints the collapsed block.
+- Live (field notes, not CI): coding task with `ui-review` child on
+  gemma4:26b — the parent's `srv_max` must not grow with the child's step
+  count.
 
 ## Testing conventions
 

@@ -3,7 +3,9 @@ mod support;
 use std::sync::Arc;
 
 use serde_json::json;
-use statie_core::{LogEntry, LogKind, MemoryLog, SandboxRoot, SessionLog, Tool, ToolCtx, ToolError};
+use statie_core::{
+    LogEntry, LogKind, MemoryLog, SandboxRoot, SessionLog, Tool, ToolCtx, ToolError,
+};
 use statie_tools::Recall;
 use tokio_util::sync::CancellationToken;
 
@@ -30,10 +32,18 @@ fn seeded_ctx(dir: &std::path::Path) -> ToolCtx {
         json!({"output": "cargo test failed parser"}),
     ))
     .unwrap();
-    log.append(entry(2, LogKind::Reasoning, json!({"text": "parser parser parser"})))
-        .unwrap();
-    log.append(entry(3, LogKind::User, json!({"text": "please fix the parser"})))
-        .unwrap();
+    log.append(entry(
+        2,
+        LogKind::Reasoning,
+        json!({"text": "parser parser parser"}),
+    ))
+    .unwrap();
+    log.append(entry(
+        3,
+        LogKind::User,
+        json!({"text": "please fix the parser"}),
+    ))
+    .unwrap();
 
     ToolCtx {
         root: SandboxRoot::new(dir).unwrap(),

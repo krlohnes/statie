@@ -49,10 +49,16 @@ impl Tool for ReadFile {
         let path = sandbox_path.as_path();
 
         if !path.exists() {
-            return Err(ToolError::ExecutionFailed(format!("no such file: {}", args.path)));
+            return Err(ToolError::ExecutionFailed(format!(
+                "no such file: {}",
+                args.path
+            )));
         }
         if !path.is_file() {
-            return Err(ToolError::ExecutionFailed(format!("not a regular file: {}", args.path)));
+            return Err(ToolError::ExecutionFailed(format!(
+                "not a regular file: {}",
+                args.path
+            )));
         }
 
         let bytes = std::fs::read(path).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;

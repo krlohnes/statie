@@ -106,6 +106,8 @@ fn strip_required(value: &mut Value) {
 /// RFC 7386 merge: `patch` is merged into `doc` in place.
 /// - `null` in the patch deletes the corresponding key from an object.
 /// - an object in the patch merges recursively into an object in `doc`.
+/// - a keyed array (see [`merge_keyed`]) in both `doc` and the patch merges
+///   entry by entry.
 /// - anything else in the patch replaces the value in `doc` wholesale.
 fn merge(doc: &mut Value, patch: &Value) {
     if let Value::Object(patch_map) = patch {
@@ -121,9 +123,91 @@ fn merge(doc: &mut Value, patch: &Value) {
                 merge(entry, v);
             }
         }
+    } else if let (Value::Array(doc_items), Value::Array(patch_items)) = (&mut *doc, patch) {
+        if !merge_keyed(doc_items, patch_items) {
+            *doc = patch.clone();
+        }
     } else {
         *doc = patch.clone();
     }
+}
+
+/// The key field shared by every element of `items`, if all elements are
+/// objects and agree on one: `"id"` if every element has an `id` key, else
+/// `"path"` if every element has a `path` key, else `None`.
+fn common_key(items: &[Value]) -> Option<&'static str> {
+    ["id", "path"].into_iter().find(|&candidate| {
+        items.iter().all(|item| {
+            item.as_object()
+                .is_some_and(|obj| obj.contains_key(candidate))
+        })
+    })
+}
+
+/// Attempt a keyed merge of `patch` into `cur` in place, per entry.
+///
+/// Applies when `cur` is non-empty, every element of `cur` is an object
+/// sharing a common key field (`id` if all have it, else `path`), and every
+/// element of `patch` is an object that also has that key field. Under
+/// those conditions: existing entries whose key matches a patch entry are
+/// merged recursively (so a patch entry can update just one field); existing
+/// entries with no matching patch entry are left unchanged; patch entries
+/// whose key does not match any existing entry are appended, in patch
+/// order. Returns whether the keyed merge applied; if not, `cur` is left
+/// untouched and the caller should fall back to replace-whole.
+fn merge_keyed(cur: &mut Vec<Value>, patch: &[Value]) -> bool {
+    if cur.is_empty() {
+        return false;
+    }
+    let Some(key) = common_key(cur) else {
+        return false;
+    };
+    if !patch
+        .iter()
+        .all(|item| item.as_object().is_some_and(|obj| obj.contains_key(key)))
+    {
+        return false;
+    }
+
+    if patch.is_empty() {
+        return true;
+    }
+
+    for entry in cur.iter_mut() {
+        let entry_key = entry.get(key).expect("checked by common_key").clone();
+        if let Some(patch_entry) = patch
+            .iter()
+            .find(|p| p.get(key).expect("checked above") == &entry_key)
+        {
+            merge(entry, patch_entry);
+        }
+    }
+
+    let existing_keys: std::collections::HashSet<Value> = cur
+        .iter()
+        .map(|e| e.get(key).expect("checked by common_key").clone())
+        .collect();
+    let mut appended: Vec<Value> = Vec::new();
+    for patch_entry in patch {
+        let patch_key = patch_entry.get(key).expect("checked above");
+        if existing_keys.contains(patch_key) {
+            continue;
+        }
+        if let Some(prior) = appended
+            .iter_mut()
+            .find(|a| a.get(key).expect("checked above") == patch_key)
+        {
+            // Two new-key patch entries share a key: merge them in patch
+            // order rather than appending a duplicate (the caller's
+            // duplicate-id rule, if any, runs against the merged result).
+            merge(prior, patch_entry);
+        } else {
+            appended.push(patch_entry.clone());
+        }
+    }
+    cur.extend(appended);
+
+    true
 }
 
 /// JSON Merge Patch (RFC 7386) strategy. The project default.
@@ -144,9 +228,13 @@ where
          like the workspace. Fields you omit are left untouched. Nested \
          objects are merged recursively -- you can update one field of a \
          nested object without repeating the others. Setting a field to \
-         null deletes it (only valid for optional fields). Arrays are \
-         replaced whole: to change an array, send the entire new array, not \
-         a diff of it."
+         null deletes it (only valid for optional fields). Arrays of \
+         objects that carry an \"id\" or \"path\" are merged entry by \
+         entry: send only the entries you change, each with its \"id\"/\
+         \"path\" and the changed fields; entries you omit are kept, and \
+         new keys are appended (to retire a plan step set its status to \
+         \"skipped\" rather than removing it). Other arrays (e.g. lists of \
+         strings) are replaced whole: send the entire new array."
     }
 
     fn apply(cur: &S, patch: &Self::Patch) -> Result<S, PatchError> {
@@ -280,6 +368,152 @@ mod tests {
         assert_eq!(next.tags, vec!["a".to_string()]);
     }
 
+    // -----------------------------------------------------------------
+    // Keyed array merge (per-entry) tests, exercising `merge` directly.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn keyed_merge_by_id_updates_one_field_and_keeps_others() {
+        let mut doc = json!({
+            "plan": [
+                {"id": 1, "text": "a", "status": "pending"},
+                {"id": 2, "text": "b", "status": "pending"},
+                {"id": 3, "text": "c", "status": "pending"}
+            ]
+        });
+        let patch = json!({"plan": [{"id": 2, "status": "in_progress"}]});
+        merge(&mut doc, &patch);
+        assert_eq!(
+            doc,
+            json!({
+                "plan": [
+                    {"id": 1, "text": "a", "status": "pending"},
+                    {"id": 2, "text": "b", "status": "in_progress"},
+                    {"id": 3, "text": "c", "status": "pending"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn keyed_merge_by_id_appends_new_id() {
+        let mut doc = json!({
+            "plan": [
+                {"id": 1, "text": "a", "status": "pending"}
+            ]
+        });
+        let patch = json!({"plan": [{"id": 2, "text": "b", "status": "pending"}]});
+        merge(&mut doc, &patch);
+        assert_eq!(
+            doc,
+            json!({
+                "plan": [
+                    {"id": 1, "text": "a", "status": "pending"},
+                    {"id": 2, "text": "b", "status": "pending"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn keyed_merge_by_path() {
+        let mut doc = json!({
+            "files": [
+                {"path": "a.rs", "note": "note a"},
+                {"path": "b.rs", "note": "note b"}
+            ]
+        });
+        let patch = json!({"files": [{"path": "a.rs", "note": "updated"}]});
+        merge(&mut doc, &patch);
+        assert_eq!(
+            doc,
+            json!({
+                "files": [
+                    {"path": "a.rs", "note": "updated"},
+                    {"path": "b.rs", "note": "note b"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_array_missing_key_falls_back_to_replace() {
+        let mut doc = json!({
+            "plan": [
+                {"id": 1, "text": "a"},
+                {"text": "b"}
+            ]
+        });
+        let patch = json!({"plan": [{"id": 1, "text": "z"}]});
+        merge(&mut doc, &patch);
+        // No common key across all `cur` elements -> replace whole.
+        assert_eq!(doc, json!({"plan": [{"id": 1, "text": "z"}]}));
+    }
+
+    #[test]
+    fn array_of_strings_replaced_whole() {
+        let mut doc = json!({"tags": ["a", "b", "c"]});
+        let patch = json!({"tags": ["x"]});
+        merge(&mut doc, &patch);
+        assert_eq!(doc, json!({"tags": ["x"]}));
+    }
+
+    #[test]
+    fn empty_current_array_replaced_by_patch() {
+        let mut doc = json!({"plan": []});
+        let patch = json!({"plan": [{"id": 1, "text": "a", "status": "pending"}]});
+        merge(&mut doc, &patch);
+        assert_eq!(
+            doc,
+            json!({"plan": [{"id": 1, "text": "a", "status": "pending"}]})
+        );
+    }
+
+    #[test]
+    fn empty_patch_array_leaves_keyed_array_unchanged() {
+        let mut doc = json!({
+            "plan": [
+                {"id": 1, "text": "a", "status": "pending"},
+                {"id": 2, "text": "b", "status": "pending"}
+            ]
+        });
+        let before = doc.clone();
+        let patch = json!({"plan": []});
+        merge(&mut doc, &patch);
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn nested_keyed_merge_inside_nested_object() {
+        let mut doc = json!({
+            "workspace": {
+                "plan": [
+                    {"id": 1, "text": "a", "status": "pending"},
+                    {"id": 2, "text": "b", "status": "pending"}
+                ],
+                "other": "unchanged"
+            }
+        });
+        let patch = json!({
+            "workspace": {
+                "plan": [{"id": 1, "status": "done"}]
+            }
+        });
+        merge(&mut doc, &patch);
+        assert_eq!(
+            doc,
+            json!({
+                "workspace": {
+                    "plan": [
+                        {"id": 1, "text": "a", "status": "done"},
+                        {"id": 2, "text": "b", "status": "pending"}
+                    ],
+                    "other": "unchanged"
+                }
+            })
+        );
+    }
+
     #[test]
     fn round_trip_parses_valid_output() {
         use statie_core::{RawOutput, Version};
@@ -307,4 +541,3 @@ mod tests {
         assert!(!n.flag);
     }
 }
-

@@ -93,6 +93,10 @@ struct ChatLine {
     /// Present on the final (`done: true`) line: number of tokens generated.
     #[serde(default)]
     eval_count: Option<u64>,
+    /// Present on the final (`done: true`) line: why generation stopped
+    /// (e.g. `"stop"`, `"length"`).
+    #[serde(default)]
+    done_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -157,7 +161,8 @@ impl Model for OllamaModel {
         options.insert("num_ctx".to_string(), json!(self.cfg.num_ctx));
         body["options"] = Value::Object(options);
 
-        let request_text = serde_json::to_string(&body).map_err(|e| ModelError::Io(e.to_string()))?;
+        let request_text =
+            serde_json::to_string(&body).map_err(|e| ModelError::Io(e.to_string()))?;
         tracing::debug!(chars = request_text.chars().count(), "ollama request");
         tracing::trace!(body = %request_text, "ollama request body");
 
@@ -165,7 +170,7 @@ impl Model for OllamaModel {
             result = self.run_request(&body, sink) => result,
             _ = cancel.cancelled() => Err(ModelError::Cancelled),
         }
-        .map(|(reasoning_native, content, usage)| {
+        .map(|(reasoning_native, content, usage, finish_reason)| {
             let (reasoning, content) = if self.cfg.think {
                 (reasoning_native, content)
             } else if let Some(r) = reasoning_native {
@@ -179,6 +184,9 @@ impl Model for OllamaModel {
             if let Some(u) = usage {
                 out = out.with_usage(u);
             }
+            if let Some(reason) = finish_reason {
+                out = out.with_finish_reason(reason);
+            }
             out
         })
     }
@@ -189,7 +197,7 @@ impl OllamaModel {
         &self,
         body: &Value,
         sink: &mut dyn StepSink,
-    ) -> Result<(Option<Reasoning>, String, Option<Usage>), ModelError> {
+    ) -> Result<(Option<Reasoning>, String, Option<Usage>, Option<String>), ModelError> {
         let response = self
             .client
             .post(self.chat_url())
@@ -226,11 +234,14 @@ impl OllamaModel {
                 if line.is_empty() {
                     continue;
                 }
-                if let Some(usage) = process_line(line, &mut reasoning_buf, &mut content_buf, sink)? {
+                if let Some((usage, finish_reason)) =
+                    process_line(line, &mut reasoning_buf, &mut content_buf, sink)?
+                {
                     return Ok((
                         (!reasoning_buf.is_empty()).then(|| Reasoning::new(reasoning_buf)),
                         content_buf,
                         usage,
+                        finish_reason,
                     ));
                 }
             }
@@ -246,23 +257,27 @@ impl OllamaModel {
             (!reasoning_buf.is_empty()).then(|| Reasoning::new(reasoning_buf)),
             content_buf,
             None,
+            None,
         ))
     }
 }
 
-/// Parses one NDJSON line. Returns `Ok(Some(usage))` if this line signals
-/// `done` (`usage` is `Some(Usage)` only when the server reported
-/// `prompt_eval_count`), `Ok(None)` otherwise.
+/// `(usage, done_reason)` reported on a `done: true` NDJSON line.
+type DoneInfo = (Option<Usage>, Option<String>);
+
+/// Parses one NDJSON line. Returns `Ok(Some((usage, done_reason)))` if this
+/// line signals `done` (`usage` is `Some(Usage)` only when the server
+/// reported `prompt_eval_count`), `Ok(None)` otherwise.
 fn process_line(
     line: &str,
     reasoning_buf: &mut String,
     content_buf: &mut String,
     sink: &mut dyn StepSink,
-) -> Result<Option<Option<Usage>>, ModelError> {
+) -> Result<Option<DoneInfo>, ModelError> {
     tracing::trace!(line, "ollama ndjson line");
 
-    let parsed: ChatLine =
-        serde_json::from_str(line).map_err(|e| ModelError::Backend(format!("invalid ndjson line: {e}")))?;
+    let parsed: ChatLine = serde_json::from_str(line)
+        .map_err(|e| ModelError::Backend(format!("invalid ndjson line: {e}")))?;
 
     if let Some(err) = parsed.error {
         return Err(ModelError::Backend(err));
@@ -291,5 +306,5 @@ fn process_line(
         prompt_tokens,
         completion_tokens: parsed.eval_count.unwrap_or(0),
     });
-    Ok(Some(usage))
+    Ok(Some((usage, parsed.done_reason)))
 }

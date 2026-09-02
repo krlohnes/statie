@@ -86,8 +86,8 @@ impl Promptable for ToolList {
         self.0
             .iter()
             .map(|t| {
-                let schema_str =
-                    serde_json::to_string(t.args_schema.as_value()).unwrap_or_else(|_| "{}".to_string());
+                let schema_str = serde_json::to_string(t.args_schema.as_value())
+                    .unwrap_or_else(|_| "{}".to_string());
                 format!("- {}: {}\n  args: {}", t.name, t.description, schema_str)
             })
             .collect::<Vec<_>>()

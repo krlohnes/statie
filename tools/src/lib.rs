@@ -1,10 +1,14 @@
-//! statie-tools: the coding harness's tool set — read, write, shell, test,
-//! and recall — all sandboxed against a `statie_core::SandboxRoot`.
+//! statie-tools: the coding harness's tool set — read, write, edit, search,
+//! shell, test, recall, and filter_last_tool_call — all sandboxed against a
+//! `statie_core::SandboxRoot`.
 
 mod common;
+mod edit_file;
+mod filter_last;
 mod list_files;
 mod read_file;
 mod recall;
+mod search;
 mod shell;
 mod test_tool;
 mod write_file;
@@ -14,9 +18,12 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use statie_core::ToolSet;
 
+pub use edit_file::EditFile;
+pub use filter_last::FilterLastToolCall;
 pub use list_files::ListFiles;
 pub use read_file::ReadFile;
 pub use recall::Recall;
+pub use search::Search;
 pub use shell::Shell;
 pub use test_tool::{TestTool, detect_test_command};
 pub use write_file::WriteFile;
@@ -64,10 +71,19 @@ pub fn default_tools(cfg: &ToolConfig) -> ToolSet {
     tools.register(Arc::new(WriteFile {
         max_output_bytes: cfg.max_output_bytes,
     }));
+    tools.register(Arc::new(EditFile {
+        max_output_bytes: cfg.max_output_bytes,
+    }));
     tools.register(Arc::new(ListFiles {
         max_output_bytes: cfg.max_output_bytes,
     }));
+    tools.register(Arc::new(Search {
+        max_output_bytes: cfg.max_output_bytes,
+    }));
     tools.register(Arc::new(Recall {
+        max_output_bytes: cfg.max_output_bytes,
+    }));
+    tools.register(Arc::new(FilterLastToolCall {
         max_output_bytes: cfg.max_output_bytes,
     }));
 
@@ -103,7 +119,20 @@ mod tests {
         let tools = default_tools(&cfg);
         let mut names = tools.names();
         names.sort();
-        assert_eq!(names, vec!["list_files", "read_file", "recall", "shell", "test", "write_file"]);
+        assert_eq!(
+            names,
+            vec![
+                "edit_file",
+                "filter_last_tool_call",
+                "list_files",
+                "read_file",
+                "recall",
+                "search",
+                "shell",
+                "test",
+                "write_file"
+            ]
+        );
     }
 
     #[test]
@@ -115,7 +144,18 @@ mod tests {
         let tools = default_tools(&cfg);
         let mut names = tools.names();
         names.sort();
-        assert_eq!(names, vec!["list_files", "read_file", "recall", "write_file"]);
+        assert_eq!(
+            names,
+            vec![
+                "edit_file",
+                "filter_last_tool_call",
+                "list_files",
+                "read_file",
+                "recall",
+                "search",
+                "write_file"
+            ]
+        );
     }
 
     #[test]

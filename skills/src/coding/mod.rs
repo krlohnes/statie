@@ -69,12 +69,16 @@ pub struct CodingWorkspace {
     /// (when empty) by whichever skill first sees it; never edited after.
     #[serde(default)]
     pub task: String,
-    /// Ordered plan steps. Empty until `plan` has run.
+    /// Ordered plan steps. Empty until `plan` has run. Merged by `id`: a
+    /// patch entry with an existing `id` updates just that step (send only
+    /// the fields you're changing, e.g. `{"id": 2, "status": "done"}`);
+    /// entries you omit are kept unchanged, and a new `id` is appended.
     #[serde(default)]
     pub plan: Vec<PlanStep>,
     /// Manifest of files touched or judged relevant so far, each with a
-    /// one-line note. Append or update; do not silently drop entries other
-    /// skills may still need.
+    /// one-line note. Merged by `path`: a patch entry with an existing
+    /// `path` updates just that entry; entries you omit are kept, and a new
+    /// `path` is appended.
     #[serde(default)]
     pub files: Vec<FileNote>,
     /// Concrete review findings. Empty means the work has been reviewed and
@@ -104,10 +108,13 @@ const KNOWN_SKILLS: [&str; 4] = ["router", "plan", "implement", "review"];
 /// Rules shared by every coding skill: `recent_summary` length cap,
 /// `next_skill` must name a known skill, `next_skill` must be one of this
 /// skill's own `allowed_transitions()` (or its own name / unset), and plan
-/// step ids must be unique.
+/// step ids must be unique. `plan` and `files` are merged per entry by
+/// `id`/`path` (see [`CodingWorkspace`]'s field docs), so a partial array in
+/// the patch no longer drops the entries it omits.
 fn common_rules(
     skill_name: &str,
     allowed_transitions: &[&str],
+    _cur: &CommittedState<CodingWorkspace>,
     next: &CodingWorkspace,
 ) -> Result<(), PatchError> {
     if next.recent_summary.len() > 1200 {
@@ -196,7 +203,10 @@ impl Default for OnceSpec {
 
 impl OnceSpec {
     fn get(&self, name: &str, instructions: String) -> Arc<SkillSpec> {
-        Arc::clone(self.0.get_or_init(|| Arc::new(SkillSpec::new(name, instructions))))
+        Arc::clone(
+            self.0
+                .get_or_init(|| Arc::new(SkillSpec::new(name, instructions))),
+        )
     }
 }
 
@@ -245,11 +255,19 @@ impl Skill for RouterSkill {
     }
 
     fn allowed_transitions(&self) -> Vec<String> {
-        vec!["plan".to_string(), "implement".to_string(), "review".to_string()]
+        vec![
+            "plan".to_string(),
+            "implement".to_string(),
+            "review".to_string(),
+        ]
     }
 
     fn is_terminal(&self, s: &Self::Workspace) -> bool {
         common_is_terminal(s)
+    }
+
+    fn allows_yield(&self) -> bool {
+        false
     }
 
     fn handoff(&self, s: &Self::Workspace) -> Option<String> {
@@ -258,10 +276,10 @@ impl Skill for RouterSkill {
 
     fn rules(
         &self,
-        _cur: &CommittedState<Self::Workspace>,
+        cur: &CommittedState<Self::Workspace>,
         next: &Self::Workspace,
     ) -> Result<(), PatchError> {
-        common_rules(self.name(), &["plan", "implement", "review"], next)
+        common_rules(self.name(), &["plan", "implement", "review"], cur, next)
     }
 }
 
@@ -282,22 +300,27 @@ impl Skill for PlanSkill {
     fn spec(&self) -> Arc<SkillSpec> {
         self.spec.get(
             "plan",
-            "You are the planner for a coding task. Explore the repository with \
-             `list_files` and `read_file` until you understand what needs to change, \
-             then write a plan -- do not write or run code yet.\n\n\
+            "You are the planner for a coding task. Use `search` to find definitions and \
+             usages before reading whole files; use `list_files` and `read_file` \
+             (with `offset`/`limit` for files longer than ~200 lines) until you \
+             understand what needs to change. Do not write or run code yet.\n\n\
              What to put in the workspace:\n\
              - Record every file you judge relevant in `files`, each with a one-line \
                note explaining why it matters.\n\
              - Write `plan` as a numbered list of small, concrete steps; each step's \
                `text` should be at most one sentence and independently checkable. Give \
-               each step a unique `id`.\n\
+               each step a unique `id`. If the repo has tests, make the first step \
+               \"run `test` to record the baseline\" and the last step \"run `test` and \
+               confirm it passes\".\n\
              - Keep `recent_summary` current as you explore.\n\n\
              When to hand off: once the plan is solid, set `next_skill: \"implement\"` \
              and action `done`. The plan must be non-empty before you hand off to \
              `implement`.\n\n\
              History is searchable with the `recall` tool if you need to check what an \
              earlier step already found. `recent_summary` is the only memory that \
-             survives across steps and across skill handoffs."
+             survives across steps and across skill handoffs. If a tool output overflowed \
+             (the observation says so), call `filter_last_tool_call` with a regex instead \
+             of re-running the command."
                 .to_string(),
         )
     }
@@ -307,7 +330,13 @@ impl Skill for PlanSkill {
     }
 
     fn tools(&self) -> Vec<String> {
-        vec!["list_files".to_string(), "read_file".to_string(), "recall".to_string()]
+        vec![
+            "list_files".to_string(),
+            "read_file".to_string(),
+            "search".to_string(),
+            "recall".to_string(),
+            "filter_last_tool_call".to_string(),
+        ]
     }
 
     fn allowed_transitions(&self) -> Vec<String> {
@@ -318,16 +347,20 @@ impl Skill for PlanSkill {
         common_is_terminal(s)
     }
 
+    fn allows_yield(&self) -> bool {
+        false
+    }
+
     fn handoff(&self, s: &Self::Workspace) -> Option<String> {
         common_handoff(self.name(), s)
     }
 
     fn rules(
         &self,
-        _cur: &CommittedState<Self::Workspace>,
+        cur: &CommittedState<Self::Workspace>,
         next: &Self::Workspace,
     ) -> Result<(), PatchError> {
-        common_rules(self.name(), &["implement", "router"], next)?;
+        common_rules(self.name(), &["implement", "router"], cur, next)?;
         if next.next_skill.as_deref() == Some("implement") && next.plan.is_empty() {
             return Err(PatchError::RuleViolation(
                 "plan must be non-empty before handing off to implement".to_string(),
@@ -358,17 +391,28 @@ impl Skill for ImplementSkill {
              What to put in the workspace:\n\
              - Mark the step you are working `in_progress`, then `done` once it is \
                finished; use `skipped` only when a step turns out unnecessary.\n\
-             - Use `write_file` for full-file writes and `shell` for other changes; run \
-               `test` after changes that could affect behavior.\n\
+             - Prefer `edit_file` for changes to existing files: give it a small \
+               anchored `old` text copied exactly from a `read_file` result, including \
+               indentation. Use `write_file` only for new files or full rewrites. If \
+               `edit_file` reports the text was not found or ambiguous, re-read the \
+               file and retry with a more specific anchor -- never fall back to \
+               rewriting the whole file. Use `shell` for other changes.\n\
+             - After finishing a step that changes code, run `test` and read the \
+               `result:` line; do not mark a step `done` while `test` reports `fail` \
+               unless the failure predates your change (check with `recall`, e.g. \
+               query \"test output\" to see the last test run).\n\
              - Keep `files` and `recent_summary` up to date as you go.\n\
              - If you are blocked (missing information only the user can give you), use \
-               action `ask_user` rather than guessing.\n\n\
+               action `ask_user` rather than guessing -- it is the only way to pause; \
+               `yield` is rejected in this skill.\n\n\
              When to hand off: once every plan step is `done` or `skipped`, set \
              `next_skill: \"review\"` and action `done`. Do not hand off to `review` \
              while any step is still `pending` or `in_progress`.\n\n\
              History is searchable with the `recall` tool -- use it to recall what an \
              earlier step already tried or found. `recent_summary` is the only memory \
-             that survives across steps and across skill handoffs."
+             that survives across steps and across skill handoffs. If a tool output \
+             overflowed (the observation says so), call `filter_last_tool_call` with a \
+             regex instead of re-running the command."
                 .to_string(),
         )
     }
@@ -381,19 +425,30 @@ impl Skill for ImplementSkill {
         vec![
             "list_files".to_string(),
             "read_file".to_string(),
+            "search".to_string(),
             "write_file".to_string(),
+            "edit_file".to_string(),
             "shell".to_string(),
             "test".to_string(),
             "recall".to_string(),
+            "filter_last_tool_call".to_string(),
         ]
     }
 
     fn allowed_transitions(&self) -> Vec<String> {
-        vec!["review".to_string(), "plan".to_string(), "router".to_string()]
+        vec![
+            "review".to_string(),
+            "plan".to_string(),
+            "router".to_string(),
+        ]
     }
 
     fn is_terminal(&self, s: &Self::Workspace) -> bool {
         common_is_terminal(s)
+    }
+
+    fn allows_yield(&self) -> bool {
+        false
     }
 
     fn handoff(&self, s: &Self::Workspace) -> Option<String> {
@@ -402,10 +457,10 @@ impl Skill for ImplementSkill {
 
     fn rules(
         &self,
-        _cur: &CommittedState<Self::Workspace>,
+        cur: &CommittedState<Self::Workspace>,
         next: &Self::Workspace,
     ) -> Result<(), PatchError> {
-        common_rules(self.name(), &["review", "plan", "router"], next)?;
+        common_rules(self.name(), &["review", "plan", "router"], cur, next)?;
         if next.next_skill.as_deref() == Some("review") {
             let unfinished = next
                 .plan
@@ -439,8 +494,10 @@ impl Skill for ReviewSkill {
     fn spec(&self) -> Arc<SkillSpec> {
         self.spec.get(
             "review",
-            "You are reviewing the work done for a coding task. Re-read the changed \
-             files (see `files`) and run `test`.\n\n\
+            "You are reviewing the work done for a coding task. Run `test` first: \
+             `result: fail` is an automatic finding -- quote the failure summary. Use \
+             `search` to check that every plan step's change actually landed. Read only \
+             the files in `files` unless a finding requires more.\n\n\
              What to put in the workspace:\n\
              - Write concrete `findings` -- specific, actionable problems, not vague \
                impressions. Leave `findings` empty if the work is correct and complete.\n\n\
@@ -460,7 +517,14 @@ impl Skill for ReviewSkill {
     }
 
     fn tools(&self) -> Vec<String> {
-        vec!["list_files".to_string(), "read_file".to_string(), "test".to_string(), "recall".to_string()]
+        vec![
+            "list_files".to_string(),
+            "read_file".to_string(),
+            "search".to_string(),
+            "test".to_string(),
+            "recall".to_string(),
+            "filter_last_tool_call".to_string(),
+        ]
     }
 
     fn allowed_transitions(&self) -> Vec<String> {
@@ -471,16 +535,20 @@ impl Skill for ReviewSkill {
         common_is_terminal(s)
     }
 
+    fn allows_yield(&self) -> bool {
+        false
+    }
+
     fn handoff(&self, s: &Self::Workspace) -> Option<String> {
         common_handoff(self.name(), s)
     }
 
     fn rules(
         &self,
-        _cur: &CommittedState<Self::Workspace>,
+        cur: &CommittedState<Self::Workspace>,
         next: &Self::Workspace,
     ) -> Result<(), PatchError> {
-        common_rules(self.name(), &["implement", "router"], next)?;
+        common_rules(self.name(), &["implement", "router"], cur, next)?;
         if next.done && !next.findings.is_empty() {
             return Err(PatchError::RuleViolation(
                 "done can only be true when findings is empty".to_string(),
@@ -493,8 +561,10 @@ impl Skill for ReviewSkill {
 /// All four coding skills, keyed by name, as trait objects sharing the
 /// coding workspace/patch types.
 #[allow(clippy::type_complexity)]
-pub fn coding_skills()
--> Vec<(String, Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>)> {
+pub fn coding_skills() -> Vec<(
+    String,
+    Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
+)> {
     vec![
         ("router".to_string(), Arc::new(RouterSkill::new())),
         ("plan".to_string(), Arc::new(PlanSkill::new())),

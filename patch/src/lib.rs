@@ -8,9 +8,9 @@
 
 mod json_patch_strategy;
 mod merge;
-mod util;
 mod replace;
 mod typed;
+mod util;
 
 pub use json_patch_strategy::JsonPatch;
 pub use merge::{JsonMergePatch, MergePatch};

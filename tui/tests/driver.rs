@@ -17,7 +17,7 @@ use statie_core::{
 use statie_models::{MockModel, MockTurn};
 use statie_patch::JsonMergePatch;
 use statie_skills::{ToySkill, ToyWorkspace};
-use statie_store::InMemoryStore;
+use statie_store::{InMemoryStore, SqliteStore};
 use statie_tui::{DynSkill, RunOptions, SkillRegistry, run_headless};
 
 struct EchoTool;
@@ -98,7 +98,13 @@ struct MapRegistry<W> {
 
 impl<W> MapRegistry<W>
 where
-    W: Clone + serde::Serialize + serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync + 'static,
+    W: Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + schemars::JsonSchema
+        + Send
+        + Sync
+        + 'static,
 {
     fn new(skills: Vec<DynSkill<W>>) -> Self {
         let mut map = HashMap::new();
@@ -119,10 +125,7 @@ impl<W: Send + Sync> SkillRegistry<W> for MapRegistry<W> {
     }
 }
 
-fn make_session(
-    model: Arc<MockModel>,
-    cfg: SessionConfig,
-) -> Session<ToyWorkspace> {
+fn make_session(model: Arc<MockModel>, cfg: SessionConfig) -> Session<ToyWorkspace> {
     let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
     Session::new(
         Box::new(InMemoryStore::<ToyWorkspace>::new()),
@@ -180,10 +183,16 @@ async fn headless_toy_run_completes_and_stays_flat() {
         initial_skill: "toy".to_string(),
         initial_messages: vec!["go".to_string()],
         max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
     };
 
     let mut out: Vec<u8> = Vec::new();
-    let summary = run_headless(session, registry, opts, &mut out).await.unwrap();
+    let summary = run_headless(session, registry, opts, &mut out)
+        .await
+        .unwrap();
 
     let printed = String::from_utf8(out).unwrap();
     assert!(
@@ -191,7 +200,11 @@ async fn headless_toy_run_completes_and_stays_flat() {
         "expected a [reasoning] line in headless output:\n{printed}"
     );
 
-    assert_eq!(summary.steps, 4, "expected 4 steps, got {}: {printed}", summary.steps);
+    assert_eq!(
+        summary.steps, 4,
+        "expected 4 steps, got {}: {printed}",
+        summary.steps
+    );
     assert_eq!(summary.final_outcome, "done");
     assert_eq!(summary.prompt_tokens.len(), 3);
     // 3 of the 4 model-calling steps scripted usage; the `done` turn did not.
@@ -212,8 +225,16 @@ async fn headless_toy_run_completes_and_stays_flat() {
 
     // Reasoning must never reach the model's prompts.
     for p in model.prompts() {
-        assert!(!p.system.contains("thinking"), "system leaked reasoning: {}", p.system);
-        assert!(!p.user.contains("thinking"), "user leaked reasoning: {}", p.user);
+        assert!(
+            !p.system.contains("thinking"),
+            "system leaked reasoning: {}",
+            p.system
+        );
+        assert!(
+            !p.user.contains("thinking"),
+            "user leaked reasoning: {}",
+            p.user
+        );
     }
 }
 
@@ -234,7 +255,10 @@ struct SkillA {
 impl SkillA {
     fn new() -> Self {
         SkillA {
-            spec: Arc::new(SkillSpec::new("a", "Skill A: set notes to [\"handoff\"] then done.")),
+            spec: Arc::new(SkillSpec::new(
+                "a",
+                "Skill A: set notes to [\"handoff\"] then done.",
+            )),
         }
     }
 }
@@ -349,17 +373,22 @@ async fn headless_handoff_between_two_skills() {
 
     let a: DynSkill<HandoffWorkspace> = Arc::new(SkillA::new());
     let b: DynSkill<HandoffWorkspace> = Arc::new(SkillB::new());
-    let registry: Arc<dyn SkillRegistry<HandoffWorkspace>> =
-        Arc::new(MapRegistry::new(vec![a, b]));
+    let registry: Arc<dyn SkillRegistry<HandoffWorkspace>> = Arc::new(MapRegistry::new(vec![a, b]));
 
     let opts = RunOptions {
         initial_skill: "a".to_string(),
         initial_messages: vec!["go".to_string()],
         max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
     };
 
     let mut out: Vec<u8> = Vec::new();
-    let summary = run_headless(session, registry, opts, &mut out).await.unwrap();
+    let summary = run_headless(session, registry, opts, &mut out)
+        .await
+        .unwrap();
 
     let printed = String::from_utf8(out).unwrap();
     assert!(
@@ -396,10 +425,19 @@ async fn cancel_arrives_as_parked_event_within_timeout() {
         initial_skill: "toy".to_string(),
         initial_messages: vec![],
         max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
     };
 
     let driver = tokio::spawn(statie_tui::run_driver(
-        session, registry, opts, cmd_rx, ev_tx, cancel.clone(),
+        session,
+        registry,
+        opts,
+        cmd_rx,
+        ev_tx,
+        cancel.clone(),
     ));
 
     cmd_tx
@@ -430,20 +468,28 @@ async fn cancel_arrives_as_parked_event_within_timeout() {
     let _ = driver.await;
 }
 
-/// A driver failure (here: the mock script is empty, so the model errors on
-/// the first step) must surface as `Err` from `run_headless`, never as an
-/// empty successful summary.
+/// A *fatal* driver failure (here: `initial_skill` names a skill the
+/// registry doesn't have -- a configuration bug, not something retrying can
+/// fix) must surface as `Err` from `run_headless`, never as an empty
+/// successful summary. Model errors are recoverable (see
+/// `step_error_is_reported_and_driver_keeps_running`) and are no longer
+/// fatal, so this test uses an unknown-skill scenario instead.
 #[tokio::test]
 async fn headless_surfaces_driver_errors() {
     let root = tempfile::tempdir().unwrap();
     let model = Arc::new(MockModel::new(vec![]));
     let session = make_session(model, config(&root));
-    let registry: Arc<dyn SkillRegistry<ToyWorkspace>> =
-        Arc::new(MapRegistry::new(vec![Arc::new(ToySkill::new(3)) as DynSkill<ToyWorkspace>]));
+    let registry: Arc<dyn SkillRegistry<ToyWorkspace>> = Arc::new(MapRegistry::new(vec![
+        Arc::new(ToySkill::new(3)) as DynSkill<ToyWorkspace>,
+    ]));
     let opts = RunOptions {
-        initial_skill: "toy".to_string(),
+        initial_skill: "no-such-skill".to_string(),
         initial_messages: vec!["go".to_string()],
         max_autonomous_steps: 50,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
     };
     let mut out: Vec<u8> = Vec::new();
     let result = run_headless(session, registry, opts, &mut out).await;
@@ -451,7 +497,535 @@ async fn headless_surfaces_driver_errors() {
         Err(e) => e.to_string(),
         Ok(summary) => panic!("expected an error, got summary steps={}", summary.steps),
     };
-    assert!(err.contains("mock script exhausted"), "err = {err}");
+    assert!(err.contains("no-such-skill"), "err = {err}");
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("[error]"), "output = {text}");
+}
+
+/// A recoverable step error (the model errors, e.g. an unreachable server)
+/// is surfaced as an `Error` event followed by a `Parked` event, and the
+/// driver keeps running: a later command still produces a `StepDone`, and
+/// `Quit` still ends the task cleanly. This is the fix for the original bug
+/// -- a model/network error used to propagate with `?` and silently end the
+/// driver task, making the TUI look like it crashed on Enter.
+#[tokio::test]
+async fn step_error_is_reported_and_driver_keeps_running() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![
+        MockTurn::error("io error: error sending request for url (http://localhost:11434/)"),
+        MockTurn::new(json!({"patch": {"counter": 1}, "action": {"type": "yield"}}).to_string()),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let session = make_session(Arc::clone(&model), config(&root));
+
+    let skill: DynSkill<ToyWorkspace> = Arc::new(ToySkill::new(100));
+    let registry: Arc<dyn SkillRegistry<ToyWorkspace>> = Arc::new(MapRegistry::new(vec![skill]));
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<statie_tui::DriverCmd>(8);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<statie_tui::UiEvent>();
+
+    let opts = RunOptions {
+        initial_skill: "toy".to_string(),
+        initial_messages: vec![],
+        max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
+    };
+
+    let cancel = session.cancel_handle();
+    let driver = tokio::spawn(statie_tui::run_driver(
+        session, registry, opts, cmd_rx, ev_tx, cancel,
+    ));
+
+    cmd_tx
+        .send(statie_tui::DriverCmd::User("hi".to_string()))
+        .await
+        .unwrap();
+
+    // Collect events until Parked; an Error event containing "step failed"
+    // must have arrived first, and the driver task must still be alive
+    // (not returned) afterward.
+    let mut saw_error = false;
+    let saw_parked = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ev_rx.recv().await {
+                Some(statie_tui::UiEvent::Error(msg)) => {
+                    assert!(
+                        msg.contains("step failed"),
+                        "unexpected error message: {msg}"
+                    );
+                    saw_error = true;
+                }
+                Some(statie_tui::UiEvent::Parked(_)) => return true,
+                Some(_) => continue,
+                None => panic!("driver event channel closed before a Parked event arrived"),
+            }
+        }
+    })
+    .await
+    .expect("a Parked event should arrive within 2s");
+    assert!(saw_parked);
+    assert!(saw_error, "expected an Error event before Parked");
+    assert!(
+        !driver.is_finished(),
+        "driver task should still be running after a recoverable step error"
+    );
+
+    // Send another message; the driver is still alive and should process it
+    // normally, producing a StepDone.
+    cmd_tx
+        .send(statie_tui::DriverCmd::User("again".to_string()))
+        .await
+        .unwrap();
+
+    let saw_step_done = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ev_rx.recv().await {
+                Some(statie_tui::UiEvent::StepDone { .. }) => return true,
+                Some(_) => continue,
+                None => panic!("driver event channel closed before a StepDone event arrived"),
+            }
+        }
+    })
+    .await
+    .expect("a StepDone event should arrive within 2s");
+    assert!(saw_step_done);
+
+    cmd_tx.send(statie_tui::DriverCmd::Quit).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), driver)
+        .await
+        .expect("driver task should return within 2s after Quit");
+    assert!(
+        matches!(result, Ok(Ok(()))),
+        "driver task should return Ok(()): {result:?}"
+    );
+}
+
+/// When the model parks with `yield` and has set a `recent_summary` in its
+/// patch, the `Parked` message should explain that nothing is being asked
+/// and surface the summary so the user knows what happened.
+#[tokio::test]
+async fn yield_park_message_includes_recent_summary() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![MockTurn::new(
+        json!({
+            "patch": {"counter": 1, "recent_summary": "did the thing"},
+            "action": {"type": "yield"},
+            "ack_inbox": [1],
+        })
+        .to_string(),
+    )];
+    let model = Arc::new(MockModel::new(turns));
+    let session = make_session(Arc::clone(&model), config(&root));
+
+    let skill: DynSkill<ToyWorkspace> = Arc::new(ToySkill::new(100));
+    let registry: Arc<dyn SkillRegistry<ToyWorkspace>> = Arc::new(MapRegistry::new(vec![skill]));
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<statie_tui::DriverCmd>(8);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<statie_tui::UiEvent>();
+
+    let opts = RunOptions {
+        initial_skill: "toy".to_string(),
+        initial_messages: vec![],
+        max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
+    };
+
+    let cancel = session.cancel_handle();
+    let driver = tokio::spawn(statie_tui::run_driver(
+        session, registry, opts, cmd_rx, ev_tx, cancel,
+    ));
+
+    cmd_tx
+        .send(statie_tui::DriverCmd::User("go".to_string()))
+        .await
+        .unwrap();
+
+    let found = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ev_rx.recv().await {
+                Some(statie_tui::UiEvent::Parked(msg)) => return msg,
+                Some(_) => continue,
+                None => panic!("driver event channel closed before a Parked event arrived"),
+            }
+        }
+    })
+    .await
+    .expect("a Parked event should arrive within 2s");
+
+    assert!(found.contains("paused"), "message = {found}");
+    assert!(found.contains("did the thing"), "message = {found}");
+    assert!(found.contains("continue"), "message = {found}");
+
+    drop(cmd_tx);
+    let _ = driver.await;
+}
+
+/// When the model parks with `ask_user`, the `Parked` message should include
+/// the question and make clear that replying resumes the run.
+#[tokio::test]
+async fn ask_user_park_message_includes_question() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![MockTurn::new(
+        json!({
+            "patch": {"counter": 1},
+            "action": {"type": "ask_user", "message": "Which file?"},
+            "ack_inbox": [1],
+        })
+        .to_string(),
+    )];
+    let model = Arc::new(MockModel::new(turns));
+    let session = make_session(Arc::clone(&model), config(&root));
+
+    let skill: DynSkill<ToyWorkspace> = Arc::new(ToySkill::new(100));
+    let registry: Arc<dyn SkillRegistry<ToyWorkspace>> = Arc::new(MapRegistry::new(vec![skill]));
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<statie_tui::DriverCmd>(8);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<statie_tui::UiEvent>();
+
+    let opts = RunOptions {
+        initial_skill: "toy".to_string(),
+        initial_messages: vec![],
+        max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
+    };
+
+    let cancel = session.cancel_handle();
+    let driver = tokio::spawn(statie_tui::run_driver(
+        session, registry, opts, cmd_rx, ev_tx, cancel,
+    ));
+
+    cmd_tx
+        .send(statie_tui::DriverCmd::User("go".to_string()))
+        .await
+        .unwrap();
+
+    let found = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ev_rx.recv().await {
+                Some(statie_tui::UiEvent::Parked(msg)) => return msg,
+                Some(_) => continue,
+                None => panic!("driver event channel closed before a Parked event arrived"),
+            }
+        }
+    })
+    .await
+    .expect("a Parked event should arrive within 2s");
+
+    assert!(found.contains("question: Which file?"), "message = {found}");
+    assert!(found.contains("reply"), "message = {found}");
+
+    drop(cmd_tx);
+    let _ = driver.await;
+}
+
+/// `RunOptions::banner` lines are sent as `Info` events before the first
+/// `Activated` event, so a UI can show config/model/sandbox context before
+/// any activity.
+#[tokio::test]
+async fn banner_lines_are_emitted_before_activation() {
+    let root = tempfile::tempdir().unwrap();
+    let turns = vec![MockTurn::new(
+        json!({"patch": {"counter": 1}, "action": {"type": "yield"}}).to_string(),
+    )];
+    let model = Arc::new(MockModel::new(turns));
+    let session = make_session(Arc::clone(&model), config(&root));
+
+    let skill: DynSkill<ToyWorkspace> = Arc::new(ToySkill::new(100));
+    let registry: Arc<dyn SkillRegistry<ToyWorkspace>> = Arc::new(MapRegistry::new(vec![skill]));
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<statie_tui::DriverCmd>(8);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<statie_tui::UiEvent>();
+
+    let opts = RunOptions {
+        initial_skill: "toy".to_string(),
+        initial_messages: vec![],
+        max_autonomous_steps: 200,
+        banner: vec!["a".to_string(), "b".to_string()],
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
+    };
+
+    let cancel = session.cancel_handle();
+    let driver = tokio::spawn(statie_tui::run_driver(
+        session, registry, opts, cmd_rx, ev_tx, cancel,
+    ));
+
+    let first = ev_rx.recv().await.expect("first event");
+    let second = ev_rx.recv().await.expect("second event");
+    let third = ev_rx.recv().await.expect("third event");
+
+    assert!(
+        matches!(first, statie_tui::UiEvent::Info(ref s) if s == "a"),
+        "{first:?}"
+    );
+    assert!(
+        matches!(second, statie_tui::UiEvent::Info(ref s) if s == "b"),
+        "{second:?}"
+    );
+    assert!(
+        matches!(third, statie_tui::UiEvent::Activated(_)),
+        "{third:?}"
+    );
+
+    drop(cmd_tx);
+    let _ = driver.await;
+}
+
+fn make_handoff_session_sqlite(
+    db_path: &std::path::Path,
+    log: Arc<dyn SessionLog>,
+    model: Arc<MockModel>,
+    cfg: SessionConfig,
+) -> Session<HandoffWorkspace> {
+    let store = SqliteStore::<HandoffWorkspace>::open(db_path).expect("open sqlite store");
+    Session::new(
+        Box::new(store),
+        log,
+        Box::new(ArcModel(model)),
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        cfg,
+    )
+}
+
+/// Resuming (`RunOptions::resume = true`) against a session that was left
+/// activated in the *second* skill of a two-skill handoff must: (1) send a
+/// `Replay` event, before the first `Activated`, carrying recent log
+/// entries (including the earlier `User` entry) and naming the stored
+/// skill; (2) actually start the new driver run in that stored skill, not
+/// `initial_skill`.
+///
+/// `InMemoryStore` can't be shared across two `Session`s (it's not
+/// `Clone`/`Arc`-based), so this uses a `SqliteStore` opened from the same
+/// on-disk file in both phases -- exactly how the real CLI persists state
+/// across two `statie -r` invocations. The `SessionLog` (`MemoryLog`) is
+/// shared directly via the same `Arc` across both phases, since only the
+/// store needs cross-process-like persistence for this test.
+#[tokio::test]
+async fn resume_replays_recent_entries_and_starts_in_stored_skill() {
+    let root = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("session.db");
+    let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
+
+    // --- Phase 1: drive skill "a" to hand off to skill "b". ---
+    let turns = vec![MockTurn::new(
+        json!({
+            "patch": {"notes": ["handoff"]},
+            "action": {"type": "done"},
+            "ack_inbox": [1],
+        })
+        .to_string(),
+    )];
+    let model = Arc::new(MockModel::new(turns));
+    let session = make_handoff_session_sqlite(&db_path, Arc::clone(&log), model, config(&root));
+
+    let a: DynSkill<HandoffWorkspace> = Arc::new(SkillA::new());
+    let b: DynSkill<HandoffWorkspace> = Arc::new(SkillB::new());
+    let registry: Arc<dyn SkillRegistry<HandoffWorkspace>> = Arc::new(MapRegistry::new(vec![a, b]));
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<statie_tui::DriverCmd>(8);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<statie_tui::UiEvent>();
+
+    let opts = RunOptions {
+        initial_skill: "a".to_string(),
+        initial_messages: vec![],
+        max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
+    };
+
+    let cancel = session.cancel_handle();
+    let driver = tokio::spawn(statie_tui::run_driver(
+        session, registry, opts, cmd_rx, ev_tx, cancel,
+    ));
+
+    cmd_tx
+        .send(statie_tui::DriverCmd::User("go".to_string()))
+        .await
+        .unwrap();
+
+    // Wait for activation of "b" (the handoff target).
+    let activated_b = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ev_rx.recv().await {
+                Some(statie_tui::UiEvent::Activated(name)) if name == "b" => return true,
+                Some(_) => continue,
+                None => panic!("driver event channel closed before activating b"),
+            }
+        }
+    })
+    .await
+    .expect("skill b should activate within 2s");
+    assert!(activated_b);
+
+    cmd_tx.send(statie_tui::DriverCmd::Quit).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), driver)
+        .await
+        .expect("driver task should return within 2s after Quit");
+    assert!(matches!(result, Ok(Ok(()))), "phase 1 driver: {result:?}");
+
+    // --- Phase 2: fresh driver over the same persisted state, resuming. ---
+    let model2 = Arc::new(MockModel::new(vec![]));
+    let session2 = make_handoff_session_sqlite(&db_path, Arc::clone(&log), model2, config(&root));
+
+    let a2: DynSkill<HandoffWorkspace> = Arc::new(SkillA::new());
+    let b2: DynSkill<HandoffWorkspace> = Arc::new(SkillB::new());
+    let registry2: Arc<dyn SkillRegistry<HandoffWorkspace>> =
+        Arc::new(MapRegistry::new(vec![a2, b2]));
+
+    let (cmd_tx2, cmd_rx2) = tokio::sync::mpsc::channel::<statie_tui::DriverCmd>(8);
+    let (ev_tx2, mut ev_rx2) = tokio::sync::mpsc::unbounded_channel::<statie_tui::UiEvent>();
+
+    let opts2 = RunOptions {
+        // Not the stored skill ("b"); resume should override this.
+        initial_skill: "a".to_string(),
+        initial_messages: vec![],
+        max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: true,
+        replay_entries: 40,
+        skill_explicit: false,
+    };
+
+    let cancel2 = session2.cancel_handle();
+    let driver2 = tokio::spawn(statie_tui::run_driver(
+        session2, registry2, opts2, cmd_rx2, ev_tx2, cancel2,
+    ));
+
+    let first = ev_rx2.recv().await.expect("first event (Replay)");
+    let (entries, skill) = match first {
+        statie_tui::UiEvent::Replay { entries, skill, .. } => (entries, skill),
+        other => panic!("expected Replay as the first event, got {other:?}"),
+    };
+    assert_eq!(skill, "b", "resume should start in the stored skill");
+    assert!(
+        entries.iter().any(|e| e.kind == statie_core::LogKind::User),
+        "replayed entries should include the earlier User entry: {entries:?}"
+    );
+
+    let second = ev_rx2.recv().await.expect("second event (Activated)");
+    assert!(
+        matches!(second, statie_tui::UiEvent::Activated(ref s) if s == "b"),
+        "expected Activated(\"b\") right after Replay, got {second:?}"
+    );
+
+    drop(cmd_tx2);
+    let _ = driver2.await;
+}
+
+/// With `resume: false`, a fresh run never sends a `Replay` event, even if
+/// the underlying store happens to have prior state.
+#[tokio::test]
+async fn fresh_run_sends_no_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("session.db");
+    let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
+
+    // Seed some prior state via phase 1, same as the resume test.
+    let turns = vec![MockTurn::new(
+        json!({
+            "patch": {"notes": ["handoff"]},
+            "action": {"type": "done"},
+            "ack_inbox": [1],
+        })
+        .to_string(),
+    )];
+    let model = Arc::new(MockModel::new(turns));
+    let session = make_handoff_session_sqlite(&db_path, Arc::clone(&log), model, config(&root));
+
+    let a: DynSkill<HandoffWorkspace> = Arc::new(SkillA::new());
+    let b: DynSkill<HandoffWorkspace> = Arc::new(SkillB::new());
+    let registry: Arc<dyn SkillRegistry<HandoffWorkspace>> = Arc::new(MapRegistry::new(vec![a, b]));
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<statie_tui::DriverCmd>(8);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<statie_tui::UiEvent>();
+    let opts = RunOptions {
+        initial_skill: "a".to_string(),
+        initial_messages: vec![],
+        max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
+    };
+    let cancel = session.cancel_handle();
+    let driver = tokio::spawn(statie_tui::run_driver(
+        session, registry, opts, cmd_rx, ev_tx, cancel,
+    ));
+    cmd_tx
+        .send(statie_tui::DriverCmd::User("go".to_string()))
+        .await
+        .unwrap();
+    let activated_b = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ev_rx.recv().await {
+                Some(statie_tui::UiEvent::Activated(name)) if name == "b" => return true,
+                Some(_) => continue,
+                None => panic!("driver event channel closed before activating b"),
+            }
+        }
+    })
+    .await
+    .expect("skill b should activate within 2s");
+    assert!(activated_b);
+    cmd_tx.send(statie_tui::DriverCmd::Quit).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), driver)
+        .await
+        .expect("driver task should return within 2s after Quit");
+
+    // Phase 2: fresh (resume: false) driver over the same persisted state.
+    let model2 = Arc::new(MockModel::new(vec![]));
+    let session2 = make_handoff_session_sqlite(&db_path, Arc::clone(&log), model2, config(&root));
+    let a2: DynSkill<HandoffWorkspace> = Arc::new(SkillA::new());
+    let b2: DynSkill<HandoffWorkspace> = Arc::new(SkillB::new());
+    let registry2: Arc<dyn SkillRegistry<HandoffWorkspace>> =
+        Arc::new(MapRegistry::new(vec![a2, b2]));
+
+    let (cmd_tx2, cmd_rx2) = tokio::sync::mpsc::channel::<statie_tui::DriverCmd>(8);
+    let (ev_tx2, mut ev_rx2) = tokio::sync::mpsc::unbounded_channel::<statie_tui::UiEvent>();
+    let opts2 = RunOptions {
+        initial_skill: "a".to_string(),
+        initial_messages: vec![],
+        max_autonomous_steps: 200,
+        banner: Vec::new(),
+        resume: false,
+        replay_entries: 40,
+        skill_explicit: false,
+    };
+    let cancel2 = session2.cancel_handle();
+    let driver2 = tokio::spawn(statie_tui::run_driver(
+        session2, registry2, opts2, cmd_rx2, ev_tx2, cancel2,
+    ));
+
+    // Since `initial_skill` is "a" and skill "a" is not terminal and has no
+    // handoff yet (notes empty on this fresh activation's workspace? no --
+    // activation only touches harness fields, agent state persists in the
+    // store, so `a`'s handoff condition (`notes == ["handoff"]`) is already
+    // true from phase 1 and it will hand off to "b" again without a model
+    // call). Either way, no Replay event should ever appear.
+    let first = ev_rx2.recv().await.expect("first event");
+    assert!(
+        !matches!(first, statie_tui::UiEvent::Replay { .. }),
+        "fresh run (resume: false) should never send Replay, got {first:?}"
+    );
+
+    drop(cmd_tx2);
+    let _ = driver2.await;
 }

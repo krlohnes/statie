@@ -19,39 +19,62 @@ use crate::config::Config;
 use crate::toy::{ToyRegistry, toy_tool_set};
 
 #[derive(Parser)]
-#[command(name = "statie", about = "A mutable-state, interactive coding harness for local LLMs")]
+#[command(
+    name = "statie",
+    version,
+    about = "A mutable-state, interactive coding harness for local LLMs"
+)]
 struct Cli {
     /// Path to the config file. Overrides $STATIE_CONFIG and the default
     /// search locations.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
+    #[command(flatten)]
+    run: RunArgs,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    /// Seed the first message of the session. Combined with -p/--prompt,
+    /// this becomes the first message and the -p values follow it in order.
+    #[arg(value_name = "PROMPT")]
+    prompt: Option<String>,
+
+    /// Run headlessly: seed a user message, drive the session to
+    /// completion (or the step cap), print the transcript, and exit.
+    /// Repeatable; each occurrence becomes one seeded user message, in
+    /// order.
+    #[arg(short = 'p', long = "prompt", value_name = "TEXT")]
+    prompts: Vec<String>,
+
+    /// Continue the existing session in `<sandbox>/.statie/` instead of
+    /// archiving it and starting fresh (the default).
+    #[arg(short, long)]
+    resume: bool,
+
+    /// Which skill to run: `router`, `plan`, `implement`, `review`
+    /// (all share the coding workspace) or `toy`. Defaults to `router` when
+    /// not given. When resuming (`-r`), an explicit `--skill` always wins
+    /// over the session's stored activation; without it, resume starts back
+    /// in the skill the session was parked in.
+    #[arg(long)]
+    skill: Option<String>,
+
+    /// Force the in-memory store + MemoryLog; no files written.
+    #[arg(long)]
+    memory: bool,
+
+    /// Target counter value for the `toy` skill.
+    #[arg(long, default_value_t = 10)]
+    toy_target: u64,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a session.
-    Run {
-        /// Which skill to run: `router`, `plan`, `implement`, `review`
-        /// (all share the coding workspace) or `toy`.
-        #[arg(long, default_value = "router")]
-        skill: String,
-        /// Run without the TUI, driving the loop to completion (or the
-        /// step cap) and printing a summary line.
-        #[arg(long)]
-        headless: bool,
-        /// Seed the session with one or more initial user messages.
-        #[arg(long = "message")]
-        messages: Vec<String>,
-        /// Force the in-memory store + MemoryLog; no files written.
-        #[arg(long)]
-        memory: bool,
-        /// Target counter value for the `toy` skill.
-        #[arg(long, default_value_t = 10)]
-        toy_target: u64,
-    },
     /// Config file management.
     Config {
         #[command(subcommand)]
@@ -100,32 +123,27 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Config {
+        Some(Command::Config {
             command: ConfigCommand::Init { global, force },
-        } => cmd_config_init(global, force),
-        Command::Config {
+        }) => cmd_config_init(global, force),
+        Some(Command::Config {
             command: ConfigCommand::Show,
-        } => cmd_config_show(cli.config),
-        Command::Check => cmd_check(cli.config).await,
-        Command::Run {
-            skill,
-            headless,
-            messages,
-            memory,
-            toy_target,
-        } => cmd_run(cli.config, skill, headless, messages, memory, toy_target).await,
-        Command::Eval {
+        }) => cmd_config_show(cli.config),
+        Some(Command::Check) => cmd_check(cli.config).await,
+        Some(Command::Eval {
             task,
             steps,
             json,
             verbose,
-        } => eval::cmd_eval(cli.config, task, steps, json, verbose).await,
+        }) => eval::cmd_eval(cli.config, task, steps, json, verbose).await,
+        None => cmd_run(cli.config, cli.run).await,
     }
 }
 
 fn cmd_config_init(global: bool, force: bool) -> anyhow::Result<()> {
     let path = if global {
-        config::global_config_path().ok_or_else(|| anyhow::anyhow!("could not determine the user config directory"))?
+        config::global_config_path()
+            .ok_or_else(|| anyhow::anyhow!("could not determine the user config directory"))?
     } else {
         config::local_config_path()
     };
@@ -137,10 +155,14 @@ fn cmd_config_init(global: bool, force: bool) -> anyhow::Result<()> {
         );
     }
 
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+    if global {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+    } else {
+        Config::default().ensure_statie_dir()?;
     }
 
     let default_cfg = Config::default();
@@ -182,7 +204,8 @@ async fn cmd_check(cli_flag: Option<PathBuf>) -> anyhow::Result<()> {
                     .map(|models| {
                         models.iter().any(|m| {
                             m.get("name").and_then(|n| n.as_str()) == Some(cfg.model.model.as_str())
-                                || m.get("model").and_then(|n| n.as_str()) == Some(cfg.model.model.as_str())
+                                || m.get("model").and_then(|n| n.as_str())
+                                    == Some(cfg.model.model.as_str())
                         })
                     })
                     .unwrap_or(false);
@@ -221,7 +244,11 @@ fn init_tracing(headless: bool, sandbox_root: &std::path::Path) {
         let log_dir = sandbox_root.join(".statie");
         if std::fs::create_dir_all(&log_dir).is_ok() {
             let log_path = log_dir.join("statie.log");
-            if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
                 let _ = tracing_subscriber::fmt()
                     .with_env_filter(env_filter)
                     .with_writer(std::sync::Mutex::new(file))
@@ -232,24 +259,74 @@ fn init_tracing(headless: bool, sandbox_root: &std::path::Path) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn cmd_run(
-    cli_flag: Option<PathBuf>,
-    skill_set: String,
-    headless: bool,
-    messages: Vec<String>,
-    memory: bool,
-    toy_target: u64,
-) -> anyhow::Result<()> {
-    let (cfg, _path) = config::load(cli_flag)?;
+async fn cmd_run(cli_flag: Option<PathBuf>, run: RunArgs) -> anyhow::Result<()> {
+    let RunArgs {
+        prompt,
+        prompts,
+        resume,
+        skill,
+        memory,
+        toy_target,
+    } = run;
+
+    // Headless mode is exactly "one or more -p/--prompt values". A bare
+    // positional PROMPT alone seeds the TUI's first message rather than
+    // triggering headless mode.
+    let headless = !prompts.is_empty();
+    let messages = initial_messages(prompt, prompts);
+
+    let (cfg, path) = config::load(cli_flag)?;
     let root = SandboxRoot::new(&cfg.sandbox_root)?;
+
+    if !memory {
+        cfg.ensure_statie_dir()?;
+    }
 
     init_tracing(headless, root.path());
 
+    if !memory {
+        if resume {
+            if cfg.has_existing_session() {
+                let msg = format!(
+                    "resuming session at {}",
+                    cfg.resolved_store_path().display()
+                );
+                eprintln!("{msg}");
+                tracing::info!("{msg}");
+            }
+        } else if let Some(dir) = cfg.archive_session()? {
+            let msg = format!("archived previous session to {}", dir.display());
+            eprintln!("{msg}");
+            tracing::info!("{msg}");
+        }
+    }
+
+    // An explicit `--skill` always wins over a resumed session's stored
+    // activation; absent one, fall back to `router` as before (the driver
+    // resolves the stored activation itself when `resume` is set).
+    let skill_explicit = skill.is_some();
+    let skill_set = skill.unwrap_or_else(|| "router".to_string());
+
     match skill_set.as_str() {
-        "toy" => run_toy(cfg, root, headless, messages, memory, toy_target).await,
+        "toy" => {
+            run_toy(
+                cfg, path, root, headless, messages, memory, toy_target, resume,
+            )
+            .await
+        }
         "router" | "plan" | "implement" | "review" => {
-            run_coding(cfg, root, &skill_set, headless, messages, memory).await
+            run_coding(
+                cfg,
+                path,
+                root,
+                &skill_set,
+                headless,
+                messages,
+                memory,
+                resume,
+                skill_explicit,
+            )
+            .await
         }
         other => anyhow::bail!(
             "unknown skill `{other}` (expected one of: router, plan, implement, review, toy)"
@@ -257,17 +334,73 @@ async fn cmd_run(
     }
 }
 
+/// Combines the positional PROMPT (if any) with the `-p`/`--prompt` values
+/// into the ordered list of initial user messages: positional first, then
+/// the `-p` values in the order given.
+fn initial_messages(prompt: Option<String>, prompts: Vec<String>) -> Vec<String> {
+    let mut messages: Vec<String> = Vec::new();
+    if let Some(p) = prompt {
+        messages.push(p);
+    }
+    messages.extend(prompts);
+    messages
+}
+
+/// Builds the startup banner lines: the config source, the model backend
+/// being used, the sandbox root, whether this run is resuming or fresh, and
+/// a usage hint. Sent as `UiEvent::Info` lines before the first activation
+/// so a user in an unconfigured directory sees *why* the first model call
+/// might fail, instead of the TUI silently dying on their first Enter (the
+/// bug this banner accompanies a fix for).
+fn build_banner(
+    cfg: &Config,
+    path: &Option<PathBuf>,
+    root: &SandboxRoot,
+    resume: bool,
+) -> Vec<String> {
+    let config_line = match path {
+        Some(p) => format!("config: {}", p.display()),
+        None => "config: defaults (no config file found; run `statie config init` and set model.base_url)".to_string(),
+    };
+    let model_line = if cfg.model.backend == "mock" {
+        "model: mock".to_string()
+    } else {
+        format!(
+            "model: {} {} @ {}",
+            cfg.model.backend, cfg.model.model, cfg.model.base_url
+        )
+    };
+    let sandbox_line = format!("sandbox: {}", root.path().display());
+    let session_line = if resume {
+        format!("session: resuming {}", cfg.resolved_store_path().display())
+    } else {
+        "session: fresh".to_string()
+    };
+    vec![
+        config_line,
+        model_line,
+        sandbox_line,
+        session_line,
+        "type a message and press Enter; /help for commands; ctrl-c to quit".to_string(),
+    ]
+}
+
 /// Builds a `Session<CodingWorkspace>` wired exactly like the toy path
 /// (config store/log/augmenters/budgets, `statie_tools::default_tools`)
 /// and dispatches to `run_tui`/`run_headless`, starting in `skill`.
+#[allow(clippy::too_many_arguments)]
 async fn run_coding(
     cfg: Config,
+    path: Option<PathBuf>,
     root: SandboxRoot,
     skill: &str,
     headless: bool,
     messages: Vec<String>,
     memory: bool,
+    resume: bool,
+    skill_explicit: bool,
 ) -> anyhow::Result<()> {
+    let banner = build_banner(&cfg, &path, &root, resume);
     let model = cfg.build_model()?;
     let tools = statie_tools::default_tools(&cfg.tools);
     let tokenizer = Box::new(TiktokenTokenizer);
@@ -290,11 +423,21 @@ async fn run_coding(
         )
     };
 
-    let mut session = Session::new(store, Arc::clone(&log), model, tools, tokenizer, session_config);
+    let mut session = Session::new(
+        store,
+        Arc::clone(&log),
+        model,
+        tools,
+        tokenizer,
+        session_config,
+    );
 
     if cfg.augmenters.repo_bm25.enabled {
         let repo_bm25 = RepoBm25::build(&session.config().root, RepoBm25Options::default())?;
-        session = session.with_augmenter(Box::new(repo_bm25), TokenBudget(cfg.augmenters.repo_bm25.budget));
+        session = session.with_augmenter(
+            Box::new(repo_bm25),
+            TokenBudget(cfg.augmenters.repo_bm25.budget),
+        );
     }
     if cfg.augmenters.session_log_bm25.enabled {
         let session_log_bm25 = SessionLogBm25::new(Arc::clone(&log), Vec::new(), 8);
@@ -304,36 +447,48 @@ async fn run_coding(
         );
     }
 
-    let registry: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> = Arc::new(CodingRegistry::new());
+    let registry: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> =
+        Arc::new(CodingRegistry::new());
 
     let opts = RunOptions {
         initial_skill: skill.to_string(),
         initial_messages: messages,
         max_autonomous_steps: cfg.max_autonomous_steps,
+        banner,
+        resume,
+        replay_entries: 40,
+        skill_explicit,
     };
 
     if headless {
         let mut stdout = std::io::stdout();
-        let summary: HeadlessSummary = statie_tui::run_headless(session, registry, opts, &mut stdout).await?;
+        let summary: HeadlessSummary =
+            statie_tui::run_headless(session, registry, opts, &mut stdout).await?;
         println!(
             "steps={} outcome={} prompt_tokens={:?}",
             summary.steps, summary.final_outcome, summary.prompt_tokens
         );
         Ok(())
     } else {
-        statie_tui::run_tui(session, registry, opts).await?;
+        if let Err(e) = statie_tui::run_tui(session, registry, opts).await {
+            anyhow::bail!("statie exited with an error: {e}");
+        }
         Ok(())
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_toy(
     cfg: Config,
+    path: Option<PathBuf>,
     root: SandboxRoot,
     headless: bool,
     messages: Vec<String>,
     memory: bool,
     toy_target: u64,
+    resume: bool,
 ) -> anyhow::Result<()> {
+    let banner = build_banner(&cfg, &path, &root, resume);
     let model = cfg.build_model()?;
     let tools = toy_tool_set();
     let tokenizer = Box::new(TiktokenTokenizer);
@@ -350,14 +505,27 @@ async fn run_toy(
             cfg.build_memory_log(),
         )
     } else {
-        (cfg.build_store::<statie_skills::ToyWorkspace>()?, cfg.build_log()?)
+        (
+            cfg.build_store::<statie_skills::ToyWorkspace>()?,
+            cfg.build_log()?,
+        )
     };
 
-    let mut session = Session::new(store, Arc::clone(&log), model, tools, tokenizer, session_config);
+    let mut session = Session::new(
+        store,
+        Arc::clone(&log),
+        model,
+        tools,
+        tokenizer,
+        session_config,
+    );
 
     if cfg.augmenters.repo_bm25.enabled {
         let repo_bm25 = RepoBm25::build(&session.config().root, RepoBm25Options::default())?;
-        session = session.with_augmenter(Box::new(repo_bm25), TokenBudget(cfg.augmenters.repo_bm25.budget));
+        session = session.with_augmenter(
+            Box::new(repo_bm25),
+            TokenBudget(cfg.augmenters.repo_bm25.budget),
+        );
     }
     if cfg.augmenters.session_log_bm25.enabled {
         let session_log_bm25 = SessionLogBm25::new(Arc::clone(&log), Vec::new(), 8);
@@ -367,24 +535,73 @@ async fn run_toy(
         );
     }
 
-    let registry: Arc<dyn SkillRegistry<statie_skills::ToyWorkspace>> = Arc::new(ToyRegistry::new(toy_target));
+    let registry: Arc<dyn SkillRegistry<statie_skills::ToyWorkspace>> =
+        Arc::new(ToyRegistry::new(toy_target));
 
     let opts = RunOptions {
         initial_skill: "toy".to_string(),
         initial_messages: messages,
         max_autonomous_steps: cfg.max_autonomous_steps,
+        banner,
+        resume,
+        replay_entries: 40,
+        skill_explicit: false,
     };
 
     if headless {
         let mut stdout = std::io::stdout();
-        let summary: HeadlessSummary = statie_tui::run_headless(session, registry, opts, &mut stdout).await?;
+        let summary: HeadlessSummary =
+            statie_tui::run_headless(session, registry, opts, &mut stdout).await?;
         println!(
             "steps={} outcome={} prompt_tokens={:?}",
             summary.steps, summary.final_outcome, summary.prompt_tokens
         );
         Ok(())
     } else {
-        statie_tui::run_tui(session, registry, opts).await?;
+        if let Err(e) = statie_tui::run_tui(session, registry, opts).await {
+            anyhow::bail!("statie exited with an error: {e}");
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod run_args_tests {
+    use super::*;
+
+    #[test]
+    fn positional_alone_seeds_one_message() {
+        assert_eq!(
+            initial_messages(Some("hi".to_string()), Vec::new()),
+            vec!["hi".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompts_alone_seed_in_order() {
+        assert_eq!(
+            initial_messages(None, vec!["a".to_string(), "b".to_string()]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn positional_then_prompts_are_ordered_positional_first() {
+        assert_eq!(
+            initial_messages(
+                Some("first".to_string()),
+                vec!["second".to_string(), "third".to_string()]
+            ),
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn neither_yields_no_messages() {
+        assert_eq!(initial_messages(None, Vec::new()), Vec::<String>::new());
     }
 }

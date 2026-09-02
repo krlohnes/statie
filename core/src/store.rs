@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::error::PatchError;
 use crate::error::StoreError;
 use crate::model::Action;
-use crate::error::PatchError;
 use crate::patch::{PatchStrategy, ValidatedPatch};
 use crate::version::{CommittedState, HarnessState, Version};
 
@@ -25,8 +25,8 @@ pub type ApplyFn<'a, W> = &'a (dyn Fn(&W, &Value) -> Result<W, PatchError> + Syn
 /// Build an [`ApplyFn`]-compatible closure for strategy `P`.
 pub fn apply_fn<W, P: PatchStrategy<W>>() -> impl Fn(&W, &Value) -> Result<W, PatchError> + Sync {
     move |cur: &W, raw: &Value| {
-        let patch: P::Patch =
-            serde_json::from_value(raw.clone()).map_err(|e| PatchError::Malformed(e.to_string()))?;
+        let patch: P::Patch = serde_json::from_value(raw.clone())
+            .map_err(|e| PatchError::Malformed(e.to_string()))?;
         P::apply(cur, &patch)
     }
 }
@@ -53,8 +53,11 @@ pub trait StateStore<W>: Send + Sync {
     /// Reapply the patch log from the initial snapshot up to `to`, using
     /// `apply` (see [`apply_fn`]) to turn each logged patch into the next
     /// agent state. The harness region is taken from the logged entry.
-    async fn replay(&self, to: Version, apply: ApplyFn<'_, W>)
-        -> Result<CommittedState<W>, StoreError>;
+    async fn replay(
+        &self,
+        to: Version,
+        apply: ApplyFn<'_, W>,
+    ) -> Result<CommittedState<W>, StoreError>;
 
     /// Overwrite the harness region only (used for inbox pushes and
     /// activation switches). Bumps no version.

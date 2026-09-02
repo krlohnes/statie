@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use statie_core::{
-    AgentState, Augmentation, Budgets, Capabilities, HarnessState, HarnessView,
-    HeuristicTokenizer, InboxItem, OverBudget, PromptBuilder, Promptable, SkillSpec,
-    SystemPrompt, ToolSet, Version,
+    AgentState, Augmentation, Budgets, Capabilities, HarnessState, HarnessView, HeuristicTokenizer,
+    InboxItem, OverBudget, PromptBuilder, Promptable, SkillSpec, SystemPrompt, ToolSet, Version,
 };
 
 fn budgets() -> Budgets {
@@ -34,6 +33,7 @@ fn harness_state() -> HarnessState {
         budgets: budgets(),
         activation: "toy".to_string(),
         step: 0,
+        last_overflow: None,
     }
 }
 
@@ -127,9 +127,15 @@ fn sections_render_in_fixed_order_regardless_of_call_order() {
     assert!(spec_idx < tools_idx);
 
     let user_text = prompt.user();
-    let agent_idx = user_text.find("## Agent State").expect("Agent State heading");
-    let harness_idx = user_text.find("## Harness View").expect("Harness View heading");
-    let aug_idx = user_text.find("## Augmentation").expect("Augmentation heading");
+    let agent_idx = user_text
+        .find("## Agent State")
+        .expect("Agent State heading");
+    let harness_idx = user_text
+        .find("## Harness View")
+        .expect("Harness View heading");
+    let aug_idx = user_text
+        .find("## Augmentation")
+        .expect("Augmentation heading");
     assert!(agent_idx < harness_idx);
     assert!(harness_idx < aug_idx);
 }
@@ -155,4 +161,28 @@ fn harness_view_renders_only_unacked_inbox_items() {
     assert!(!rendered.contains("[1] acked message"));
     // The rendered inbox listing must not carry an entry for id 1 at all.
     assert!(!rendered.contains("[1]"));
+}
+
+#[test]
+fn harness_view_renders_last_observation_when_set() {
+    let mut harness = harness_state();
+    harness.last_overflow = Some("step 3: `echo` output overflowed".to_string());
+    let view = HarnessView::new(&harness);
+    let rendered = view.render();
+    assert!(
+        rendered.contains("last_observation: step 3: `echo` output overflowed"),
+        "expected a last_observation line, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn harness_view_omits_last_observation_when_none() {
+    let harness = harness_state();
+    assert!(harness.last_overflow.is_none());
+    let view = HarnessView::new(&harness);
+    let rendered = view.render();
+    assert!(
+        !rendered.contains("last_observation:"),
+        "expected no last_observation line, got:\n{rendered}"
+    );
 }

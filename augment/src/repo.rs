@@ -1,13 +1,17 @@
 //! `RepoBm25`: BM25 retrieval over the sandbox's source files, chunked by
 //! line ranges.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::RwLock;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use statie_core::{Augmenter, Bm25Index, Observation, SandboxRoot, Snippet, TokenBudget, Tokenizer};
+use statie_core::{
+    Augmenter, Bm25Index, Observation, SandboxRoot, Snippet, TokenBudget, Tokenizer,
+};
 
 use crate::fit::fit_snippets;
 use crate::query::query_text;
@@ -40,6 +44,9 @@ impl Default for RepoBm25Options {
                 "target".to_string(),
                 "node_modules".to_string(),
                 ".statie".to_string(),
+                "__pycache__".to_string(),
+                ".venv".to_string(),
+                "venv".to_string(),
             ],
             extensions: None,
         }
@@ -54,9 +61,14 @@ struct Chunk {
     text: String,
 }
 
+/// Fingerprint of every indexed file's on-disk state, keyed by relative
+/// path: `(mtime as nanos since epoch, 0 if unavailable; file length)`.
+type Fingerprint = BTreeMap<String, (u64, u64)>;
+
 struct RepoState {
     index: Bm25Index,
     chunks: Vec<Chunk>,
+    fingerprint: Fingerprint,
 }
 
 /// BM25 retrieval over the files under a `SandboxRoot`.
@@ -72,27 +84,106 @@ impl RepoBm25 {
     /// remaining file into `opts.chunk_lines`-line chunks, and indexes each
     /// chunk with text = `"{relative path} {chunk text}"`.
     pub fn build(root: &SandboxRoot, opts: RepoBm25Options) -> std::io::Result<Self> {
-        let (index, chunks) = index_root(root, &opts)?;
+        let (index, chunks, fingerprint) = index_root(root, &opts)?;
         Ok(RepoBm25 {
             root: root.clone(),
             opts,
-            state: RwLock::new(RepoState { index, chunks }),
+            state: RwLock::new(RepoState {
+                index,
+                chunks,
+                fingerprint,
+            }),
         })
     }
 
-    /// Rebuilds the index from disk.
-    pub fn refresh(&mut self) -> std::io::Result<()> {
-        let (index, chunks) = index_root(&self.root, &self.opts)?;
+    /// Rebuilds the index from disk unconditionally.
+    pub fn refresh(&self) -> std::io::Result<()> {
+        let (index, chunks, fingerprint) = index_root(&self.root, &self.opts)?;
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.index = index;
         state.chunks = chunks;
+        state.fingerprint = fingerprint;
         Ok(())
+    }
+
+    /// Computes the current on-disk fingerprint (same walk and filters as
+    /// `index_root`, but metadata only — no file reads).
+    fn current_fingerprint(&self) -> std::io::Result<Fingerprint> {
+        current_fingerprint(&self.root, &self.opts)
+    }
+
+    /// Re-indexes from disk if the sandbox's file set/mtimes/lengths have
+    /// changed since the last index or refresh. Returns `true` if it
+    /// re-indexed, `false` if the stored index was already up to date.
+    pub fn refresh_if_changed(&self) -> std::io::Result<bool> {
+        let current = self.current_fingerprint()?;
+        let changed = {
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            state.fingerprint != current
+        };
+        if !changed {
+            return Ok(false);
+        }
+
+        let (index, chunks, fingerprint) = index_root(&self.root, &self.opts)?;
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        state.index = index;
+        state.chunks = chunks;
+        state.fingerprint = fingerprint;
+        Ok(true)
     }
 }
 
-fn index_root(root: &SandboxRoot, opts: &RepoBm25Options) -> std::io::Result<(Bm25Index, Vec<Chunk>)> {
-    let mut index = Bm25Index::new();
-    let mut chunks: Vec<Chunk> = Vec::new();
+/// Returns `true` if `path` (relative to `root`) passes the exclude-dir,
+/// extension, and size filters used by both `index_root` and
+/// `current_fingerprint`.
+fn is_indexable_file(
+    entry: &walkdir::DirEntry,
+    opts: &RepoBm25Options,
+) -> Option<std::fs::Metadata> {
+    if !entry.file_type().is_file() {
+        return None;
+    }
+    let path = entry.path();
+
+    if let Some(exts) = &opts.extensions {
+        let matches = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| exts.iter().any(|allowed| allowed == e))
+            .unwrap_or(false);
+        if !matches {
+            return None;
+        }
+    }
+
+    let metadata = entry.metadata().ok()?;
+    if metadata.len() as usize > opts.max_file_bytes {
+        return None;
+    }
+
+    Some(metadata)
+}
+
+fn relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn fingerprint_entry(metadata: &std::fs::Metadata) -> (u64, u64) {
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    (mtime, metadata.len())
+}
+
+fn current_fingerprint(root: &SandboxRoot, opts: &RepoBm25Options) -> std::io::Result<Fingerprint> {
+    let mut fingerprint = Fingerprint::new();
 
     let walker = walkdir::WalkDir::new(root.path())
         .into_iter()
@@ -103,28 +194,43 @@ fn index_root(root: &SandboxRoot, opts: &RepoBm25Options) -> std::io::Result<(Bm
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-
-        if let Some(exts) = &opts.extensions {
-            let matches = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| exts.iter().any(|allowed| allowed == e))
-                .unwrap_or(false);
-            if !matches {
-                continue;
-            }
-        }
-
-        let Ok(metadata) = entry.metadata() else {
+        let Some(metadata) = is_indexable_file(&entry, opts) else {
             continue;
         };
-        if metadata.len() as usize > opts.max_file_bytes {
+        let rel = relative_path(root.path(), entry.path());
+        fingerprint.insert(rel, fingerprint_entry(&metadata));
+    }
+
+    Ok(fingerprint)
+}
+
+fn index_root(
+    root: &SandboxRoot,
+    opts: &RepoBm25Options,
+) -> std::io::Result<(Bm25Index, Vec<Chunk>, Fingerprint)> {
+    let mut index = Bm25Index::new();
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut fingerprint = Fingerprint::new();
+
+    let walker = walkdir::WalkDir::new(root.path())
+        .into_iter()
+        .filter_entry(|e| !is_excluded_dir(e, root.path(), &opts.exclude_dirs));
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let Some(metadata) = is_indexable_file(&entry, opts) else {
             continue;
-        }
+        };
+        let path = entry.path();
+        let rel = relative_path(root.path(), path);
+
+        // This file passed the walk/exclude/extension/size filters, so it
+        // counts toward the fingerprint regardless of whether it turns out
+        // to be readable/valid UTF-8 below.
+        fingerprint.insert(rel.clone(), fingerprint_entry(&metadata));
 
         let Ok(bytes) = std::fs::read(path) else {
             continue;
@@ -132,12 +238,6 @@ fn index_root(root: &SandboxRoot, opts: &RepoBm25Options) -> std::io::Result<(Bm
         let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
-
-        let rel = path
-            .strip_prefix(root.path())
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
 
         let lines: Vec<&str> = text.lines().collect();
         if lines.is_empty() {
@@ -166,7 +266,7 @@ fn index_root(root: &SandboxRoot, opts: &RepoBm25Options) -> std::io::Result<(Bm
         }
     }
 
-    Ok((index, chunks))
+    Ok((index, chunks, fingerprint))
 }
 
 fn is_excluded_dir(entry: &walkdir::DirEntry, root: &Path, exclude_dirs: &[String]) -> bool {
@@ -200,6 +300,10 @@ impl<W: Serialize + Send + Sync> Augmenter<W> for RepoBm25 {
         let query = query_text(s, obs);
         if query.trim().is_empty() {
             return Vec::new();
+        }
+
+        if let Err(err) = self.refresh_if_changed() {
+            tracing::warn!("repo_bm25: failed to refresh index, using stale index: {err}");
         }
 
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());

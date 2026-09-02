@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use statie_core::{SessionLog, StateStore};
-use statie_models::{MockModel, MockTurn, OllamaConfig, OllamaFormat, OllamaModel, OpenAiCompatConfig, OpenAiCompatModel};
+use statie_models::{
+    MockModel, MockTurn, OllamaConfig, OllamaFormat, OllamaModel, OpenAiCompatConfig,
+    OpenAiCompatModel,
+};
 use statie_store::{InMemoryStore, JsonlLog, SqliteStore};
 use statie_tools::ToolConfig;
 
@@ -211,8 +214,12 @@ pub enum ConfigError {
 /// 1. `--config <path>`
 /// 2. `$STATIE_CONFIG`
 /// 3. `./.statie/config.json`
-/// 4. `~/.config/statie/config.json`
-/// 5. (none — built-in defaults)
+/// 4. `$XDG_CONFIG_HOME/statie/config.json` (defaulting to
+///    `~/.config/statie/config.json`)
+/// 5. `<platform config dir>/statie/config.json` (e.g.
+///    `~/Library/Application Support/statie/config.json` on macOS) — a
+///    fallback for files written before this XDG precedence existed
+/// 6. (none — built-in defaults)
 pub fn resolve_path(cli_flag: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(p) = cli_flag {
         return Some(p);
@@ -226,12 +233,28 @@ pub fn resolve_path(cli_flag: Option<PathBuf>) -> Option<PathBuf> {
     if cwd_config.exists() {
         return Some(cwd_config.to_path_buf());
     }
-    if let Some(home_config) = dirs::config_dir().map(|d| d.join("statie").join("config.json"))
-        && home_config.exists()
+    if let Some(xdg_config) = xdg_config_path()
+        && xdg_config.exists()
     {
-        return Some(home_config);
+        return Some(xdg_config);
+    }
+    if let Some(platform_config) = dirs::config_dir().map(|d| d.join("statie").join("config.json"))
+        && platform_config.exists()
+    {
+        return Some(platform_config);
     }
     None
+}
+
+/// `$XDG_CONFIG_HOME/statie/config.json` if that env var is set and
+/// non-empty, else `<home>/.config/statie/config.json`.
+pub fn xdg_config_path() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg).join("statie").join("config.json"));
+    }
+    dirs::home_dir().map(|d| d.join(".config").join("statie").join("config.json"))
 }
 
 /// Loads and parses the effective config. Returns the config plus the path
@@ -267,7 +290,7 @@ pub fn load(cli_flag: Option<PathBuf>) -> Result<(Config, Option<PathBuf>), Conf
 
 /// The default config path for `statie config init --global`.
 pub fn global_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("statie").join("config.json"))
+    xdg_config_path()
 }
 
 /// The default config path for `statie config init` (no `--global`).
@@ -290,6 +313,25 @@ impl Config {
             return Err("`model.num_ctx` must be greater than zero".to_string());
         }
         Ok(())
+    }
+
+    /// Creates `<sandbox_root>/.statie/` if missing and ensures it
+    /// self-ignores from git, the way `target/` does for cargo: writes
+    /// `.statie/.gitignore` with `*\n` if (and only if) that file does not
+    /// already exist. Never overwrites an existing `.gitignore`. Idempotent.
+    /// Returns the directory path.
+    pub fn ensure_statie_dir(&self) -> anyhow::Result<PathBuf> {
+        let dir = self.sandbox_root.join(".statie");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", dir.display()))?;
+
+        let gitignore = dir.join(".gitignore");
+        if !gitignore.exists() {
+            std::fs::write(&gitignore, "*\n")
+                .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", gitignore.display()))?;
+        }
+
+        Ok(dir)
     }
 
     pub fn ollama(&self) -> OllamaConfig {
@@ -352,19 +394,87 @@ impl Config {
                 let model = MockModel::new(turns).repeat_last(true);
                 Ok(Box::new(model))
             }
-            other => anyhow::bail!("unknown model backend `{other}` (expected one of: ollama, openai, mock)"),
+            other => anyhow::bail!(
+                "unknown model backend `{other}` (expected one of: ollama, openai, mock)"
+            ),
         }
     }
 
     /// Resolves `self.store.path` and `self.session_log` against the
     /// sandbox root, so relative paths in the config are anchored there
     /// rather than the process cwd.
-    fn resolved_store_path(&self) -> PathBuf {
+    pub(crate) fn resolved_store_path(&self) -> PathBuf {
         resolve_under(&self.sandbox_root, &self.store.path)
     }
 
     fn resolved_session_log_path(&self) -> PathBuf {
         resolve_under(&self.sandbox_root, &self.session_log)
+    }
+
+    /// True when a previous sqlite-backed session's store file exists on
+    /// disk. Used to warn the user that `statie run` will resume it.
+    pub fn has_existing_session(&self) -> bool {
+        self.store.kind == "sqlite" && self.resolved_store_path().exists()
+    }
+
+    /// Archives an existing sqlite store and/or session log out of the way
+    /// so a fresh `statie run` starts a clean session. Moves the store db
+    /// (plus any `-wal`/`-shm` sidecars) and the JSONL log into
+    /// `<sandbox_root>/.statie/archive/<YYYYmmdd-HHMMSS>/`, preserving file
+    /// names. Returns `Ok(None)` if there was nothing to archive (kind is
+    /// not `sqlite`, or neither file exists).
+    pub fn archive_session(&self) -> anyhow::Result<Option<PathBuf>> {
+        if self.store.kind != "sqlite" {
+            return Ok(None);
+        }
+
+        let store_path = self.resolved_store_path();
+        let log_path = self.resolved_session_log_path();
+
+        if !store_path.exists() && !log_path.exists() {
+            return Ok(None);
+        }
+
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let archive_dir = self
+            .sandbox_root
+            .join(".statie")
+            .join("archive")
+            .join(timestamp);
+        std::fs::create_dir_all(&archive_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create archive dir {}: {e}",
+                archive_dir.display()
+            )
+        })?;
+
+        let mut candidates = vec![store_path.clone(), log_path.clone()];
+        for ext in ["-wal", "-shm"] {
+            if let Some(file_name) = store_path.file_name() {
+                let mut sidecar_name = file_name.to_os_string();
+                sidecar_name.push(ext);
+                candidates.push(store_path.with_file_name(sidecar_name));
+            }
+        }
+
+        for path in candidates {
+            if !path.exists() {
+                continue;
+            }
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            let dest = archive_dir.join(file_name);
+            std::fs::rename(&path, &dest).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to archive {} to {}: {e}",
+                    path.display(),
+                    dest.display()
+                )
+            })?;
+        }
+
+        Ok(Some(archive_dir))
     }
 
     /// Builds the configured `StateStore<W>`. Unknown `store.kind` values
@@ -379,7 +489,9 @@ impl Config {
                 let store = SqliteStore::<W>::open(self.resolved_store_path())?;
                 Ok(Box::new(store))
             }
-            other => anyhow::bail!("unknown store kind `{other}` (expected one of: memory, sqlite)"),
+            other => {
+                anyhow::bail!("unknown store kind `{other}` (expected one of: memory, sqlite)")
+            }
         }
     }
 
@@ -449,13 +561,19 @@ mod tests {
     #[test]
     fn unknown_top_level_key_errors() {
         let result: Result<Config, _> = serde_json::from_str(r#"{"modle":{}}"#);
-        assert!(result.is_err(), "expected an error for the unknown key `modle`");
+        assert!(
+            result.is_err(),
+            "expected an error for the unknown key `modle`"
+        );
     }
 
     #[test]
     fn unknown_nested_key_errors() {
         let result: Result<Config, _> = serde_json::from_str(r#"{"model":{"bakend":"mock"}}"#);
-        assert!(result.is_err(), "expected an error for the unknown nested key `bakend`");
+        assert!(
+            result.is_err(),
+            "expected an error for the unknown nested key `bakend`"
+        );
     }
 
     #[test]
@@ -486,7 +604,11 @@ mod tests {
         }
         std::env::set_current_dir(orig_cwd).unwrap();
 
-        assert_eq!(resolved, Some(other_file), "env var should win over ./.statie/config.json");
+        assert_eq!(
+            resolved,
+            Some(other_file),
+            "env var should win over ./.statie/config.json"
+        );
     }
 
     #[test]
@@ -519,7 +641,11 @@ mod tests {
         }
         std::env::set_current_dir(orig_cwd).unwrap();
 
-        assert_eq!(resolved, Some(flag_file), "--config should win over both env and default");
+        assert_eq!(
+            resolved,
+            Some(flag_file),
+            "--config should win over both env and default"
+        );
     }
 
     #[test]
@@ -534,12 +660,14 @@ mod tests {
         }
 
         // Best-effort: this can only assert "None" reliably if the test
-        // machine has no ~/.config/statie/config.json. Skip the assertion
-        // if that file happens to exist rather than produce a flaky test.
-        let would_use_global = dirs::config_dir()
-            .map(|d| d.join("statie").join("config.json"))
-            .map(|p| p.exists())
-            .unwrap_or(false);
+        // machine has no ~/.config/statie/config.json (XDG) and no
+        // <platform config dir>/statie/config.json. Skip the assertion if
+        // either file happens to exist rather than produce a flaky test.
+        let would_use_global = xdg_config_path().map(|p| p.exists()).unwrap_or(false)
+            || dirs::config_dir()
+                .map(|d| d.join("statie").join("config.json"))
+                .map(|p| p.exists())
+                .unwrap_or(false);
 
         let resolved = resolve_path(None);
         std::env::set_current_dir(orig_cwd).unwrap();
@@ -547,6 +675,59 @@ mod tests {
         if !would_use_global {
             assert_eq!(resolved, None);
         }
+    }
+
+    #[test]
+    fn resolve_path_uses_xdg_config_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let xdg_dir = tempfile::tempdir().unwrap();
+        let statie_dir = xdg_dir.path().join("statie");
+        std::fs::create_dir_all(&statie_dir).unwrap();
+        let xdg_file = statie_dir.join("config.json");
+        std::fs::write(&xdg_file, "{}").unwrap();
+
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd_dir.path()).unwrap();
+        unsafe {
+            std::env::remove_var("STATIE_CONFIG");
+            std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        }
+
+        let resolved = resolve_path(None);
+
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        std::env::set_current_dir(orig_cwd).unwrap();
+
+        assert_eq!(
+            resolved,
+            Some(xdg_file),
+            "should find the config under $XDG_CONFIG_HOME/statie/config.json"
+        );
+    }
+
+    #[test]
+    fn global_config_path_follows_xdg_config_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let xdg_dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        }
+
+        let resolved = global_config_path();
+
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        assert_eq!(
+            resolved,
+            Some(xdg_dir.path().join("statie").join("config.json"))
+        );
     }
 
     #[test]
@@ -576,7 +757,10 @@ mod tests {
 
         let err = load(Some(path.clone())).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains(path.to_str().unwrap()), "error should mention the path: {msg}");
+        assert!(
+            msg.contains(path.to_str().unwrap()),
+            "error should mention the path: {msg}"
+        );
     }
 
     #[test]

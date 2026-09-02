@@ -7,7 +7,11 @@ use statie_core::{Snippet, TokenBudget, Tokenizer};
 /// `tok.count(&format!("[{source}]\n{text}"))` stays `<= budget.0`. Stops at
 /// the first snippet that would exceed the budget (does not skip past it to
 /// try a later, smaller one).
-pub fn fit_snippets(snippets: Vec<Snippet>, budget: TokenBudget, tok: &dyn Tokenizer) -> Vec<Snippet> {
+pub fn fit_snippets(
+    snippets: Vec<Snippet>,
+    budget: TokenBudget,
+    tok: &dyn Tokenizer,
+) -> Vec<Snippet> {
     let mut kept = Vec::new();
     let mut total = 0usize;
 

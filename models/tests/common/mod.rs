@@ -42,6 +42,7 @@ pub fn build_prompt(version: Version) -> BoundedPrompt {
         budgets: budgets(),
         activation: "toy".to_string(),
         step: 0,
+        last_overflow: None,
     };
     let harness_view = HarnessView::new(&harness);
 
@@ -116,8 +117,8 @@ pub async fn read_request(stream: &mut tokio::net::TcpStream) -> (String, String
         buf.extend_from_slice(&chunk[..n]);
     }
 
-    let body =
-        String::from_utf8(buf[header_end..header_end + content_length].to_vec()).expect("utf8 body");
+    let body = String::from_utf8(buf[header_end..header_end + content_length].to_vec())
+        .expect("utf8 body");
     (body, header_text)
 }
 
@@ -143,7 +144,10 @@ pub async fn write_ndjson_response(stream: &mut tokio::net::TcpStream, lines: &[
         body.len(),
         body
     );
-    stream.write_all(response.as_bytes()).await.expect("write response");
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .expect("write response");
     stream.shutdown().await.expect("shutdown");
 }
 
@@ -163,17 +167,27 @@ pub async fn write_sse_response(stream: &mut tokio::net::TcpStream, data_lines: 
         body.len(),
         body
     );
-    stream.write_all(response.as_bytes()).await.expect("write response");
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .expect("write response");
     stream.shutdown().await.expect("shutdown");
 }
 
 #[allow(dead_code)]
-pub async fn write_status_response(stream: &mut tokio::net::TcpStream, status_line: &str, body: &str) {
+pub async fn write_status_response(
+    stream: &mut tokio::net::TcpStream,
+    status_line: &str,
+    body: &str,
+) {
     let response = format!(
         "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
-    stream.write_all(response.as_bytes()).await.expect("write response");
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .expect("write response");
     stream.shutdown().await.expect("shutdown");
 }

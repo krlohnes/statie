@@ -59,7 +59,8 @@ fn eval_toy_json_shows_flat_statie_and_growing_baseline() {
     });
 
     let mut file = std::fs::File::create(&cfg_path).unwrap();
-    file.write_all(serde_json::to_string(&cfg).unwrap().as_bytes()).unwrap();
+    file.write_all(serde_json::to_string(&cfg).unwrap().as_bytes())
+        .unwrap();
     drop(file);
 
     let output = Command::new(bin())
@@ -83,7 +84,8 @@ fn eval_toy_json_shows_flat_statie_and_growing_baseline() {
         "expected success; stdout={stdout}\nstderr={stderr}"
     );
 
-    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
 
     let statie = &value["statie"];
     let baseline = &value["baseline"];
@@ -94,10 +96,17 @@ fn eval_toy_json_shows_flat_statie_and_growing_baseline() {
         .iter()
         .map(|v| v.as_u64().unwrap())
         .collect();
-    assert_eq!(statie_tokens.len(), 3, "statie.prompt_tokens: {statie_tokens:?}");
+    assert_eq!(
+        statie_tokens.len(),
+        3,
+        "statie.prompt_tokens: {statie_tokens:?}"
+    );
     let min = *statie_tokens.iter().min().unwrap();
     let max = *statie_tokens.iter().max().unwrap();
-    assert!(max - min <= 20, "statie prompt should stay flat: {statie_tokens:?}");
+    assert!(
+        max - min <= 20,
+        "statie prompt should stay flat: {statie_tokens:?}"
+    );
 
     let baseline_tokens: Vec<u64> = baseline["prompt_tokens"]
         .as_array()
@@ -105,7 +114,11 @@ fn eval_toy_json_shows_flat_statie_and_growing_baseline() {
         .iter()
         .map(|v| v.as_u64().unwrap())
         .collect();
-    assert_eq!(baseline_tokens.len(), 3, "baseline.prompt_tokens: {baseline_tokens:?}");
+    assert_eq!(
+        baseline_tokens.len(),
+        3,
+        "baseline.prompt_tokens: {baseline_tokens:?}"
+    );
     // The terminal `done` step short-circuits before calling the model, so it
     // records no prompt; the three model-calling steps must show the
     // append-only baseline's prompt growing strictly with every entry.
@@ -188,7 +201,8 @@ fn eval_toy_table_has_srv_headers_and_dash_for_no_usage() {
     });
 
     let mut file = std::fs::File::create(&cfg_path).unwrap();
-    file.write_all(serde_json::to_string(&cfg).unwrap().as_bytes()).unwrap();
+    file.write_all(serde_json::to_string(&cfg).unwrap().as_bytes())
+        .unwrap();
     drop(file);
 
     let output = Command::new(bin())
@@ -216,5 +230,8 @@ fn eval_toy_table_has_srv_headers_and_dash_for_no_usage() {
     assert!(stdout.contains("srv_growth"), "stdout={stdout}");
     assert!(stdout.contains("srv_completion"), "stdout={stdout}");
     assert!(stdout.contains("est_total"), "stdout={stdout}");
-    assert!(stdout.contains(" - "), "expected `-` in a server column: {stdout}");
+    assert!(
+        stdout.contains(" - "),
+        "expected `-` in a server column: {stdout}"
+    );
 }

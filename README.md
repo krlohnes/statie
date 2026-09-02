@@ -2,39 +2,59 @@
 
 ![statie](statie-code.png)
 
-statie is a mutable-state, interactive coding harness for local LLMs. Instead
-of growing a transcript on every turn, it keeps one bounded prompt per step —
-an immutable skill spec, the current structured workspace state, the latest
-tool observation, and optional retrieval augmentation — and asks the model
-to emit a single JSON patch plus an action (run a tool, ask the user, yield,
-or finish). The model's own reasoning never re-enters the prompt; the full
-session history is persisted to disk and searchable by the model through a
-`recall` tool, but prompt size stays flat whether the session is 5 steps or
-500.
+statie is a mutable-state, interactive coding harness for local LLMs, written
+in Rust. It implements the SKILL.state architecture from
+[*SKILL.state* (Badhe, Tiwari, Chung — arXiv:2608.26263, EMNLP 2026)](https://arxiv.org/abs/2608.26263),
+adapted for an interactive terminal workflow instead of batch skill
+execution.
 
-The binary in this crate (`statie`) is the thing you actually run: it loads
-a JSON config, wires together a model backend, a persistence store, a set of
-tools, and retrieval augmenters into a `Session`, and drives it either
-through the `statie-tui` terminal UI or headlessly for scripting and CI.
-Nothing about which model server to talk to, where state lives, or how big
-the prompt budget is is hardcoded anywhere in the binary — all of it comes
-from the config file described below, the same way you'd configure any
-other agentic coding harness.
+The idea: instead of growing a transcript on every turn, the model gets one
+bounded prompt per step — an immutable skill spec, the current structured
+workspace state, the latest tool observation, and a little retrieval — and
+answers with a single JSON patch to that state plus one action (call a tool,
+ask the user, or finish). Its reasoning never re-enters the prompt. The full
+history is persisted and searchable through a `recall` tool, but prompt size
+stays flat whether the session is 5 steps or 500.
+
+Everything about which model server to talk to, where state lives, and how
+big the budgets are comes from a JSON config file, the way you'd configure
+any other agentic coding harness. Nothing is hardcoded.
 
 ## Quick start
 
 ```sh
-cargo run -- config init           # writes ./.statie/config.json with the defaults
-$EDITOR .statie/config.json        # at minimum, point base_url at your model server
-cargo run -- check                 # verifies the model backend is reachable and reports its capabilities
-cargo run --                       # starts a session (TUI by default)
-cargo run -- "fix the bug in x"    # starts a session, seeding the first message
-cargo run -- -p "fix the bug in x" # headless: run to completion, print the transcript, exit
+cargo install --path cli                 # installs `statie` into ~/.cargo/bin
+statie config init --global              # writes ~/.config/statie/config.json
+$EDITOR ~/.config/statie/config.json     # point model.base_url at your server
+statie check                             # is the server reachable, is the model there?
+
+cd ~/some/project
+statie                                   # TUI, fresh session
+statie "add a --json flag to the CLI"    # TUI, seeded with a first message
+statie -p "add a --json flag to the CLI" # headless: run to completion, print, exit
+statie -r                                # resume the session in ./.statie/
 ```
 
-`cargo run -- config init --global` writes to
-`~/.config/statie/config.json` instead, so the config applies to every
-project you run `statie` from unless a project-local config overrides it.
+A working config for gemma4:26b on Ollama looks like this (the rest of the
+keys take their defaults):
+
+```json
+{
+  "model": {
+    "backend": "ollama",
+    "base_url": "http://192.168.1.222:11434",
+    "model": "gemma4:26b",
+    "num_ctx": 16384,
+    "timeout_secs": 1200,
+    "options": { "temperature": 0.3 }
+  },
+  "budget": { "total": 12000, "observation": 2000, "augmentation": 1000 }
+}
+```
+
+`sandbox_root` defaults to the current directory, so run `statie` from the
+project you want it to work on. Session state lives in `./.statie/`, which
+writes its own `.gitignore`.
 
 ## Configuration
 
@@ -49,11 +69,11 @@ statie reads a single JSON config file. Resolution order, first hit wins:
    as a fallback)
 5. built-in defaults (no file at all)
 
-Every field has a default, so a partial file — even `{}` — is valid; any
-key not recognized (a typo like `"modle"`) is a hard error rather than being
+Every field has a default, so a partial file — even `{}` — is valid; an
+unrecognized key (a typo like `"modle"`) is a hard error rather than being
 silently ignored. `statie.example.json` at the repo root is the full default
 config with every key spelled out; `statie config show` prints the config
-statie would actually use, merged with whichever file it resolved.
+statie would actually use and where it came from.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -85,100 +105,125 @@ statie would actually use, merged with whichever file it resolved.
 | `tools.max_output_bytes` | integer | `200000` | Per-tool output cap before truncation. |
 | `max_autonomous_steps` | integer | `200` | Safety cap on consecutive autonomous steps (`Outcome::Continue`) before a run stops on its own. |
 
-Config files never contain a hardcoded model endpoint by design — everything
-above is read from the file (or its defaults), and `check`/`run` build the
-model backend purely from `model.*`.
-
 ## Commands
 
+- `statie [OPTIONS] [PROMPT]` — starts a session in the TUI. A positional
+  `PROMPT` seeds the first message.
+- `statie -p|--prompt <TEXT> [OPTIONS]` — headless mode (see below).
+  Repeatable; each `-p` is one seeded message, in order, after the
+  positional `PROMPT` if there is one.
 - `statie config init [--global] [--force]` — writes the default config to
   `./.statie/config.json` (or `~/.config/statie/config.json` with
-  `--global`); refuses to overwrite an existing file unless `--force` is
-  given. `.statie/` is self-ignoring (it gets its own `.gitignore`); commit a
-  copy elsewhere, e.g. `statie.example.json`, if you want the config in
-  version control.
-- `statie config show` — prints the effective config (defaults merged with
-  whichever file was resolved) as pretty JSON, and the path it came from
-  (or `defaults` if none was found).
-- `statie check` — builds the configured model backend and prints its
-  `capabilities()` (native thinking, schema-constrained decoding, prefix
-  caching). For the `ollama` backend it also queries `GET
-  {base_url}/api/tags` and reports whether `model.model` is present on the
-  server.
-- `statie [OPTIONS] [PROMPT]` — starts a session. With no `PROMPT` and no
-  `-p`, launches the `statie-tui` terminal UI empty. A positional `PROMPT`
-  seeds the first message and (with no `-p`) still launches the TUI.
-- `statie -p|--prompt <TEXT> [OPTIONS]` — headless mode: seeds `TEXT` as a
-  user message, drives the session to completion (or until it parks) with
-  no terminal UI, prints the transcript, and exits. Repeatable — each
-  `-p` becomes one seeded user message, in order; a positional `PROMPT`
-  combined with `-p` becomes the first message, with the `-p` values
-  following it in order.
-  Options, valid with or without `-p`:
-  - `--skill <name>` (default `router`) — the starting activation:
-    `router`, `plan`, `implement`, and `review` all share the coding
-    workspace and its tools (read, write, edit, search, shell, test, recall —
-    `statie_tools::default_tools`); `toy` runs the toy skill instead. For
-    the coding skills, the first seeded message is the task the router
-    copies into the workspace.
-  - `-r, --resume` — continue the existing session in `<sandbox>/.statie/`
-    instead of starting fresh. **Fresh is the default**: without
-    `--resume`, an existing sqlite session store and log are archived to
-    `.statie/archive/<timestamp>/` first (printing an `archived previous
-    session to ...` notice to stderr) and a clean session starts. With
-    `--resume` and an existing session, it's continued in place (printing
-    a `resuming session at ...` notice); with `--resume` and no existing
-    session, it just starts — no error.
-  - `--memory` — forces an in-memory store and log; nothing touches disk,
-    useful for tests and one-off scratch runs. Never archives or resumes.
-  - `--toy-target <n>` (default `10`) — target counter value for the
-    `toy` skill.
-- `statie eval [--task <toy|coding>] [--steps N] [--json] [-v|--verbose]`
-  — runs the same task through two harnesses built from the same config:
-  **statie** (the config's own bounded budgets) and **baseline** (an
-  append-only harness that re-injects the entire prior transcript into the
-  prompt every step, via `TranscriptAugmenter`, with an effectively
-  unbounded budget). Both run headlessly, in isolated temp sandboxes, and
-  report `steps`, `success`, and two families of prompt-token stats as a
-  table or (`--json`) a JSON object: `est_*` (`prompt_tokens`,
-  `total_prompt_tokens`, `max_prompt_tokens`, `growth`, printed as
-  `est_total`/`est_max`/`est_growth`) is the local `TiktokenTokenizer`
-  (cl100k) estimate of prompt size; `srv_*` (`server_prompt_tokens`,
-  `server_total_prompt_tokens`, `server_max_prompt_tokens`,
-  `server_total_completion_tokens`, `server_growth`) is the backend's own
-  reported token usage for each model call — Ollama's `prompt_eval_count`/
-  `eval_count`, or an OpenAI-compatible server's `usage` object — present
-  only when the backend reports it (the printed table shows `-` in the
-  server columns otherwise, e.g. for the `mock` backend with no scripted
-  usage). `srv_max` is the number to compare against `model.num_ctx`, since
-  it comes from the model's own tokenizer rather than the local estimate.
-  `--task toy` drives `ToySkill` up to `--steps` (default 10) with the
-  `echo` tool; `--task coding` asks the router to create `hello.txt` with a
-  fixed line of content and checks the sandbox for it. Exits non-zero only
-  on an actual error — a harness failing the task is reported, not treated
-  as a CLI failure. Pair with a `model.backend: "mock"` config for a fully
-  offline, deterministic comparison.
+  `--global`); refuses to overwrite without `--force`. `.statie/` is
+  self-ignoring; keep a copy elsewhere (e.g. `statie.example.json`) if you
+  want the config in version control.
+- `statie config show` — prints the effective config and its source.
+- `statie check` — builds the model backend and prints its capabilities
+  (native thinking, schema-constrained decoding, prefix caching). For Ollama
+  it also asks the server whether `model.model` is present.
+- `statie eval [--task toy|coding] [--steps N] [--json] [-v]` — see
+  [Eval](#eval).
 
-### Headless mode (-p)
+Session options, valid with or without `-p`:
 
-By default `statie` launches the `statie-tui` terminal UI. Passing one or
-more `-p`/`--prompt` values switches to headless mode instead: it drives the
-session loop to completion (or until it parks) without a terminal UI,
-writing to stdout, and exits `0` when the run reaches `done` or parks (e.g.
-on `AskUser`/`Yield`). It prints a final summary line:
+- `-r, --resume` — continue the session in `<sandbox>/.statie/`. **Fresh is
+  the default**: without `--resume`, an existing store and log are archived
+  to `.statie/archive/<timestamp>/` first and a clean session starts. On
+  resume the TUI starts in the skill that was active and replays the last
+  40 log entries into the history pane.
+- `--skill <name>` — the starting activation. `router` (default), `plan`,
+  `implement`, and `review` share the coding workspace; `toy` runs the toy
+  counter skill. Normally the router picks and the handoffs chain on their
+  own. An explicit `--skill` wins over the stored activation on resume.
+- `--memory` — in-memory store and log; nothing touches disk. Never archives
+  or resumes.
+- `--toy-target <n>` — target for the `toy` skill (default 10).
+
+## In the TUI
+
+The history pane shows each step: the model's reasoning collapsed to one
+line, the patch, the action, and the tool output; the status bar shows the
+skill, step, version, prompt tokens (estimated and server-reported), and a
+spinner with elapsed seconds while the model is thinking. Steps on a 26B
+local model take 20–60 s. On startup the banner prints the config path, the
+model, the sandbox, and whether the session is fresh or resumed.
+
+Type a message and press Enter to give the model its next turn. Slash
+commands (type `/` for completion, Tab to accept):
+
+| Command | Effect |
+|---|---|
+| `/state` | print the committed workspace |
+| `/reasoning [step]` | expand the reasoning of a step (default: latest) |
+| `/patches [n]` | last n patches (default 5) |
+| `/log [kind] [n]` | last n log entries, optionally one kind: `user`, `patch`, `action`, `tool_output`, `system` |
+| `/tools` | tools available to the current skill |
+| `/skill <name>` | switch skill (must be an allowed transition); `/skill! <name>` forces it |
+| `/edit <json>` | apply a merge patch to the workspace yourself |
+| `/help`, `/quit` | |
+
+Keys: ↑/↓ and PgUp/PgDn scroll history, Home/End jump, ctrl-u clears the
+input, ctrl-l clears the pane, Esc clears the input, ctrl-c cancels the
+in-flight step (and quits when idle).
+
+When the session parks it says why and what to do: a question from the
+model, a step failure (fix the config or server and send a message to
+retry), or the autonomous step cap (`max_autonomous_steps` consecutive
+steps without pausing; any message continues with a fresh counter).
+
+## Tools
+
+All tools are confined to `sandbox_root` and their output is capped at
+`tools.max_output_bytes`, then truncated head/tail to `budget.observation`
+for the prompt (the full output stays in the session log).
+
+| Tool | What it does |
+|---|---|
+| `read_file` | a file, or a window of it (`offset`/`limit`), with line numbers |
+| `write_file` | whole-file write, atomic; for new files or full rewrites |
+| `edit_file` | replace exactly one anchored occurrence; whitespace-tolerant fallback; reports the closest line on a miss |
+| `search` | regex over file contents, with `path`/`glob`/`max_results`; root-relative paths |
+| `list_files` | recursive listing, skipping `.git`, `target`, `node_modules`, `__pycache__`, virtualenvs |
+| `filter_last_tool_call` | regex over the full output of the previous tool call, for when it overflowed |
+| `shell` | `sh -c` in the sandbox with a timeout; runs in its own process group and kills it on timeout, cancel, or lingering background children |
+| `test` | the project's test command (auto-detected or explicit), reported as `result: pass` / `result: fail (exit N)` plus a failure summary |
+| `recall` | search the session log (never the model's reasoning) |
+
+The coding skills: `router` decides where to go, `plan` explores and writes
+a step list, `implement` works the plan with `edit_file`/`write_file` and
+runs `test`, `review` runs `test`, checks the changes, and either sends
+findings back to `implement` or marks the task done.
+
+## Headless mode
+
+`-p` drives the session to completion without a terminal UI, printing every
+step to stdout, and exits 0 when the run reaches `done` or parks. The last
+line is a summary:
 
 ```
 steps=N outcome=<done|parked|...> prompt_tokens=[…]
 ```
 
-For example:
-
 ```sh
-statie -p "create hello.txt" --skill router --memory
+statie -p "create hello.txt containing hello statie" --memory
 ```
 
-This is the mode to use in CI or scripts — pair it with `--memory` and a
-`model.backend: "mock"` config for fully offline, deterministic runs.
+Pair `--memory` with a `model.backend: "mock"` config for offline,
+deterministic runs in CI.
+
+## Eval
+
+`statie eval` runs the same task through two harnesses built from the same
+config: **statie** (bounded budgets) and **baseline** (an append-only
+harness that re-injects the whole transcript every step). Both run
+headlessly in temp sandboxes and report `steps`, `success`, and two
+families of prompt-token stats: `est_*` from the local cl100k estimate, and
+`srv_*` from the backend's own usage counts (Ollama's `prompt_eval_count`/
+`eval_count`, or an OpenAI-compatible `usage` object). `srv_max` is the
+number to compare against `model.num_ctx`. `--task toy` drives the counter
+skill for `--steps`; `--task coding` asks the router to create a file and
+checks that it did. `--json` prints an object instead of a table; `-v`
+prints both transcripts to stderr.
 
 ## Running against Ollama: field notes
 
@@ -218,7 +263,6 @@ either a default or a config knob:
   session log's `Patch`/`rejected` entries) — compare `srv_max` against
   `num_ctx` to see how close a run got to overflowing the context window,
   since it reflects the real tokenizer rather than the cl100k stand-in.
-
 - **Whole-file writes are where small models corrupt code.** `edit_file`
   replaces exactly one anchored occurrence and refuses ambiguous or missing
   anchors; its description says outright that `new` replaces `old`, because
@@ -251,6 +295,41 @@ either a default or a config knob:
   "shell", "args": ...}` (tool name as the type) is rewritten to a `tool`
   call and logged as a `normalized` system entry instead of being rejected;
   a `tool` action with no `name` gets a message that says what's missing.
+- **Truncate to fit by construction, then tell the model what it lost.**
+  Head/tail truncation budgeted 60% + 40% of the observation cap and then
+  appended its marker, so a 57k-char `ls -R node_modules` came out 11 tokens
+  over and the strict builder failed the step. `truncate` now reserves the
+  marker's cost, verifies the rendered count, and shrinks until it fits.
+  The marker itself is now an instruction with numbers ("57853 chars, ~14000
+  tokens against a 2000-token budget; showing the first 1200 and last 800")
+  and the ways to narrow. The harness view carries a `last_observation:`
+  note until the next tool output fits, so the following step still knows.
+  And `filter_last_tool_call` applies a regex to the full output kept in the
+  session log, so the model can pull the lines it needs without re-running
+  the command; there is deliberately no "show me offset N" mode.
+- **Repair the last brace, not the content.** Writing a whole file through
+  `write_file` means 1000+ tokens of escaped code inside one JSON string;
+  gemma4 twice nested `ack_inbox` inside `action` and dropped the final `}`.
+  Ollama's JSON mode did not stop it (a direct probe produced a balanced
+  1593-token object with `done_reason: stop`). The parser now closes
+  unclosed brackets at end of output and hoists a misplaced `ack_inbox`/
+  `patch`, logging both as `normalized`; a cutoff inside a string is still
+  rejected. The server's `done_reason`/`finish_reason` is recorded, and a
+  `length` cutoff says so in the rejection with advice to write less per
+  step. Rejected raw content is logged up to 16k chars so the next
+  diagnosis doesn't lose the tail.
+- **Background processes outlive the shell.** The model ran `npm run dev &`;
+  the 120 s timeout killed `sh` but the Vite server kept port 3000 until it
+  was killed by hand. `shell` now runs each command in its own process
+  group, kills the group on timeout or cancel, and after the shell exits
+  gives lingering readers 500 ms before killing the group and saying so.
+- **Anchors differ by whitespace more than by content.** Five of fourteen
+  `edit_file` calls in one session failed "not found" and each cost a
+  `read_file` round trip. Exact match is tried first; on zero matches a
+  whitespace-normalized window match is accepted when unique (with a
+  note), and a miss reports the closest line.
+- **The step cap is a pause, not a failure.** The parked message now says
+  so, with the step and skill, and how to continue.
 - **`yield` is a dead end for a coding agent.** The model paused with
   `yield` after one step, and the UI could only say "waiting for you: yield".
   The coding skills now reject `yield` outright (`ask_user` with a concrete
@@ -276,5 +355,6 @@ state, not history) versus 3671 and 1173 for the append-only baseline.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the binding contract between
 crates (types, traits, the session loop algorithm, and the type-level
-invariants), and [statie-spec.md](./statie-spec.md) for the original design
-plan it refines.
+invariants) — including the design for the next milestone, on-demand
+guides and subagents as state composition — and
+[statie-spec.md](./statie-spec.md) for the original design plan it refines.

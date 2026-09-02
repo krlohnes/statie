@@ -131,7 +131,10 @@ impl SessionLog for JsonlLog {
 
         let line = serde_json::to_string(&e).map_err(|e| LogError::Backend(e.to_string()))?;
         writeln!(guard.file, "{line}").map_err(|e| LogError::Io(e.to_string()))?;
-        guard.file.flush().map_err(|e| LogError::Io(e.to_string()))?;
+        guard
+            .file
+            .flush()
+            .map_err(|e| LogError::Io(e.to_string()))?;
 
         let doc_id = guard.entries.len() as u64;
         let text = searchable_text(&e.payload);
@@ -322,7 +325,10 @@ mod tests {
 
         match JsonlLog::open(&path) {
             Err(LogError::Backend(msg)) => {
-                assert!(msg.contains('2'), "expected line number 2 in message: {msg}");
+                assert!(
+                    msg.contains('2'),
+                    "expected line number 2 in message: {msg}"
+                );
             }
             Err(other) => panic!("expected LogError::Backend, got {other:?}"),
             Ok(_) => panic!("expected an error opening a malformed log"),

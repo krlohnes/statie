@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 
-use crate::promptable::Observation;
 use crate::prompt::Snippet;
+use crate::promptable::Observation;
 use crate::tokenizer::{TokenBudget, Tokenizer};
 
 #[async_trait]

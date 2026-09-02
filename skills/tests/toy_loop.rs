@@ -10,8 +10,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use statie_core::{
-    Action, Event, LogKind, NullSink, Outcome, Park, SessionError, SessionLogExt, Skill,
-    SkillSpec, Usage, Version,
+    Action, Event, LogKind, NullSink, Outcome, Park, SessionError, SessionLogExt, Skill, SkillSpec,
+    Usage, Version,
 };
 use statie_models::{MockModel, MockTurn};
 use statie_patch::JsonMergePatch;
@@ -135,10 +135,7 @@ async fn inbox_and_ack() {
     let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
 
     let rec = active
-        .step(
-            Event::User("please note this".to_string()),
-            &mut NullSink,
-        )
+        .step(Event::User("please note this".to_string()), &mut NullSink)
         .await
         .unwrap();
     let outcome = log.append_record(rec).unwrap();
@@ -165,7 +162,10 @@ async fn inbox_and_ack() {
 
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome2 = log.append_record(rec2).unwrap();
-    assert!(matches!(outcome2, Outcome::Parked(Park::Yield)), "got {outcome2:?}");
+    assert!(
+        matches!(outcome2, Outcome::Parked(Park::Yield)),
+        "got {outcome2:?}"
+    );
 
     let prompts = model.prompts();
     assert_eq!(prompts.len(), 2);
@@ -252,12 +252,18 @@ async fn cancel_during_model_call() {
         handle.cancel();
     });
 
-    let result = tokio::time::timeout(Duration::from_secs(2), active.step(Event::Tick, &mut NullSink))
-        .await
-        .expect("step should return within 2s")
-        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        active.step(Event::Tick, &mut NullSink),
+    )
+    .await
+    .expect("step should return within 2s")
+    .unwrap();
     let outcome = log.append_record(result).unwrap();
-    assert!(matches!(outcome, Outcome::Parked(Park::Cancelled)), "got {outcome:?}");
+    assert!(
+        matches!(outcome, Outcome::Parked(Park::Cancelled)),
+        "got {outcome:?}"
+    );
     cancel_task.await.unwrap();
 
     let (_, version) = active.session().state().await.unwrap();
@@ -267,7 +273,10 @@ async fn cancel_during_model_call() {
     // valid (non-delayed) turn should succeed normally.
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome2 = log.append_record(rec2).unwrap();
-    assert!(matches!(outcome2, Outcome::Parked(Park::Yield)), "got {outcome2:?}");
+    assert!(
+        matches!(outcome2, Outcome::Parked(Park::Yield)),
+        "got {outcome2:?}"
+    );
 }
 
 #[tokio::test]
@@ -344,7 +353,10 @@ async fn user_patch_edit() {
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome = log.append_record(rec).unwrap();
-    assert!(matches!(outcome, Outcome::Parked(Park::Yield)), "got {outcome:?}");
+    assert!(
+        matches!(outcome, Outcome::Parked(Park::Yield)),
+        "got {outcome:?}"
+    );
 
     let (_, version_before) = active.session().state().await.unwrap();
 
@@ -353,7 +365,10 @@ async fn user_patch_edit() {
         .await
         .unwrap();
     let outcome2 = log.append_record(rec2).unwrap();
-    assert!(matches!(outcome2, Outcome::Parked(Park::Yield)), "got {outcome2:?}");
+    assert!(
+        matches!(outcome2, Outcome::Parked(Park::Yield)),
+        "got {outcome2:?}"
+    );
 
     let (state, version_after) = active.session().state().await.unwrap();
     assert_eq!(version_after, Version(version_before.0 + 1));
@@ -374,7 +389,10 @@ async fn user_patch_edit() {
     assert!(bad.is_err(), "rule-violating user patch should error");
 
     let (_, version_final) = active.session().state().await.unwrap();
-    assert_eq!(version_final, version_after, "version must be unchanged on rejected user patch");
+    assert_eq!(
+        version_final, version_after,
+        "version must be unchanged on rejected user patch"
+    );
 }
 
 // Keep `Action` import exercised for readability of expected shapes above,
@@ -392,11 +410,25 @@ async fn oversized_augmentation_is_trimmed_not_fatal() {
     struct Huge;
     #[async_trait::async_trait]
     impl Augmenter<ToyWorkspace> for Huge {
-        fn name(&self) -> &str { "huge" }
-        async fn augment(&self, _: &ToyWorkspace, _: Option<&statie_core::Observation>, _: TokenBudget, _: &dyn Tokenizer) -> Vec<Snippet> {
+        fn name(&self) -> &str {
+            "huge"
+        }
+        async fn augment(
+            &self,
+            _: &ToyWorkspace,
+            _: Option<&statie_core::Observation>,
+            _: TokenBudget,
+            _: &dyn Tokenizer,
+        ) -> Vec<Snippet> {
             vec![
-                Snippet { source: "small".into(), text: "tiny".into() },
-                Snippet { source: "big".into(), text: "x".repeat(4000) },
+                Snippet {
+                    source: "small".into(),
+                    text: "tiny".into(),
+                },
+                Snippet {
+                    source: "big".into(),
+                    text: "x".repeat(4000),
+                },
             ]
         }
     }
@@ -415,10 +447,16 @@ async fn oversized_augmentation_is_trimmed_not_fatal() {
         .await
         .expect("step must not fail");
     let outcome = active.session().log().append_record(rec).unwrap();
-    assert!(matches!(outcome, Outcome::Parked(Park::Yield)), "{outcome:?}");
+    assert!(
+        matches!(outcome, Outcome::Parked(Park::Yield)),
+        "{outcome:?}"
+    );
     let user = model.prompts()[0].user.clone();
     assert!(user.contains("tiny"), "small snippet kept");
-    assert!(!user.contains(&"x".repeat(4000)), "oversized snippet dropped");
+    assert!(
+        !user.contains(&"x".repeat(4000)),
+        "oversized snippet dropped"
+    );
 }
 
 /// A `MockTurn` with usage attached surfaces on `Active::last_usage()` after
@@ -428,8 +466,11 @@ async fn oversized_augmentation_is_trimmed_not_fatal() {
 async fn last_usage_reflects_the_most_recent_model_call() {
     let root = tempfile::tempdir().unwrap();
     let model = Arc::new(MockModel::new(vec![
-        MockTurn::new(json!({"patch": {"counter": 1}, "action": {"type": "yield"}, "ack_inbox": [1]}).to_string())
-            .with_usage(200, 20),
+        MockTurn::new(
+            json!({"patch": {"counter": 1}, "action": {"type": "yield"}, "ack_inbox": [1]})
+                .to_string(),
+        )
+        .with_usage(200, 20),
     ]));
     let (mut session, log) = make_session(Arc::clone(&model), config(&root));
 
@@ -441,9 +482,15 @@ async fn last_usage_reflects_the_most_recent_model_call() {
         "no model call has happened yet"
     );
 
-    let rec = active.step(Event::User("go".into()), &mut NullSink).await.unwrap();
+    let rec = active
+        .step(Event::User("go".into()), &mut NullSink)
+        .await
+        .unwrap();
     let outcome = log.append_record(rec).unwrap();
-    assert!(matches!(outcome, Outcome::Parked(Park::Yield)), "{outcome:?}");
+    assert!(
+        matches!(outcome, Outcome::Parked(Park::Yield)),
+        "{outcome:?}"
+    );
 
     assert_eq!(
         active.last_usage(),
@@ -510,7 +557,10 @@ async fn rejected_output_with_usage_records_last_usage_and_log_payload() {
         .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("rejected"))
         .expect("expected a rejected system entry");
     assert_eq!(
-        rejected.payload.get("usage").and_then(|u| u.get("prompt_tokens")),
+        rejected
+            .payload
+            .get("usage")
+            .and_then(|u| u.get("prompt_tokens")),
         Some(&json!(50))
     );
 }

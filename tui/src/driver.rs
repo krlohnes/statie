@@ -10,7 +10,8 @@ use tokio::sync::mpsc;
 
 use schemars::JsonSchema;
 use statie_core::{
-    CancelHandle, Event, LogEntry, LogKind, Outcome, Park, Session, SessionLogExt, StepSink, Usage,
+    CancelHandle, Event, LogEntry, LogKind, Outcome, Park, Session, SessionError, SessionLogExt,
+    StepSink, Usage,
 };
 
 use crate::error::TuiError;
@@ -42,6 +43,16 @@ pub enum Query {
 pub enum UiEvent {
     ReasoningDelta(String),
     ContentDelta(String),
+    /// Sent once, before the first `Activated` event, when resuming a
+    /// session that already had committed state: the most recent log
+    /// entries (oldest first) plus the stored step/skill so a UI can render
+    /// "you're back here" instead of an empty history pane.
+    Replay {
+        entries: Vec<LogEntry>,
+        state: Value,
+        step: u64,
+        skill: String,
+    },
     StepDone {
         entries: Vec<LogEntry>,
         outcome: String,
@@ -96,13 +107,81 @@ fn outcome_label(outcome: &Outcome) -> String {
     }
 }
 
-fn park_message(park: &Park) -> String {
+fn park_message(park: &Park, state: &Value) -> String {
     match park {
-        Park::AskUser(msg) => msg.clone(),
-        Park::Yield => "yield".to_string(),
+        Park::AskUser(msg) => format!("question: {msg} — reply in the input box to resume."),
+        Park::Yield => {
+            let summary = state
+                .pointer("/agent/recent_summary")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            match summary {
+                Some(summary) => format!(
+                    "model paused without asking anything (yield). Summary: \"{summary}\". \
+                     Send any message (e.g. \"continue\") to resume."
+                ),
+                None => "model paused without asking anything (yield). Send any message (e.g. \
+                     \"continue\") to resume."
+                    .to_string(),
+            }
+        }
         Park::Failure(reason) => reason.clone(),
         Park::Cancelled => "cancelled".to_string(),
     }
+}
+
+/// The message sent when the autonomous step cap is hit. Explains that the
+/// session is parked, not failed, and how to resume, prefixed with the
+/// current step/skill when available from `state`.
+fn step_cap_message(max_autonomous_steps: usize, state: &Value) -> String {
+    let prefix = match (
+        state.pointer("/harness/step").and_then(Value::as_u64),
+        state.pointer("/harness/activation").and_then(Value::as_str),
+    ) {
+        (Some(step), Some(skill)) => format!("step {step}, skill {skill}: "),
+        _ => String::new(),
+    };
+    format!(
+        "{prefix}autonomous step cap reached ({max_autonomous_steps} steps in a row without \
+         pausing). The session is parked, not failed: send any message (e.g. \"continue\") to \
+         keep going with a fresh counter, or raise max_autonomous_steps in the config."
+    )
+}
+
+/// Whether `e` should end the driver task (`run_driver` returns `Err`)
+/// rather than being surfaced to the user as a recoverable step failure.
+///
+/// Fatal: an unknown skill name (`TuiError::UnknownSkill`, a configuration
+/// bug), a session store failure (`SessionError::Store`, e.g. a corrupt or
+/// unwritable local database -- retrying the same command can't help), a
+/// log-append failure (`TuiError::Log`, same reasoning), or `NoActivation`
+/// (an internal invariant violation). Everything else -- model errors
+/// (including the network/IO failures that happen when there's no
+/// reachable model server, the original bug this fixes), tool failures,
+/// patch/parse errors that escaped skill-level rejection, budget overruns,
+/// and cancellation -- is recoverable: the user can fix the underlying
+/// problem (config, server, network) and retry without restarting the TUI.
+fn is_fatal(e: &TuiError) -> bool {
+    matches!(
+        e,
+        TuiError::UnknownSkill(_)
+            | TuiError::Log(_)
+            | TuiError::Session(SessionError::Store(_))
+            | TuiError::Session(SessionError::NoActivation)
+    )
+}
+
+/// Reports a recoverable step failure as an `Error` event followed by a
+/// `Parked` event, so a UI shows it plainly and returns to the input prompt
+/// instead of the driver task silently ending (the original bug: an
+/// unhandled model/network error propagated with `?`, closing the event
+/// channel and making the TUI look like it crashed on Enter).
+fn report_step_error(ev_tx: &mpsc::UnboundedSender<UiEvent>, e: &TuiError) {
+    let _ = ev_tx.send(UiEvent::Error(format!("step failed: {e}")));
+    let _ = ev_tx.send(UiEvent::Parked(
+        "step failed; fix the problem (config, server, network) and send a message to retry"
+            .to_string(),
+    ));
 }
 
 /// Runs the driver loop against `session`, reading commands from `cmd_rx`
@@ -121,6 +200,10 @@ where
 {
     let _ = &cancel; // held by the caller (TUI task); the driver itself never cancels.
 
+    for line in &opts.banner {
+        let _ = ev_tx.send(UiEvent::Info(line.clone()));
+    }
+
     let mut next_skill = opts.initial_skill.clone();
     let mut forced_next = false;
     // Messages to push as the very first `Event::User` steps after the
@@ -130,6 +213,40 @@ where
     // the new activation should be ticked immediately rather than waiting
     // for a command. A user-issued `/skill` switch, by contrast, waits.
     let mut autonomous_after_activate = false;
+
+    if opts.resume {
+        // Read committed state without activating (activating would append
+        // a spurious "activate" log entry and reset harness fields before
+        // we've had a chance to look at them).
+        if let Ok((state, _version)) = session.state().await {
+            let stored_skill = state.harness.activation.clone();
+            let stored_step = state.harness.step;
+
+            if !opts.skill_explicit && registry.get(&stored_skill).is_some() {
+                next_skill = stored_skill.clone();
+            }
+
+            let log = session.log();
+            let recent = log.entries(None, opts.replay_entries);
+            if !recent.is_empty() {
+                let mut state_value =
+                    serde_json::to_value(&state).unwrap_or(serde_json::Value::Null);
+                if let serde_json::Value::Object(map) = &mut state_value {
+                    map.insert(
+                        "version".to_string(),
+                        serde_json::Value::Number(_version.0.into()),
+                    );
+                }
+                let _ = ev_tx.send(UiEvent::Replay {
+                    entries: recent,
+                    state: state_value,
+                    step: stored_step,
+                    skill: next_skill.clone(),
+                });
+            }
+        }
+        // No committed state: nothing to resume, proceed as a fresh run.
+    }
 
     'activation: loop {
         let Some(skill) = registry.get(&next_skill) else {
@@ -143,34 +260,42 @@ where
         };
         let _ = ev_tx.send(UiEvent::Activated(active.skill_name().to_string()));
 
-        if autonomous_after_activate
-            && let StepOutcome::Switch { name, forced } =
-                run_one_step(&mut active, Event::Tick, &ev_tx, &opts).await?
-        {
-            next_skill = name;
-            forced_next = forced;
-            continue 'activation;
-        }
-
-        // Drain any messages queued for this activation as User steps,
-        // running autonomously after each until parked/done/handoff/capped.
-        let initial_msgs = std::mem::take(&mut pending_initial_messages);
-        for msg in initial_msgs {
-            match run_one_step(
-                &mut active,
-                Event::User(msg),
-                &ev_tx,
-                &opts,
-            )
-            .await?
-            {
-                StepOutcome::Switch { name, forced } => {
-                    next_skill = name;
-                    forced_next = forced;
-                    autonomous_after_activate = true;
-                    continue 'activation;
+        'pre_wait: {
+            if autonomous_after_activate {
+                match run_one_step(&mut active, Event::Tick, &ev_tx, &opts).await {
+                    Ok(StepOutcome::Switch { name, forced }) => {
+                        next_skill = name;
+                        forced_next = forced;
+                        continue 'activation;
+                    }
+                    Ok(StepOutcome::Continue) => {}
+                    Err(e) if is_fatal(&e) => return Err(e),
+                    Err(e) => {
+                        report_step_error(&ev_tx, &e);
+                        pending_initial_messages.clear();
+                        break 'pre_wait;
+                    }
                 }
-                StepOutcome::Continue => {}
+            }
+
+            // Drain any messages queued for this activation as User steps,
+            // running autonomously after each until parked/done/handoff/capped.
+            let initial_msgs = std::mem::take(&mut pending_initial_messages);
+            for msg in initial_msgs {
+                match run_one_step(&mut active, Event::User(msg), &ev_tx, &opts).await {
+                    Ok(StepOutcome::Switch { name, forced }) => {
+                        next_skill = name;
+                        forced_next = forced;
+                        autonomous_after_activate = true;
+                        continue 'activation;
+                    }
+                    Ok(StepOutcome::Continue) => {}
+                    Err(e) if is_fatal(&e) => return Err(e),
+                    Err(e) => {
+                        report_step_error(&ev_tx, &e);
+                        break 'pre_wait;
+                    }
+                }
             }
         }
 
@@ -188,19 +313,21 @@ where
                 DriverCmd::Cancel => {
                     // No step is in flight here (we're between steps,
                     // waiting on a command); nothing to cancel.
-                    let _ = ev_tx.send(UiEvent::Info(
-                        "nothing to cancel".to_string(),
-                    ));
+                    let _ = ev_tx.send(UiEvent::Info("nothing to cancel".to_string()));
                 }
                 DriverCmd::User(text) => {
-                    match run_one_step(&mut active, Event::User(text), &ev_tx, &opts).await? {
-                        StepOutcome::Switch { name, forced } => {
+                    match run_one_step(&mut active, Event::User(text), &ev_tx, &opts).await {
+                        Ok(StepOutcome::Switch { name, forced }) => {
                             next_skill = name;
                             forced_next = forced;
                             autonomous_after_activate = true;
                             continue 'activation;
                         }
-                        StepOutcome::Continue => {}
+                        Ok(StepOutcome::Continue) => {}
+                        Err(e) if is_fatal(&e) => return Err(e),
+                        Err(e) => {
+                            report_step_error(&ev_tx, &e);
+                        }
                     }
                 }
                 DriverCmd::Switch { name, forced } => {
@@ -278,23 +405,23 @@ where
             outcome: outcome_label(&outcome),
             prompt_tokens,
             usage,
-            state,
+            state: state.clone(),
         });
 
         match outcome {
             Outcome::Continue => {
                 continues += 1;
                 if continues >= opts.max_autonomous_steps {
-                    let _ = ev_tx.send(UiEvent::Error(
-                        "autonomous step cap reached".to_string(),
-                    ));
-                    let _ = ev_tx.send(UiEvent::Parked("autonomous step cap reached".to_string()));
+                    let _ = ev_tx.send(UiEvent::Parked(step_cap_message(
+                        opts.max_autonomous_steps,
+                        &state,
+                    )));
                     return Ok(StepOutcome::Continue);
                 }
                 ev = Event::Tick;
             }
             Outcome::Parked(park) => {
-                let _ = ev_tx.send(UiEvent::Parked(park_message(&park)));
+                let _ = ev_tx.send(UiEvent::Parked(park_message(&park, &state)));
                 return Ok(StepOutcome::Continue);
             }
             Outcome::Done => {
@@ -342,7 +469,10 @@ where
             ))
         }
         Query::Reasoning(step) => {
-            let entries = active.session().log().entries(Some(LogKind::Reasoning), 10_000);
+            let entries = active
+                .session()
+                .log()
+                .entries(Some(LogKind::Reasoning), 10_000);
             let filtered: Vec<&LogEntry> = match step {
                 Some(s) => entries.iter().filter(|e| e.step == s).collect(),
                 None => {
@@ -356,11 +486,7 @@ where
                 Ok(filtered
                     .iter()
                     .map(|e| {
-                        let text = e
-                            .payload
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
+                        let text = e.payload.get("text").and_then(Value::as_str).unwrap_or("");
                         format!("[step {}] {}", e.step, text)
                     })
                     .collect::<Vec<_>>()
@@ -450,6 +576,72 @@ pub enum Command {
     Quit,
     Unknown(String),
 }
+
+/// One entry in the single source of truth for slash commands: name, its
+/// argument placeholder text (empty when it takes none), and a one-line help
+/// string. Drives both `parse_command` (by hand, kept in sync via tests) and
+/// the TUI's `/help` text and autocomplete.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub args: &'static str,
+    pub help: &'static str,
+}
+
+/// All slash commands `parse_command` accepts, in the order shown by
+/// `/help` and offered by autocomplete.
+pub const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "state",
+        args: "",
+        help: "show the current session state",
+    },
+    CommandSpec {
+        name: "reasoning",
+        args: "[step]",
+        help: "show reasoning for a step (default: latest)",
+    },
+    CommandSpec {
+        name: "patches",
+        args: "[n]",
+        help: "show the last n patches (default: 5)",
+    },
+    CommandSpec {
+        name: "log",
+        args: "[kind] [n]",
+        help: "show the last n log entries, optionally filtered by kind",
+    },
+    CommandSpec {
+        name: "tools",
+        args: "",
+        help: "list the active tools",
+    },
+    CommandSpec {
+        name: "skill",
+        args: "<name>",
+        help: "switch to a skill",
+    },
+    CommandSpec {
+        name: "skill!",
+        args: "<name>",
+        help: "force-switch to a skill",
+    },
+    CommandSpec {
+        name: "edit",
+        args: "<json merge patch>",
+        help: "apply a JSON merge patch to the workspace",
+    },
+    CommandSpec {
+        name: "help",
+        args: "",
+        help: "show this help",
+    },
+    CommandSpec {
+        name: "quit",
+        args: "",
+        help: "quit",
+    },
+];
 
 fn parse_log_kind(s: &str) -> Option<LogKind> {
     match s {
@@ -631,5 +823,54 @@ mod tests {
     #[test]
     fn bogus_command_is_unknown() {
         assert!(matches!(parse_command("/bogus"), Some(Command::Unknown(_))));
+    }
+
+    /// Every `COMMANDS` entry must parse to something other than
+    /// `Command::Unknown` (appending a plausible argument for commands that
+    /// require one), keeping the single source of truth in sync with
+    /// `parse_command`.
+    #[test]
+    fn every_command_spec_parses() {
+        for spec in COMMANDS {
+            let line = match spec.name {
+                "skill" => "/skill x".to_string(),
+                "skill!" => "/skill! x".to_string(),
+                "edit" => "/edit {}".to_string(),
+                _ => format!("/{}", spec.name),
+            };
+            let parsed = parse_command(&line);
+            assert!(
+                !matches!(parsed, Some(Command::Unknown(_)) | None),
+                "COMMANDS entry {:?} parsed as {:?} for input {line:?}",
+                spec.name,
+                parsed
+            );
+        }
+    }
+
+    /// Every `Command` variant except `Unknown` has a `COMMANDS` entry
+    /// (listed by hand so this test fails if a variant is added without a
+    /// corresponding spec).
+    #[test]
+    fn every_command_variant_has_a_spec() {
+        let names: Vec<&str> = COMMANDS.iter().map(|s| s.name).collect();
+        // One name per `Command` variant other than `Unknown`.
+        for expected in [
+            "state",
+            "reasoning",
+            "patches",
+            "log",
+            "tools",
+            "skill",
+            "skill!",
+            "edit",
+            "help",
+            "quit",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing COMMANDS entry for {expected:?}"
+            );
+        }
     }
 }

@@ -198,7 +198,10 @@ mod tests {
 
         let results = idx.search("parser", 10);
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, 1, "short doc with repeated term should rank first");
+        assert_eq!(
+            results[0].0, 1,
+            "short doc with repeated term should rank first"
+        );
         assert!(results[0].1 > results[1].1);
     }
 

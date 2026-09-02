@@ -10,7 +10,15 @@ use statie_core::{Schema, Tool, ToolCtx, ToolError, ToolOutputFull};
 
 use crate::common::cap_output;
 
-const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".statie"];
+pub(crate) const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".statie",
+    "__pycache__",
+    ".venv",
+    "venv",
+];
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesArgs {
@@ -21,7 +29,8 @@ pub struct ListFilesArgs {
 }
 
 /// Recursively lists files and directories under a sandbox path, skipping
-/// common noise directories (`.git`, `target`, `node_modules`, `.statie`).
+/// common noise directories (`.git`, `target`, `node_modules`, `.statie`,
+/// `__pycache__`, `.venv`, `venv`).
 pub struct ListFiles {
     pub max_output_bytes: usize,
 }
@@ -51,10 +60,14 @@ impl Tool for ListFiles {
         let base = sandbox_path.as_path().to_path_buf();
 
         if !base.exists() {
-            return Err(ToolError::ExecutionFailed(format!("no such directory: {rel}")));
+            return Err(ToolError::ExecutionFailed(format!(
+                "no such directory: {rel}"
+            )));
         }
         if !base.is_dir() {
-            return Err(ToolError::ExecutionFailed(format!("not a directory: {rel}")));
+            return Err(ToolError::ExecutionFailed(format!(
+                "not a directory: {rel}"
+            )));
         }
 
         let mut entries: Vec<(PathBuf, bool)> = Vec::new();
@@ -80,7 +93,11 @@ impl Tool for ListFiles {
             lines.push(format!("… {} more", total - count));
         }
 
-        let out = if lines.is_empty() { "(empty directory)".to_string() } else { lines.join("\n") };
+        let out = if lines.is_empty() {
+            "(empty directory)".to_string()
+        } else {
+            lines.join("\n")
+        };
         Ok(ToolOutputFull::new(cap_output(out, self.max_output_bytes)))
     }
 }

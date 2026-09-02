@@ -72,6 +72,7 @@ pub fn harness(step: u64) -> HarnessState {
         },
         activation: "toy".to_string(),
         step,
+        last_overflow: None,
     }
 }
 

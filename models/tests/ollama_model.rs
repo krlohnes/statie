@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use statie_core::{Model, ModelError, NullSink, Usage, Version};
-use statie_models::{OllamaFormat, OllamaConfig, OllamaModel, strip_thoughts};
+use statie_models::{OllamaConfig, OllamaFormat, OllamaModel, strip_thoughts};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -61,10 +61,7 @@ async fn happy_path_streams_thinking_and_content_and_captures_request() {
         .expect("step succeeds");
 
     assert_eq!(out.reasoning.expect("reasoning").as_ref(), "let me think");
-    assert_eq!(
-        out.content,
-        r#"{"patch":{},"action":{"type":"done"}}"#
-    );
+    assert_eq!(out.content, r#"{"patch":{},"action":{"type":"done"}}"#);
     assert_eq!(sink.reasoning, "let me think");
     assert_eq!(sink.content, r#"{"patch":{},"action":{"type":"done"}}"#);
     assert_eq!(
@@ -115,7 +112,12 @@ async fn done_line_without_usage_counts_reports_no_usage() {
     let schema = schema();
 
     let out = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect("step succeeds");
 
@@ -137,7 +139,12 @@ async fn error_line_returns_backend_error() {
     let schema = schema();
 
     let err = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect_err("expected backend error");
 
@@ -162,7 +169,12 @@ async fn non_2xx_status_returns_backend_error() {
     let schema = schema();
 
     let err = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect_err("expected backend error");
 
@@ -193,7 +205,12 @@ async fn think_false_strips_thoughts_block_from_content() {
     let schema = schema();
 
     let out = model
-        .step(build_prompt(Version(0)), &schema, &mut NullSink, CancellationToken::new())
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
         .await
         .expect("step succeeds");
 
@@ -212,11 +229,16 @@ async fn cancellation_returns_cancelled_promptly() {
         // Send one line, then hang well past the test's cancellation point.
         let line = r#"{"message":{"content":"partial"},"done":false}"#;
         let chunk = format!("{line}\n");
-        let response_head =
-            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
-        stream.write_all(response_head.as_bytes()).await.expect("write head");
+        let response_head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
+        stream
+            .write_all(response_head.as_bytes())
+            .await
+            .expect("write head");
         let chunked = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
-        stream.write_all(chunked.as_bytes()).await.expect("write chunk");
+        stream
+            .write_all(chunked.as_bytes())
+            .await
+            .expect("write chunk");
         tokio::time::sleep(Duration::from_secs(5)).await;
     });
 
@@ -235,7 +257,10 @@ async fn cancellation_returns_cancelled_promptly() {
         .await;
     let elapsed = start.elapsed();
 
-    assert!(matches!(result, Err(ModelError::Cancelled)), "result = {result:?}");
+    assert!(
+        matches!(result, Err(ModelError::Cancelled)),
+        "result = {result:?}"
+    );
     assert!(elapsed < Duration::from_secs(1), "elapsed = {elapsed:?}");
 }
 
@@ -264,6 +289,52 @@ fn strip_thoughts_unterminated_block() {
     assert_eq!(content, "");
 }
 
+/// A `done` line whose `done_reason` is `"length"` (the server cut the
+/// output off after hitting a token/length limit, as opposed to a clean
+/// `"stop"`) must surface as `RawOutput.finish_reason`, so the harness can
+/// explain the resulting parse failure instead of leaving the model to
+/// guess why its JSON was truncated.
+#[tokio::test]
+async fn done_reason_length_is_reported_as_finish_reason() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"content":"{\"patch\":{}"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"length","prompt_eval_count":260,"eval_count":1100}"#,
+            ],
+        )
+        .await;
+    });
+
+    let model = OllamaModel::new(cfg_for(addr)).expect("build model");
+    let schema = schema();
+
+    let out = model
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("step succeeds");
+
+    assert_eq!(out.finish_reason.as_deref(), Some("length"));
+    assert_eq!(
+        out.usage,
+        Some(Usage {
+            prompt_tokens: 260,
+            completion_tokens: 1100,
+        })
+    );
+}
+
 #[tokio::test]
 async fn json_format_mode_sends_plain_json_and_reports_unconstrained() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -287,7 +358,12 @@ async fn json_format_mode_sends_plain_json_and_reports_unconstrained() {
     let schema = schema();
     let mut sink = CollectingSink::new();
     let out = model
-        .step(prompt, &schema, &mut sink, tokio_util::sync::CancellationToken::new())
+        .step(
+            prompt,
+            &schema,
+            &mut sink,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(out.content, r#"{"patch":{},"action":{"type":"done"}}"#);

@@ -4,8 +4,8 @@ use std::marker::PhantomData;
 
 use json_patch::PatchOperation;
 use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use statie_core::{PatchError, PatchStrategy};
 
 use crate::util::deserialize_with_path;
@@ -124,4 +124,3 @@ mod tests {
         assert!(matches!(parsed.action(), Action::Yield));
     }
 }
-

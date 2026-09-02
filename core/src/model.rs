@@ -48,8 +48,8 @@ impl Schema {
     pub fn of<T: JsonSchema>() -> Schema {
         // Inline every subschema: grammar-constrained local decoders handle
         // a flat schema far more reliably than `$ref`/`$defs`.
-        let settings = schemars::generate::SchemaSettings::draft2020_12()
-            .with(|s| s.inline_subschemas = true);
+        let settings =
+            schemars::generate::SchemaSettings::draft2020_12().with(|s| s.inline_subschemas = true);
         let root = settings.into_generator().into_root_schema_for::<T>();
         let mut value = root.to_value();
         if let Value::Object(ref mut map) = value {
@@ -82,6 +82,11 @@ pub struct RawOutput {
     pub reasoning: Option<Reasoning>,
     pub content: String,
     pub usage: Option<Usage>,
+    /// Why the backend stopped generating, in the backend's own vocabulary
+    /// (Ollama: `done_reason`, e.g. `"stop"`/`"length"`; OpenAI-compatible:
+    /// `choices[0].finish_reason`, e.g. `"stop"`/`"length"`). `None` when
+    /// the backend didn't report one.
+    pub finish_reason: Option<String>,
     version: Version,
 }
 
@@ -91,6 +96,7 @@ impl RawOutput {
             reasoning,
             content,
             usage: None,
+            finish_reason: None,
             version: prompt_version,
         }
     }
@@ -98,6 +104,12 @@ impl RawOutput {
     /// Attaches server-reported usage.
     pub fn with_usage(mut self, u: Usage) -> Self {
         self.usage = Some(u);
+        self
+    }
+
+    /// Attaches the backend-reported reason generation stopped.
+    pub fn with_finish_reason(mut self, reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(reason.into());
         self
     }
 

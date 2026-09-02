@@ -87,6 +87,21 @@ where
             UiEvent::ContentDelta(_) => {
                 // Not printed.
             }
+            UiEvent::Replay {
+                entries,
+                step,
+                skill,
+                state: _,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "[resumed] step {step} in {skill}; replaying {} entries",
+                    entries.len()
+                );
+                for e in &entries {
+                    let _ = writeln!(out, "  {}", crate::driver::render_entry_line(e));
+                }
+            }
             UiEvent::StepDone {
                 entries,
                 outcome,

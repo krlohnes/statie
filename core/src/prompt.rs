@@ -7,12 +7,12 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::model::Capabilities;
+use crate::model::Schema;
 use crate::promptable::{Observation, Promptable, sealed};
 use crate::skill::SkillSpec;
 use crate::tokenizer::{Budgets, Tokenizer};
 use crate::tool::ToolList;
 use crate::version::{HarnessState, Version};
-use crate::model::Schema;
 
 /// One of the seven fixed prompt sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -347,6 +347,9 @@ impl<'a> Promptable for HarnessView<'a> {
             "budgets: total={} observation={} augmentation={}\n",
             self.0.budgets.total, self.0.budgets.observation, self.0.budgets.augmentation
         ));
+        if let Some(note) = &self.0.last_overflow {
+            s.push_str(&format!("last_observation: {note}\n"));
+        }
         s.push_str("inbox:\n");
         let unacked: Vec<_> = self.0.inbox.iter().filter(|i| !i.acked).collect();
         if unacked.is_empty() {
@@ -448,5 +451,44 @@ mod tests {
 
         let err = result.expect_err("expected OverBudget");
         assert_eq!(err.section, Section::Observation);
+    }
+
+    /// Regression for the live "prompt section Observation over budget"
+    /// failure: a huge tool output, truncated at exactly the configured
+    /// observation budget via `Observation::truncate`, must build
+    /// successfully through the real `PromptBuilder` -- for several budget
+    /// sizes, with the real `TiktokenTokenizer` (the tokenizer that
+    /// surfaced the bug; `HeuristicTokenizer`'s char/4 estimate can't
+    /// exhibit the BPE-merge-across-boundary overshoot).
+    #[test]
+    fn huge_observation_truncated_at_budget_builds_successfully() {
+        use crate::tokenizer::TiktokenTokenizer;
+
+        let tok = TiktokenTokenizer;
+        for budget in [100usize, 500, 2000] {
+            let sys = SystemPrompt::for_harness(&caps(), "replace", "replace semantics", None);
+            let spec = Arc::new(SkillSpec::new("toy", "instructions"));
+            let harness_state = HarnessState::default();
+            let harness_view = HarnessView::new(&harness_state);
+            let agent = serde_json::json!({});
+            let agent_state = AgentState::new(&agent);
+
+            let full = ToolOutputFull::new("x".repeat(100_000));
+            let obs = Observation::truncate(&full, budget, &tok);
+
+            let prompt = PromptBuilder::new(&tok, budgets(budget), Version(0))
+                .system(&sys)
+                .spec(&spec)
+                .agent(&agent_state)
+                .harness(&harness_view)
+                .observation(&obs)
+                .build();
+
+            assert!(
+                prompt.is_ok(),
+                "budget={budget} expected build() to succeed, got {:?}",
+                prompt.err()
+            );
+        }
     }
 }

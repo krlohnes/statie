@@ -21,5 +21,9 @@ async fn shell_output_is_capped() {
     let text = out.to_string();
 
     assert!(text.len() <= 1100, "len = {}", text.len());
-    assert!(text.contains("output capped"), "got tail: {}", &text[text.len().saturating_sub(80)..]);
+    assert!(
+        text.contains("output capped"),
+        "got tail: {}",
+        &text[text.len().saturating_sub(80)..]
+    );
 }

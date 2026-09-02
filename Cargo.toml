@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "core",
+    "store",
+    "patch",
+    "augment",
+    "models",
+    "tools",
+    "skills",
+    "tui",
+    "cli",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+statie-core = { path = "core" }
+statie-store = { path = "store" }
+statie-patch = { path = "patch" }
+statie-augment = { path = "augment" }
+statie-models = { path = "models" }
+statie-tools = { path = "tools" }
+statie-skills = { path = "skills" }
+statie-tui = { path = "tui" }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+schemars = "1.2.2"
+thiserror = "2.0.20"
+async-trait = "0.1.92"
+tracing = "0.1.44"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
+tiktoken-rs = "0.12.0"
+once_cell = "1.21.4"
+chrono = { version = "0.4.45", features = ["serde"] }

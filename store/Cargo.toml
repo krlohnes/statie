@@ -1,0 +1,17 @@
+[package]
+name = "statie-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono = { workspace = true }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+statie-core = { workspace = true }
+
+[dev-dependencies]
+schemars.workspace = true
+tempfile = "3.14"
+tokio = { workspace = true, features = ["macros", "rt"] }

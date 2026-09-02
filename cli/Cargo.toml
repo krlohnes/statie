@@ -1,0 +1,34 @@
+[package]
+name = "statie"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "statie"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait.workspace = true
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "6.0.0"
+reqwest = { version = "0.13.4", features = ["json"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+statie-augment.workspace = true
+statie-core = { workspace = true }
+statie-models.workspace = true
+statie-patch.workspace = true
+statie-skills.workspace = true
+statie-store.workspace = true
+statie-tools.workspace = true
+statie-tui.workspace = true
+tempfile = "3.27.0"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

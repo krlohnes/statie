@@ -1,0 +1,19 @@
+[package]
+name = "statie-skills"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+statie-core = { workspace = true }
+statie-patch = { workspace = true }
+serde = { workspace = true }
+schemars = { workspace = true }
+
+[dev-dependencies]
+statie-store = { workspace = true }
+statie-models = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3.27.0"

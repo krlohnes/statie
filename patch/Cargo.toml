@@ -1,0 +1,12 @@
+[package]
+name = "statie-patch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+json-patch = { version = "4.2.0", default-features = false, features = ["schemars"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error = "0.1.20"
+statie-core = { workspace = true }

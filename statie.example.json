@@ -1,0 +1,37 @@
+{
+  "model": {
+    "backend": "ollama",
+    "base_url": "http://localhost:11434",
+    "model": "gemma4:26b",
+    "think": true,
+    "api_key": null,
+    "num_ctx": 32768,
+    "format": "json",
+    "schema_constrained": null,
+    "options": {},
+    "timeout_secs": 600,
+    "mock_script": []
+  },
+  "budget": {
+    "total": 24000,
+    "observation": 3000,
+    "augmentation": 2000
+  },
+  "retries": 3,
+  "store": {
+    "kind": "sqlite",
+    "path": ".statie/session.db"
+  },
+  "session_log": ".statie/session.jsonl",
+  "sandbox_root": ".",
+  "augmenters": {
+    "repo_bm25": { "enabled": true, "budget": 1200 },
+    "session_log_bm25": { "enabled": true, "budget": 800 }
+  },
+  "tools": {
+    "shell_timeout_secs": 120,
+    "allow_shell": true,
+    "max_output_bytes": 200000
+  },
+  "max_autonomous_steps": 200
+}

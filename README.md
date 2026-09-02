@@ -1,5 +1,7 @@
 # statie
 
+![statie](statie-code.png)
+
 statie is a mutable-state, interactive coding harness for local LLMs. Instead
 of growing a transcript on every turn, it keeps one bounded prompt per step —
 an immutable skill spec, the current structured workspace state, the latest
@@ -22,10 +24,12 @@ other agentic coding harness.
 ## Quick start
 
 ```sh
-cargo run -- config init      # writes ./.statie/config.json with the defaults
-$EDITOR .statie/config.json   # at minimum, point base_url at your model server
-cargo run -- check            # verifies the model backend is reachable and reports its capabilities
-cargo run -- run              # starts a session (TUI by default)
+cargo run -- config init           # writes ./.statie/config.json with the defaults
+$EDITOR .statie/config.json        # at minimum, point base_url at your model server
+cargo run -- check                 # verifies the model backend is reachable and reports its capabilities
+cargo run --                       # starts a session (TUI by default)
+cargo run -- "fix the bug in x"    # starts a session, seeding the first message
+cargo run -- -p "fix the bug in x" # headless: run to completion, print the transcript, exit
 ```
 
 `cargo run -- config init --global` writes to
@@ -39,7 +43,10 @@ statie reads a single JSON config file. Resolution order, first hit wins:
 1. `--config <path>`
 2. `$STATIE_CONFIG`
 3. `./.statie/config.json`
-4. `~/.config/statie/config.json`
+4. `$XDG_CONFIG_HOME/statie/config.json`, defaulting to
+   `~/.config/statie/config.json` (a file in the platform config dir, e.g.
+   `~/Library/Application Support/statie/config.json` on macOS, is honoured
+   as a fallback)
 5. built-in defaults (no file at all)
 
 Every field has a default, so a partial file — even `{}` — is valid; any
@@ -87,7 +94,9 @@ model backend purely from `model.*`.
 - `statie config init [--global] [--force]` — writes the default config to
   `./.statie/config.json` (or `~/.config/statie/config.json` with
   `--global`); refuses to overwrite an existing file unless `--force` is
-  given.
+  given. `.statie/` is self-ignoring (it gets its own `.gitignore`); commit a
+  copy elsewhere, e.g. `statie.example.json`, if you want the config in
+  version control.
 - `statie config show` — prints the effective config (defaults merged with
   whichever file was resolved) as pretty JSON, and the path it came from
   (or `defaults` if none was found).
@@ -96,16 +105,34 @@ model backend purely from `model.*`.
   caching). For the `ollama` backend it also queries `GET
   {base_url}/api/tags` and reports whether `model.model` is present on the
   server.
-- `statie run [--skill <name>] [--headless] [--message <text>]... [--memory]`
-  — builds a session for the chosen skill and runs it. `--skill` selects the
-  starting activation: `router` (the default), `plan`, `implement`, and
-  `review` all share the coding workspace and its tools (read, write,
-  shell, test, recall — `statie_tools::default_tools`); `toy` runs the toy
-  skill instead. `--message` seeds the session's inbox with one or more
-  initial user messages, in order — for the coding skills, the first
-  message is the task the router copies into the workspace. `--memory`
-  forces an in-memory store and log — nothing touches disk, useful for
-  tests and one-off scratch runs.
+- `statie [OPTIONS] [PROMPT]` — starts a session. With no `PROMPT` and no
+  `-p`, launches the `statie-tui` terminal UI empty. A positional `PROMPT`
+  seeds the first message and (with no `-p`) still launches the TUI.
+- `statie -p|--prompt <TEXT> [OPTIONS]` — headless mode: seeds `TEXT` as a
+  user message, drives the session to completion (or until it parks) with
+  no terminal UI, prints the transcript, and exits. Repeatable — each
+  `-p` becomes one seeded user message, in order; a positional `PROMPT`
+  combined with `-p` becomes the first message, with the `-p` values
+  following it in order.
+  Options, valid with or without `-p`:
+  - `--skill <name>` (default `router`) — the starting activation:
+    `router`, `plan`, `implement`, and `review` all share the coding
+    workspace and its tools (read, write, edit, search, shell, test, recall —
+    `statie_tools::default_tools`); `toy` runs the toy skill instead. For
+    the coding skills, the first seeded message is the task the router
+    copies into the workspace.
+  - `-r, --resume` — continue the existing session in `<sandbox>/.statie/`
+    instead of starting fresh. **Fresh is the default**: without
+    `--resume`, an existing sqlite session store and log are archived to
+    `.statie/archive/<timestamp>/` first (printing an `archived previous
+    session to ...` notice to stderr) and a clean session starts. With
+    `--resume` and an existing session, it's continued in place (printing
+    a `resuming session at ...` notice); with `--resume` and no existing
+    session, it just starts — no error.
+  - `--memory` — forces an in-memory store and log; nothing touches disk,
+    useful for tests and one-off scratch runs. Never archives or resumes.
+  - `--toy-target <n>` (default `10`) — target counter value for the
+    `toy` skill.
 - `statie eval [--task <toy|coding>] [--steps N] [--json] [-v|--verbose]`
   — runs the same task through two harnesses built from the same config:
   **statie** (the config's own bounded budgets) and **baseline** (an
@@ -132,15 +159,22 @@ model backend purely from `model.*`.
   as a CLI failure. Pair with a `model.backend: "mock"` config for a fully
   offline, deterministic comparison.
 
-### `--headless`
+### Headless mode (-p)
 
-By default `run` launches the `statie-tui` terminal UI. `--headless` instead
-drives the session loop to completion (or until it parks) without a
-terminal UI, writing to stdout, and exits `0` when the run reaches `done` or
-parks (e.g. on `AskUser`/`Yield`). It prints a final summary line:
+By default `statie` launches the `statie-tui` terminal UI. Passing one or
+more `-p`/`--prompt` values switches to headless mode instead: it drives the
+session loop to completion (or until it parks) without a terminal UI,
+writing to stdout, and exits `0` when the run reaches `done` or parks (e.g.
+on `AskUser`/`Yield`). It prints a final summary line:
 
 ```
 steps=N outcome=<done|parked|...> prompt_tokens=[…]
+```
+
+For example:
+
+```sh
+statie -p "create hello.txt" --skill router --memory
 ```
 
 This is the mode to use in CI or scripts — pair it with `--memory` and a
@@ -184,6 +218,54 @@ either a default or a config knob:
   session log's `Patch`/`rejected` entries) — compare `srv_max` against
   `num_ctx` to see how close a run got to overflowing the context window,
   since it reflects the real tokenizer rather than the cl100k stand-in.
+
+- **Whole-file writes are where small models corrupt code.** `edit_file`
+  replaces exactly one anchored occurrence and refuses ambiguous or missing
+  anchors; its description says outright that `new` replaces `old`, because
+  the first live run "inserted" a function by anchoring on its neighbour and
+  deleted the neighbour. `search` (regex, root-relative paths) lets the model
+  find definitions without reading whole files.
+- **The repo index must follow the model's edits.** `RepoBm25` used to index
+  once at startup; after an edit, the augmentation section showed the old
+  file next to a fresh `read_file` of the new one, and the reviewer looped
+  between `test` and `read_file` trying to reconcile them. It now
+  fingerprints the tree (mtime + length) on every `augment` call and
+  re-indexes when anything changed.
+- **Say how to hand off, not just that it's required.** The `done`
+  rejection now names the skill's allowed `next_skill` targets; without that
+  the model repeated `done` five times with `next_skill` still set to its
+  own name. The loop guard also watches a window of the last 8 tool calls,
+  so alternating A/B/A/B repeats are flagged, not only consecutive ones.
+- **`test` reports a verdict first.** Its output starts with `result: pass`
+  or `result: fail (exit N)` plus a failure summary, so the model reads one
+  line instead of a traceback. `list_files`/`search`/`RepoBm25` skip
+  `__pycache__` and virtualenvs alongside `.git`, `target`, `node_modules`.
+- **Small models patch arrays by key, so let them.** To mark one plan step
+  done, gemma4 sent `plan: [{"id": 2, "status": "in_progress"}]` and, under
+  strict RFC 7386, the other five steps vanished; a rule that rejected the
+  drop just made it retry the same shape until the cap. The merge strategy
+  now treats arrays of objects sharing an `id` or `path` as keyed: entries in
+  the patch update their match field by field, new keys append, omitted
+  entries stay. Plain arrays (strings) are still replaced whole.
+- **Normalize the action shapes the model actually emits.** `{"type":
+  "shell", "args": ...}` (tool name as the type) is rewritten to a `tool`
+  call and logged as a `normalized` system entry instead of being rejected;
+  a `tool` action with no `name` gets a message that says what's missing.
+- **`yield` is a dead end for a coding agent.** The model paused with
+  `yield` after one step, and the UI could only say "waiting for you: yield".
+  The coding skills now reject `yield` outright (`ask_user` with a concrete
+  question is the only way to pause), and the park message shows the model's
+  own `recent_summary` plus how to resume.
+- **A model error must not kill the UI.** Running without a reachable
+  server used to exit the TUI on the first Enter. Step failures are now shown
+  in red and the session parks; only store/log failures or an unknown skill
+  are fatal. The startup banner prints the config path, model, and sandbox so
+  a wrong setup is visible before typing.
+
+With those in place, the toy task "add `multiply` to a two-function Python
+module so `make test` passes" went from 32+ steps and a killed run to 8 steps
+with zero rejections: router → plan → implement (baseline `test`, one
+`edit_file`, `test`) → review → done.
 
 Live result on the `eval --task coding` task (create a file end to end via
 router → plan → implement → review): both harnesses succeeded in 11 steps;

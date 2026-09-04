@@ -504,7 +504,9 @@ First-pass classification, by what each rule was written against:
 Method: every rule marked "peel" gets a switch in a `guards` config
 section (`guards.redundant_reads`, `guards.silent_reads`,
 `guards.read_guard`, `guards.redundant_verify`, `guards.done_stays_done`,
-`guards.commitment_read_cap`; all default `true`). The audit runs the same
+`guards.commitment_read_cap`; all default `true` at the time of the
+audit; `commitment_read_cap` and then `done_stays_done` were turned off
+by its results and the first bench battery). The audit runs the same
 unit with the working set on, one rule off at a time in the order above,
 and compares the eval columns (`rej`, `edits`, `first_edit`, `maint`) and
 steps to completion. A rule stays off when the run is no worse without
@@ -714,6 +716,94 @@ than any single effect: the rules that make a read leave something in
 state, or that demand an edit after reads, are the ones carrying a
 26B model in 16k of context, and they are not symptoms of too little
 context but the substitute for it.
+
+### Bench: the task battery
+
+Every rule from run 21 to run 74 was tuned against one unit in one
+file. The audit's verdicts are verdicts about that file. Before the
+next rule, the harness needs a battery: several tasks of different
+shapes, several seeds each, run through the real binary, reported as
+landing rate and context cost. The prime directive it measures is the
+project's: manage a limited context through mutable state and get the
+work done. It does not reward tidy state; it rewards landed changes at
+a low peak prompt.
+
+A task is a directory: `task.json` (the prompt a user would type, the
+verify command, the files that must be byte-identical afterwards, a
+timeout), `fixture/` (the sandbox as the model finds it, failing the
+verify command), and `solution/` (an overlay that makes it pass; the
+self-check applies it so a broken fixture fails the test suite, not a
+bench run). The first seven, six tiny Rust crates and one Python
+module: add a function, fix an off-by-one, fill match arms across
+files, rename across files, add a struct field, create a module, add
+a method. Each is a shape a live run failed on.
+
+`statie bench` copies a fixture to a fresh sandbox, writes the base
+config in with the sandbox as root and the seed in the model options,
+runs `statie -p <prompt>` there with the timeout, runs the verify
+command, checks the protected files (a model that edits the test to
+pass has not landed), and reads everything else from the session log:
+committed steps, outcome, rejections, tool errors, edits, green step,
+conversions and skips, and the server-reported prompt tokens per
+call (max, mean, last). One line per run as it finishes; then per
+task: landed k/n, median steps, mean peak prompt, mean seconds, the
+outcomes. `--json` for the record, `--out` to keep every run's log,
+stdout, verify output, and config.
+
+What it is for: a rule earns its default when it does not lower the
+landing rate across the battery; a context change (budget, working
+set size, num_ctx) is judged by landing rate against peak prompt; and
+variance, which dominated every series so far, gets a number.
+
+First two batteries (README field notes for the tables). Baseline,
+thinking off: eleven of fourteen landed, peak prompt under 7.4k on a
+16k window; three of the four misses were the model sending `done`
+where it should run `test` until the repeat cap parked it, and the
+fourth was done-stays-done rejecting a reopened "run the tests" step
+twelve times to a retry-cap failure with the crate green on disk.
+Thinking on: fourteen of fourteen, a third fewer steps, 2.4 times the
+wall time, a fifth more peak prompt, and seven patch-shape rejections
+that constrained decoding had held at zero, so the server appears not
+to enforce the schema after a thinking block. Consequences: implement's
+`done` without a passing test becomes the harness running the test
+(the review substitution's twin), done-stays-done defaults off, and
+the maintainer's log entry records how much reasoning it was given so
+section 9's premise can finally be measured rather than assumed.
+
+Third build (verify guard keyed by tool so a `shell` run never hides a
+`test`, identical skips capped, the test substitution ahead of the
+premature-`done` note, a consumed handoff cleared on activation):
+fourteen of fourteen landed and done with thinking off, median twelve
+steps, four rejections, eleven minutes; thinking on landed thirteen
+with one false `done` from the plan skill, closed by making review
+the only skill that can terminate. Across three builds the landing
+rate went 11, 13, 14 of 14 with the model, budgets, and context fixed;
+each step was a harness state the log did not show until a bench run
+made it show.
+
+Fourth build (review the only terminal skill, implement's `done: true`
+stripped with a note, a mixed-shape non-progress cap, a missing
+`action` converted to a note): fourteen of fourteen landed and done in
+both arms. Thinking off had zero rejections, the first battery to;
+thinking on had twenty, nineteen of them patch-shape errors that
+constrained decoding holds at zero without thinking, all fixed on the
+retry. The shape rule stands: the server enforces the schema only when
+no thinking block precedes the answer, so with thinking on the
+harness's own parse is the schema.
+
+### Tools write durable state
+
+The model is a poor author of its own state: file notes without line
+numbers, empty patches after reads, re-reading from the top after a
+resume. The rules that carried it (silent reads, the read guard) exist
+to force state out of it. The complement is to have the tools write
+the state themselves. `Skill::after_tool` lets a skill turn a
+successful tool call into a harness-sourced patch; the coding
+workspace's `seen` list records, per file, its length and the line
+ranges read and edited with the step of the last change. The model
+reads it before re-reading and cannot patch it. Eviction and clearing
+are the hook's, not the model's. Whether it lowers steps or peak
+prompt is a bench question, answered against the baseline above.
 
 ## 11. Model backends
 

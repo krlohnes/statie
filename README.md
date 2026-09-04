@@ -118,7 +118,7 @@ statie would actually use and where it came from.
 | `guards.silent_reads` | bool | `true` | Consecutive reads whose patch wrote nothing are rejected at the cap. `false` never rejects on that ground. |
 | `guards.read_guard` | bool | `true` | Fourth read of one path with no edit between gets a note. `false` disables the note. |
 | `guards.redundant_verify` | bool | `true` | An identical `shell`/`test` command with nothing edited since is skipped and its earlier result shown. `false` re-runs it. |
-| `guards.done_stays_done` | bool | `true` | A `done` plan step may not be reopened. `false` allows it. |
+| `guards.done_stays_done` | bool | `false` | `true` rejects a patch that reopens a `done` plan step. Off by default since the bench: the model reopens "run the tests" after an edit, which is the plan becoming true again, and twelve rejections of that parked a run with the crate green on disk. |
 | `guards.commitment_read_cap` | bool | `true` | Reads against a set `next` beyond the cap are rejected. `false` lets them run and appends a "still pending" note instead. |
 | `max_autonomous_steps` | integer | `200` | Safety cap on consecutive autonomous steps (`Outcome::Continue`) before a run stops on its own. |
 
@@ -220,6 +220,7 @@ for the prompt (the full output stays in the session log).
 | `filter_last_tool_call` | regex over the full output of the previous tool call, for when it overflowed |
 | `shell` | `sh -c` in the sandbox with a timeout; runs in its own process group and kills it on timeout, cancel, or lingering background children |
 | `test` | the project's test command (auto-detected or explicit), reported as `result: pass` / `result: fail (exit N)` plus a failure summary |
+| (all read/edit tools) | after a successful `read_file`, `edit_file`, `write_file`, or `revert_file` the harness updates the workspace's `seen` list: per file, its length and the line ranges read and edited, with the step; the model reads it before re-reading and cannot patch it |
 | `revert_file` | restore a file to its content from before this session's first `edit_file`/`write_file` of it (a file created this session is removed); the backup lives in `.statie/orig/`, is taken on first modification, cleared on a fresh start, kept on `--resume` |
 | `recall` | search the session log (never the model's reasoning) |
 
@@ -261,6 +262,33 @@ checks that it did. The table's trailing columns (`rej`, `tool_err`,
 `skipped`, `paged`, `continued`, `green`, `restored`) are the same log
 counts `statie metrics` prints. `--json` prints an object instead of a
 table; `-v` prints both transcripts to stderr.
+
+## Bench
+
+`statie bench` runs a battery of small tasks through the real binary,
+several seeds each, and reports landing rate and context cost per task
+shape. A task is `bench/tasks/<name>/` with `task.json` (prompt, verify
+command, protected files, timeout), `fixture/` (the sandbox as the
+model finds it; its verify command fails), and `solution/` (an overlay
+that makes it pass, used by the self-check in `cli/tests/bench_tasks.rs`).
+The shipped seven: `add_function`, `fix_off_by_one`, `match_arms`,
+`rename_across_files`, `add_struct_field`, `new_module` (Rust) and
+`python_method` (unittest).
+
+```
+statie bench --config ~/work/.statie/config.json --seeds 3 --out /tmp/bench1
+statie bench --task match_arms --seeds 5 --json
+```
+
+Per run: task, seed, outcome, landed (verify passed AND every protected
+file byte-identical), committed steps, rejections, tool errors, edits,
+green step, peak server prompt tokens, seconds. Per task: landed k/n,
+median steps, mean peak prompt, mean seconds, outcomes. `--out` keeps
+each run's `session.jsonl`, stdout, stderr, verify output, and config;
+`--keep` keeps the sandbox too. A run that crashes or times out is a
+row, not a bench failure. This is the yardstick for every rule and
+budget change from here on: a rule keeps its default when it does not
+lower the landing rate across the battery.
 
 ## Running against Ollama: field notes
 
@@ -1002,6 +1030,207 @@ either a default or a config knob:
   52 steps, nine ways to die) to here (0 rejections, done in 30-89
   steps, whole suite green) the model, the prompt budget, and the
   context size did not change; the harness did.
+
+- **The bench, first battery.** Seven tasks, two seeds, the dogfood
+  config (gemma4:26b, 16k context, 14k prompt budget, every rule on,
+  read cap off), 14 runs in 14 minutes:
+
+  | task | landed | median steps | mean peak prompt | mean secs | outcomes |
+  |---|---|---|---|---|---|
+  | add_function | 2/2 | 14 | 5593 | 80 | done, question |
+  | add_struct_field | 1/2 | 22.5 | 5556 | 73 | question, failure |
+  | fix_off_by_one | 2/2 | 13 | 5483 | 34 | done, done |
+  | match_arms | 2/2 | 20.5 | 5263 | 47 | done, question |
+  | new_module | 2/2 | 24.5 | 5370 | 58 | done, done |
+  | python_method | 2/2 | 9 | 4886 | 18 | done, done |
+  | rename_across_files | 0/2 | 17.5 | 6361 | 51 | question, question |
+
+  Eleven of fourteen landed; the peak prompt never passed 7.4k tokens
+  on a 16k window. Three of the four misses are one shape: the model
+  sends `done` where it should run `test`, the premature-`done` or
+  no-green note says so, it sends `done` again, and after three the
+  repeat cap parks it. The fourth is done-stays-done rejecting the
+  model twelve times for reopening its "run cargo test" step after an
+  edit, until the retry cap parked it as a failure with the crate
+  already green on disk. Two conclusions the dogfood runs had hinted
+  at and the bench states: telling this model to run the test does
+  not work, running it for it does (the review substitution, now for
+  implement's `done` too); and a rule that forbids the model from
+  making its plan true again is a rule against the directive, so
+  done-stays-done goes off by default.
+
+- **Thinking on.** Same battery, same config with `model.think: true`
+  (off since run 10, when thinking deferred the edit):
+
+  | task | landed | median steps | mean peak prompt | mean secs |
+  |---|---|---|---|---|
+  | add_function | 2/2 | 10.5 | 6024 | 50 |
+  | add_struct_field | 2/2 | 15 | 6638 | 89 |
+  | fix_off_by_one | 2/2 | 10.5 | 7435 | 167 |
+  | match_arms | 2/2 | 15.5 | 6511 | 85 |
+  | new_module | 2/2 | 14 | 5765 | 87 |
+  | python_method | 2/2 | 11.5 | 5520 | 49 |
+  | rename_across_files | 2/2 | 22.5 | 8645 | 246 |
+
+  Fourteen of fourteen, every one ending in `done`, a third fewer
+  steps per task, at 2.4 times the wall time and a peak prompt about
+  a fifth higher. The model that thinks does not send `done` where it
+  should run `test`; the three misses of that shape in the baseline
+  did not recur. Two things to watch: rejections went from 17 to 24,
+  and seven of those were patch-shape errors (`"todo"` for a plan
+  status, an integer for `next`) that constrained decoding had held at
+  zero with thinking off, which suggests the server does not enforce
+  `format` on the content after a thinking block for this model; and
+  the maintainer's notes did not measurably change (median 216 chars
+  against 260), so whether the reasoning reaches it or helps it is
+  still unmeasured. The maintainer log entry gains a reasoning size
+  so the next battery can say.
+
+- **Read map, first look.** Same battery with the harness-kept `seen`
+  list in (thinking off): twelve of fourteen landed, but five runs hit
+  the retry cap and rejections went from 17 to 72, 64 of them
+  done-stays-done: with every plan step marked done and no passing
+  test, the model reopens its "run cargo test" step to run it again,
+  and the rule refuses, on some runs a dozen times in a row until the
+  cap. Two of the 72 were the model patching `seen` itself. Nothing in
+  this battery says whether the read map helped; it says the
+  done-stays-done decision was overdue. Rerun after the switch is off.
+
+- **Second build: read map, implement's `done` runs the test, bare
+  `done` hands off, done-stays-done off.** Thinking off:
+
+  | task | landed | median steps | mean peak prompt | mean secs | outcomes |
+  |---|---|---|---|---|---|
+  | add_function | 2/2 | 10 | 5386 | 60 | done, done |
+  | add_struct_field | 2/2 | 29 | 6793 | 103 | done, done |
+  | fix_off_by_one | 2/2 | 13 | 5932 | 46 | done, done |
+  | match_arms | 2/2 | 23 | 6384 | 74 | done, done |
+  | new_module | 2/2 | 39 | 5476 | 95 | done, done |
+  | python_method | 2/2 | 8.5 | 5054 | 21 | done, done |
+  | rename_across_files | 1/2 | 26.5 | 6699 | 102 | done, question |
+
+  Thirteen of fourteen landed and thirteen reached `done` (the
+  baseline: eleven and seven). Rejections across the battery: two,
+  from seventeen. Peak prompt unchanged. Two runs found the next
+  holes. The rename that parked sent `done` with its "run cargo test"
+  step still open, and the premature-`done` note has priority over
+  the test substitution, so it got the note three times and parked;
+  when edits are unverified, running the test is the right answer
+  whatever step is open. And one new-module run took 66 steps for a
+  reason that is entirely the harness's: the model ran `cargo test`
+  through `shell` after its last edit and it passed; the
+  redundant-verify guard then skipped every following `test` call as
+  a repeat of that shell command, while the green checkpoint listens
+  only to the `test` tool, so the harness saw no passing run, its own
+  substitution kept inserting `test`, and the guard kept skipping it,
+  51 times, until the model said `done` anyway. The guard now skips a
+  `test` only on the strength of an earlier `test`, an identical skip
+  three times in a row parks like a repeated note, and the
+  substitution outranks the premature-`done` note when there are
+  unverified edits.
+
+- **Second build, thinking on.** Thirteen of fourteen, median steps
+  10 to 15 per task (a third under thinking off again), mean wall
+  time 47 to 111 seconds per task, and the peak prompt reached 12.8k
+  on one match-arms run (a full working set plus a long test
+  observation, within the 14k budget but close to the 16k window).
+  The maintainer received reasoning in 57 percent of its calls, 1.5k
+  characters on average, now that its log entry says so. The one miss
+  was a retry-cap failure in six steps: four outputs in a row with no
+  `action` field at all. Rejections were 34 across the battery, 20 of
+  them patch-shape or missing-field errors that constrained decoding
+  holds at zero with thinking off, and 11 the "done only valid when
+  terminal" rule on a `done` that marked every plan step done in the
+  same patch right after a green checkpoint, the exact case the
+  bare-`done` conversion exists for; it did not fire, and the
+  reproduction is the next ticket. Thinking on lands the same and
+  thinks less per step; it is paying for it in prompt size, wall
+  time, and a schema the server no longer enforces.
+
+- **Four batteries side by side.** Build 1 is the binary the audit
+  ended on; build 2 adds the read map, implement's `done` running the
+  test, the bare-`done` handoff, and done-stays-done off. Fourteen
+  runs each.
+
+  | build | landed | done | median steps | rejections | tool errors | mean peak prompt | max peak | minutes |
+  |---|---|---|---|---|---|---|---|---|
+  | build 1, thinking off | 11/14 | 8 | 15 | 18 | 12 | 5502 | 7388 | 12 |
+  | build 1, thinking on | 14/14 | 14 | 13 | 26 | 3 | 6648 | 8708 | 26 |
+  | build 2, thinking off | 13/14 | 13 | 15.5 | 2 | 16 | 5960 | 7859 | 17 |
+  | build 2, thinking on | 13/14 | 13 | 12 | 34 | 6 | 7149 | 12841 | 20 |
+
+  Build 2 with thinking off is the cheapest way to thirteen: it
+  reaches `done` where build 1 parked, at the lowest prompt and
+  with rejections all but gone. Thinking on lands the same, in fewer
+  steps, with fewer tool errors (it copies anchors better), and pays
+  in wall time, peak prompt, and shape rejections the server's
+  schema no longer catches. With two seeds per task, one run is the
+  difference between 13 and 14; the direction is clear, the last
+  place is not.
+
+- **The bare `done` that would not convert.** The eleven "done only
+  valid when terminal" rejections in the thinking battery had nothing
+  to do with thinking. Nothing ever cleared `next_skill` after a
+  handoff: every implement activation carried `next_skill:
+  "implement"` from the plan's handoff, so a bare `done` merged into
+  a self-handoff, the bare-`done` conversion stood aside because a
+  handoff was named, and the core rule rejected it because implement
+  cannot hand off to itself. Thinking-off models send `done: true` or
+  a fresh `next_skill` and never tripped it. A skill now clears a
+  consumed handoff on activation (`Skill::on_activate`, a harness
+  patch like the read map's), and the conversions treat a
+  self-handoff as none. The agent that first tried to reproduce it
+  wrote a faithful test from the log and it passed on the old code:
+  the state the log does not show, a field nobody reset, was the bug.
+
+- **Third build: verify guard keyed by tool, skip cap, substitution
+  priority, handoff cleared on activation.** Fourteen runs each.
+
+  | build | landed | done | median steps | rejections | tool errors | mean peak prompt | max peak | minutes |
+  |---|---|---|---|---|---|---|---|---|
+  | build 3, thinking off | 14/14 | 14 | 12 | 4 | 6 | 5824 | 7327 | 11 |
+  | build 3, thinking on | 13/14 | 14 | 10 | 23 | 5 | 6877 | 9255 | 22 |
+
+  Thinking off: the first clean sweep, every task landed and reached
+  `done`, median twelve steps, four rejections in fourteen runs,
+  eleven minutes for the battery, peak prompt under 7.4k. Thinking on
+  reached `done` fourteen times but one of them was false: the plan
+  skill sent `done: true` with an empty plan, the empty-plan
+  conversion swapped the action for a note but kept the patch, and
+  `done: true` made the workspace terminal, ending the session after
+  three steps with nothing built. Two holes, both closed: that
+  conversion strips `done`, and the plan skill can no longer
+  terminate the task at all; only review can. Thinking on is now the
+  same landing rate at fewer steps, twice the wall time, a fifth more
+  prompt, and five times the rejections, all of them the shape errors
+  the server's schema no longer catches after a thinking block.
+
+- **Fourth build: only review terminates, implement's `done: true`
+  stripped with a note, mixed-shape non-progress cap, missing
+  `action` converted.** Fourteen runs each.
+
+  | build | landed | done | median steps | rejections | tool errors | mean peak prompt | max peak | minutes |
+  |---|---|---|---|---|---|---|---|---|
+  | build 4, thinking off | 14/14 | 14 | 12.5 | 0 | 2 | 5777 | 7651 | 14 |
+  | build 4, thinking on | 14/14 | 14 | 12 | 20 | 7 | 7181 | 8233 | 20 |
+
+  Both arms landed everything and every `done` was real. Thinking
+  off is the first battery with zero rejections; its only harness
+  interventions were two `ask_user` conversions (one empty, one a
+  statement of intent). Its extra three minutes over build 3 are one
+  run of `add_function` that spent five minutes on the server's side
+  over nineteen steps; its twin took fourteen steps in thirty-five
+  seconds.
+  Thinking on: nineteen of the twenty rejections are patch-shape
+  errors (`next` missing `tool` or sent as a bare step number,
+  `plan[].status` as `completed`/`todo`, a `files` entry without a
+  `path`), the same class as build 3 and still zero with thinking
+  off, so the schema is enforced by the server only when there is no
+  thinking block. The twentieth was a `next_skill` change on a tool
+  call. Every one was fixed on the retry. Across four builds the
+  thinking-off landing rate went 11, 13, 14, 14 of 14 and the
+  rejection count 18, 2, 4, 0, with the model, budgets, and window
+  fixed throughout.
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

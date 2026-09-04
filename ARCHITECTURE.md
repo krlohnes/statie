@@ -490,6 +490,12 @@ so it holds when the model ignores instructions.
   latest command is caught; A, B, A is fine. This was a rejection until a
   live run showed the model marking its plan step done in the same output
   as the redundant call: rejecting the step threw the progress away.
+  The memory is keyed by tool as well as command since the second bench
+  battery: a `test` is never skipped on the strength of a `shell` run of
+  the same command (the green checkpoint listens only to `test`, so that
+  skip hid a passing tree behind a stale failure for 51 steps). An
+  identical skip on three consecutive steps parks as a question, the same
+  cap as a repeated note.
 - **Done stays done.** A patch that moves a plan step from `done` back to
   `pending` or `in_progress` is rejected (`plan_rules` in the coding
   skills), naming the first open step to work on instead, or "add a new
@@ -915,7 +921,51 @@ findings, `tool_calls == 0`) is replaced by a `test` call on
 set beside `green_step`; no `cmd` when none), so the model's next
 prompt holds a real test result instead of a request to get one. Runs
 45-46 and 69-70 showed the look-first note never moves this model; run
-71 showed a test observation does. The same mechanism, with the patch left
+71 showed a test observation does. Implement got the twin after the
+first bench battery: `done` with the plan complete and no passing test
+becomes the `test` call on `last_test_cmd` whenever something was
+edited since the last run (`HarnessState.edits_since_test`, reset on
+every `test` call) or no test has run yet; only a `done` sent after a
+failing run with nothing edited since keeps the note, so the repeat cap
+still catches a model that will not edit; and the substitution outranks
+the premature-`done` note whenever edits are unverified, since running
+the test is the right move whatever plan step is open. And a bare `done` (neither
+`done: true` nor `next_skill`), which the core rule rejected eight
+times in the thinking battery, is named for the model: with a passing
+test and no open step it becomes the handoff to review; otherwise it
+falls into the same paths as any other `done`. The `maintainer` log
+entry now carries `reasoning_chars` and `observation_chars`, so a run
+can show whether the maintainer ever received reasoning. Last in this
+family: a model patch that carries a harness-owned field (`notes`,
+`seen`, `reports`) has that key dropped with a note ("`seen` is kept
+by the harness; that part of your patch was dropped and the rest was
+kept") instead of being rejected outright, since the model sees those
+fields in its workspace view and echoes them back. Operator patches
+never pass through `validate` and stay trusted writes. At the parse
+level, an output that carries a well-formed `patch` and no `action` at
+all (four in a row with thinking on, where the server stops enforcing
+the schema) becomes a `Continue` with the note "your output had no
+`action`; the patch was kept" rather than a shape rejection; the
+model-facing schema still requires `action`, and an explicit
+`"type": "continue"` is still rejected. And a third cap sits beside
+the two identical-repeat caps: `NON_PROGRESS_CAP` (6) parks the
+session as a question after six consecutive committed steps that were
+each a conversion or a skipped repeat, of any mix of shapes, naming
+the shapes in order (one run alternated a skipped test, an empty
+`ask_user`, and a premature `done` for thirty steps without ever
+tripping a same-shape cap). Any executed tool call, park, handoff, or
+`done` resets it.
+
+Only review can end the task. `RouterSkill`, `PlanSkill`, and
+`ImplementSkill` return `false` from `is_terminal` unconditionally, and
+a `done: true` in any of their patches is stripped with a note ("`done:
+true` is not the plan skill's to set; the task is finished by review";
+for implement, "`done: true` is review's to set; implement hands off
+with `next_skill: "review"` once verification passes", after which the
+usual chain decides the handoff or the test substitution): a bench
+run had the plan skill send `done: true` on an empty plan, the
+empty-plan conversion swapped the action but kept the patch, and the
+session ended as `done` after three steps with nothing built. The same mechanism, with the patch left
 unchanged, backs the `next` shape rules (`strip_malformed_next`) and
 the working set's redundant-call skips: the slot or call is dropped,
 the note says why, the step still lands. A conversion is a steer, not a
@@ -1008,8 +1058,10 @@ its first crash.
 `Guards` (`core/src/guards.rs`) is one `bool` per non-progress rule the
 spec's audit table marks "peel": `redundant_reads` (7.8), `silent_reads`,
 `read_guard`, `redundant_verify` (7.7), `done_stays_done`, and
-`commitment_read_cap`. All default `true`; `Session::with_guards` and the
-CLI's `guards` config section set them. The five session-level rules are
+`commitment_read_cap`. All default `true` except `done_stays_done`
+(off since the first bench battery: twelve rejections of a reopened
+"run the tests" step parked a run whose crate was already green);
+`Session::with_guards` and the CLI's `guards` config section set them. The five session-level rules are
 gated at their existing check sites in `core/src/session.rs`; with
 `commitment_read_cap` off, a read against a set commitment runs and the
 observation gets a one-line "still pending" note instead of a rejection.
@@ -1028,10 +1080,64 @@ ahead of the switch runs, and done-stays-done is peeled first.
 
 The audit itself (runs 38-43 one per switch, runs 51-65 three per
 switch; tables in the README field notes) left the defaults as they
-are: every switch on except `commitment_read_cap`. Silent reads and the
+were: every switch on except `commitment_read_cap`. The bench then
+turned `done_stays_done` off as well (see the bench milestone). Silent reads and the
 read guard are the two whose absence showed (no green in six runs);
 done-stays-done and redundant-verify are the only candidates to peel,
 and only with more runs than the audit had.
+
+## Tools write durable state: `Skill::after_tool` and `seen`
+
+`Skill::after_tool(ws, harness, step, name, args, output) -> Option<Patch>`
+(default `None`) runs after a tool call executed successfully (never on
+a tool error or a skipped repeat; a paged read arrives with its
+rewritten args), after the model's own patch for the step committed.
+The session applies the returned patch as one extra harness version
+(`apply_after_tool_patch`: a top-level replace rather than the merge
+strategy, because the merge keeps keyed-array entries the patch omits
+and the hook needs to evict and clear), logged as a `Patch` entry with
+`source: "harness"`, `reason: "after_tool"`; a patch that fails to
+apply is a System `note`, never a failed step.
+
+The coding skills use it for `CodingWorkspace.seen: Vec<SeenFile>`
+(`{path, lines, read: [[a,b]..], edited: [[a,b]..], step}`), harness-
+owned like `notes` (a model patch touching it is refused with the same
+text). `read_file` records the window from the tool's header and the
+file length; `edit_file` records the edited range from its output;
+`write_file` marks the whole file edited and clears the read ranges;
+`revert_file` clears both, or drops the entry when the file was
+removed. Ranges coalesce when adjacent or overlapping; twelve entries
+at most, the oldest step evicted. The working set keeps the recent
+content; `seen` keeps the durable record of what the model knows about
+each file, across eviction, handoff, and resume. This is the directive
+applied to the tools: a read that leaves nothing in state was the
+failure mode the silent-reads rule guards against, and now every read
+leaves its range in state whether the model writes a note or not.
+
+`Skill::on_activate(&self, ws) -> Option<Patch>` (default `None`) is
+the activation-time twin: called once after an activation commits, its
+patch is applied the same way (`source: "harness"`, `reason:
+"on_activate"`). The coding skills use it to clear `next_skill` once a
+handoff has been consumed; before it, the field stayed set for the
+whole next activation and a bare `done` merged into a self-handoff the
+core rule rejected (eleven times in one bench battery).
+
+## Milestone 13: bench
+
+`statie bench [--tasks DIR] [--task NAME]... [--seeds N] [--config PATH]
+[--out DIR] [--json] [--keep]` (`cli/src/bench.rs`) runs each task under
+`bench/tasks/<name>/` (`task.json`, `fixture/`, `solution/`) for seeds
+1..=N through the real binary: fresh temp sandbox, fixture copied in,
+the base config written to `.statie/config.json` with `sandbox_root`
+`"."` and `model.options.seed` set, `statie -p <prompt>` spawned there
+with a wall-clock timeout, then `test_cmd` for the landing, a byte
+comparison of the protected files, and metrics from the session log
+(`cli/src/metrics.rs` plus server prompt tokens from the Patch entries'
+usage). Runs are sequential (one GPU). The runner is a trait so tests
+substitute a fake that writes a log and a summary line. The fixtures'
+`Cargo.toml` files carry an empty `[workspace]` table so they are
+standalone roots; `cli/tests/bench_tasks.rs` checks every task fails as
+shipped and passes with `solution/` overlaid.
 
 ## Testing conventions
 

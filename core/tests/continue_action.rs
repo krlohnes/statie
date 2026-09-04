@@ -606,3 +606,107 @@ async fn streak_resets_after_parking_so_a_single_further_repeat_does_not_repark(
         outcomes[3]
     );
 }
+
+// ---------------------------------------------------------------------
+// A plain skill (default `Skill::validate`, no override) to exercise the
+// no-`action` recovery (`core/src/skill.rs`'s `ParsedOutput::
+// parse_with_fixes`) end to end through the session, as opposed to
+// `ContinueSkill` above, whose `validate` override always converts to
+// `Continue` regardless of what the model sent.
+// ---------------------------------------------------------------------
+
+struct PlainSkill;
+
+impl Skill for PlainSkill {
+    type Workspace = Workspace;
+    type Patch = MergePatch;
+
+    fn name(&self) -> &str {
+        "plain"
+    }
+
+    fn spec(&self) -> Arc<SkillSpec> {
+        Arc::new(SkillSpec::new("plain", "a skill with no validate override"))
+    }
+
+    fn initial_workspace(&self) -> Workspace {
+        Workspace::default()
+    }
+
+    fn tools(&self) -> Vec<String> {
+        vec!["read_file".to_string()]
+    }
+
+    fn is_terminal(&self, s: &Workspace) -> bool {
+        s.done
+    }
+}
+
+/// The session-level repeat cap: a model output with a well-formed `patch`
+/// and no `action` at all -- the exact live shape that hit the retry cap
+/// four times in a row before this recovery existed -- parses as
+/// `Action::Continue` (see `core/tests/parse_validate.rs` for the parser-
+/// level assertions) and, sent identically three times running through a
+/// plain skill with no `validate` override, hits `CONTINUE_REPEAT_CAP` the
+/// same as any other repeated `Continue` note: steps 1-2 are
+/// `Outcome::Continue`, step 3 parks as `Park::AskUser` with the exact
+/// no-`action` note and "3 times in a row" in the message.
+#[tokio::test]
+async fn three_identical_no_action_outputs_in_a_row_park_via_repeat_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    // No `action` key at all -- `ParsedOutput::parse_with_fixes` recovers
+    // this as `Action::Continue` rather than rejecting it.
+    let no_action_output = || serde_json::json!({"patch": {"value": 1}});
+    let model = ScriptedModel::new(vec![
+        no_action_output(),
+        no_action_output(),
+        no_action_output(),
+    ]);
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        statie_core::ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+
+    let skill = Arc::new(PlainSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        outcomes.push(SessionLogExt::append_record(log.as_ref(), rec).unwrap());
+    }
+
+    assert!(
+        matches!(outcomes[0], Outcome::Continue),
+        "step 1: got {:?}",
+        outcomes[0]
+    );
+    assert!(
+        matches!(outcomes[1], Outcome::Continue),
+        "step 2: got {:?}",
+        outcomes[1]
+    );
+    match &outcomes[2] {
+        Outcome::Parked(Park::AskUser(msg)) => {
+            assert!(
+                msg.contains(
+                    "your output had no `action`; the patch was kept. Every output needs an \
+                     action: a tool call, `done`, or `ask_user`."
+                ),
+                "park message should contain the no-action note: {msg}"
+            );
+            assert!(
+                msg.contains("3 times in a row"),
+                "park message should say it repeated 3 times in a row: {msg}"
+            );
+        }
+        other => panic!("step 3: expected Parked(AskUser(_)), got {other:?}"),
+    }
+}

@@ -73,6 +73,23 @@ const READ_GUARD_THRESHOLD: u32 = 4;
 /// driver) breaks the loop instead of the model repeating itself forever.
 const CONTINUE_REPEAT_CAP: u32 = 3;
 
+/// How many consecutive non-progress steps of ANY shape may commit before
+/// the session parks, regardless of whether consecutive occurrences repeat
+/// the same shape. `CONTINUE_REPEAT_CAP` (via `continue_repeat_count`/
+/// `skip_repeat_count`) already catches the same `Continue` note or the same
+/// skipped call recurring three times running, but a live run alternated
+/// three DIFFERENT non-progress shapes -- a skipped repeat of the test, an
+/// empty `ask_user`, a premature `done` -- for roughly 30 steps with neither
+/// cap ever firing, since neither streak was ever identical to itself twice
+/// running. A step counts as non-progress here when its committed outcome
+/// was a `Continue` conversion (a skill's `validate` override rewriting the
+/// model's action, e.g. `ParsedOutput::set_action`, INCLUDING the no-`action`
+/// recovery in `ParsedOutput::parse_with_fixes`) or a skipped-redundant call
+/// (7.7/7.8's "do NOT run the tool" path); an executed tool call, a park, a
+/// handoff, or `done` resets the count to 0. See
+/// `Session::non_progress_count`/`non_progress_shapes`.
+const NON_PROGRESS_CAP: u32 = 6;
+
 /// Large enough window to find any `ToolOutput` entry from the current
 /// activation when looking up a previous `read_file` call's header for
 /// 7.8's read-paging special case (mirrors `working_set.rs`'s
@@ -101,6 +118,14 @@ struct AppliedTrustedPatch {
 /// `Active::step`).
 #[derive(Clone, Debug, PartialEq)]
 struct VerifyRun {
+    /// The tool that ran the command (`"shell"` or `"test"`). A repeat is
+    /// only redundant when both the tool AND the command match: `test`
+    /// listens for its own green checkpoint (`note_test_result`), which a
+    /// `shell` run of the identical command never produces, so a `test`
+    /// call must still run even if a `shell` of the same command already
+    /// ran (and vice versa) -- see the redundant-verification guard in
+    /// `Active::step`.
+    tool: String,
     /// The command as normalized by `normalize_command`.
     cmd: String,
     /// Short human-readable summary of what the command returned, shown in
@@ -185,6 +210,43 @@ fn read_call_key(name: &str, args: &Value) -> String {
 /// something.
 fn is_empty_patch(patch: &Value) -> bool {
     matches!(patch, Value::Object(map) if map.is_empty())
+}
+
+/// Maximum length, in characters, of one shape description in the
+/// `NON_PROGRESS_CAP` park message/log entry (see `non_progress_shape`) --
+/// long enough for a short clause, short enough that six of them stay
+/// readable on one line.
+const NON_PROGRESS_SHAPE_MAX_CHARS: usize = 60;
+
+/// Short, human-readable description of one non-progress step, for the
+/// `NON_PROGRESS_CAP` guard's park message and `non_progress_cap` log entry
+/// (see `Session::non_progress_shapes`). For a skipped-redundant call, names
+/// the tool and command/key, matching the existing repeated-skip guard's own
+/// text. For a `Continue` conversion, core has no visibility into what the
+/// model's original action was (a skill's `validate` override already
+/// replaced it before this point) -- the best generic description available
+/// is a short lead-in of the note itself: up to the first `.`/`:`/newline,
+/// capped at `NON_PROGRESS_SHAPE_MAX_CHARS` chars (with a trailing "..." when
+/// cut).
+fn non_progress_shape(tool_skipped: bool, action: &Action) -> String {
+    if tool_skipped && let Action::Tool { name, args } = action {
+        let described = extract_command(args).unwrap_or_else(|| read_call_key(name, args));
+        return format!("skipped {name} {described}");
+    }
+    if let Action::Continue { note } = action {
+        let cut = note
+            .find(['.', ':', '\n'])
+            .map(|i| &note[..i])
+            .unwrap_or(note.as_str())
+            .trim();
+        let truncated: String = cut.chars().take(NON_PROGRESS_SHAPE_MAX_CHARS).collect();
+        return if truncated.chars().count() < cut.chars().count() {
+            format!("{truncated}...")
+        } else {
+            truncated
+        };
+    }
+    "non-progress step".to_string()
 }
 
 /// Extracts the command string for `shell`/`test` args: `args.cmd`, falling
@@ -376,8 +438,9 @@ pub struct Session<W> {
     /// restores pre-working-set behaviour.
     working_set: WorkingSetConfig,
     /// Rule-audit switches (statie-spec.md "10. After it works: the rule
-    /// audit", milestone 12). Defaults to `Guards::default()` (all `true`),
-    /// which is exactly today's behaviour.
+    /// audit", milestone 12). Defaults to `Guards::default()` (all `true`
+    /// except `done_stays_done`, off by default since the first bench
+    /// battery's audit -- see `core/src/guards.rs`).
     guards: Guards,
     /// Green checkpoint (statie-spec.md "10. Working set", "Green
     /// checkpoint"): every file the activation had edited as of the last
@@ -433,6 +496,40 @@ pub struct Session<W> {
     /// third time parks instead of continuing (`Active::execute`'s
     /// `Action::Continue` arm).
     continue_repeat_count: u32,
+    /// Repeated-skip guard: the `(tool, call key)` (see `read_call_key`) of
+    /// the most recent `skipped_redundant` step (7.7/7.8's "do NOT run the
+    /// tool" path in `Active::execute`), kept so the next skip can tell
+    /// whether it is the SAME call being skipped again. `None` initially,
+    /// on activation, and after any step that isn't itself a skip -- i.e. an
+    /// executed tool call, a rejection, or any other outcome breaks the
+    /// streak, the same as a different skipped call would. A
+    /// `skipped_redundant` observation is the same kind of non-progress as a
+    /// repeated `Continue` note (see `last_continue_note`) but wasn't
+    /// counted before this guard existed, letting a run repeat the same
+    /// skip dozens of times.
+    last_skip_key: Option<(String, String)>,
+    /// How many consecutive steps have produced `last_skip_key` (including
+    /// the one that set it, so this is always >= 1 whenever `last_skip_key`
+    /// is `Some`). Reset to 0 alongside `last_skip_key`. At
+    /// `CONTINUE_REPEAT_CAP`, the step that would make the skip recur a
+    /// third time parks instead of continuing (`Active::execute`'s skip
+    /// handling), the same as `continue_repeat_count` does for `Continue`.
+    skip_repeat_count: u32,
+    /// Mixed-shape non-progress guard (`NON_PROGRESS_CAP`): count of
+    /// consecutive committed steps whose outcome was a `Continue` conversion
+    /// OR a skipped-redundant call, regardless of whether consecutive
+    /// occurrences share a note/call key -- unlike `continue_repeat_count`/
+    /// `skip_repeat_count`, which only track a streak of the SAME shape.
+    /// Reset to 0 by an executed tool call, a park, a handoff, `done`, or
+    /// activation. See `non_progress_shapes` for the human-readable
+    /// description of each step in the current streak.
+    non_progress_count: u32,
+    /// One short human-readable description per step in the current
+    /// `non_progress_count` streak, in order (e.g. "skipped test", "empty
+    /// ask_user", "done with an open step"), used to build the park message
+    /// and the `non_progress_cap` log entry when the cap fires. Cleared
+    /// alongside `non_progress_count`.
+    non_progress_shapes: Vec<String>,
 }
 
 impl<W> Session<W> {
@@ -479,6 +576,10 @@ impl<W> Session<W> {
             mutated_since_test: false,
             last_continue_note: None,
             continue_repeat_count: 0,
+            last_skip_key: None,
+            skip_repeat_count: 0,
+            non_progress_count: 0,
+            non_progress_shapes: Vec::new(),
         }
     }
 
@@ -501,7 +602,8 @@ impl<W> Session<W> {
 
     /// Configures the rule-audit switches (statie-spec.md "10. After it
     /// works: the rule audit", milestone 12). Without a call, the session
-    /// runs with `Guards::default()` (all rules on -- today's behaviour).
+    /// runs with `Guards::default()` (all rules on except `done_stays_done`,
+    /// off by default -- see `core/src/guards.rs`).
     pub fn with_guards(mut self, guards: Guards) -> Self {
         self.guards = guards;
         self
@@ -586,6 +688,7 @@ impl<W> Session<W> {
                         green_filtered: false,
                         tool_calls: 0,
                         last_test_cmd: None,
+                        edits_since_test: 0,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -613,6 +716,10 @@ impl<W> Session<W> {
         self.mutated_since_test = false;
         self.last_continue_note = None;
         self.continue_repeat_count = 0;
+        self.last_skip_key = None;
+        self.skip_repeat_count = 0;
+        self.non_progress_count = 0;
+        self.non_progress_shapes.clear();
 
         let entry = LogEntry {
             step: self.log.last_step(),
@@ -644,12 +751,14 @@ impl<W> Session<W> {
         }
         restrict_action_types(&mut schema, &allowed_types);
 
-        Ok(Active {
+        let mut active = Active {
             session: self,
             skill,
             spec,
             schema,
-        })
+        };
+        active.run_on_activate().await?;
+        Ok(active)
     }
 
     pub async fn state(&self) -> Result<(CommittedState<W>, Version), SessionError> {
@@ -1361,6 +1470,7 @@ where
             && (name == "shell" || name == "test")
             && let Some(cmd) = extract_command(args)
             && let Some(last) = &self.session.last_verify
+            && last.tool == *name
             && last.cmd == cmd
             && !self.session.mutated_since_verify
         {
@@ -1542,7 +1652,7 @@ where
         let patch_empty = is_empty_patch(&patch_raw);
 
         // 9. Execute.
-        let outcome = self
+        let mut outcome = self
             .execute(
                 executable,
                 next_harness.step,
@@ -1752,6 +1862,113 @@ where
         if !matches!(action_for_maintainer, Action::Continue { .. }) {
             self.session.last_continue_note = None;
             self.session.continue_repeat_count = 0;
+        }
+
+        // Repeated-skip guard (`CONTINUE_REPEAT_CAP`, shared with the
+        // repeated-`Continue`-note guard above): a `skipped_redundant` step
+        // (7.7/7.8's "do NOT run the tool" path in `execute`) is the same
+        // kind of non-progress as a repeated `Continue` note, but wasn't
+        // capped before -- a live run skipped the same call 51 times in one
+        // session. Track consecutive occurrences of the SAME `(tool, call
+        // key)` (see `read_call_key`); any other committed step (an
+        // executed tool call, whether it succeeds or errors) resets the
+        // streak, the same as a different skip would.
+        if tool_skipped && let Action::Tool { name, args } = &action_for_maintainer {
+            let key = (name.clone(), read_call_key(name, args));
+            if self.session.last_skip_key.as_ref() == Some(&key) {
+                self.session.skip_repeat_count += 1;
+            } else {
+                self.session.last_skip_key = Some(key.clone());
+                self.session.skip_repeat_count = 1;
+            }
+
+            if self.session.skip_repeat_count >= CONTINUE_REPEAT_CAP {
+                // Reset so a resumed session starts this streak fresh
+                // rather than parking again on the very next step even if
+                // the model's reply happens to repeat the same skip once
+                // more -- mirrors the `Continue`-note guard's own reset.
+                self.session.last_skip_key = None;
+                self.session.skip_repeat_count = 0;
+
+                // Prefer the human-readable command (`shell`/`test`) over
+                // the raw call key (`read_file`/`search`/...) when one is
+                // available -- mirrors the redundant-verification guard's
+                // own rejection text.
+                let described = extract_command(args).unwrap_or_else(|| key.1.clone());
+                let base = self
+                    .session
+                    .pending_observation
+                    .as_ref()
+                    .map(|o| o.as_str().to_string())
+                    .unwrap_or_default();
+                let message = format!(
+                    "{base}\n\nThe model has repeated the same skipped call \
+                     {CONTINUE_REPEAT_CAP} times in a row ({name} {described}). Reply with what \
+                     it should do next."
+                );
+                let message =
+                    self.restore_green_and_append(next_harness.step, &mut entries, message);
+                outcome = Outcome::Parked(Park::AskUser(message));
+            }
+        } else if !tool_skipped {
+            self.session.last_skip_key = None;
+            self.session.skip_repeat_count = 0;
+        }
+
+        // Mixed-shape non-progress guard (`NON_PROGRESS_CAP`): unlike the
+        // two guards just above, which only catch a streak of the SAME
+        // shape recurring, this one catches ANY run of non-progress steps
+        // regardless of shape -- a live run alternated a skipped repeat, an
+        // empty `ask_user`, and a premature `done` for ~30 steps with
+        // neither of those caps ever firing, since no single shape ever hit
+        // three in a row. Only evaluated when this step didn't already park
+        // (from the retry cap inside `execute`'s `Continue` arm, from the
+        // repeated-skip guard just above, or from the model's own action):
+        // a park is itself progress in the sense that matters here -- a
+        // human/driver is now in the loop -- and the two guards above always
+        // reset their own counters on the way to parking, so counting this
+        // step again on top would double, not extend, the signal.
+        if matches!(outcome, Outcome::Continue) {
+            let is_non_progress =
+                matches!(action_for_maintainer, Action::Continue { .. }) || tool_skipped;
+            if is_non_progress {
+                self.session.non_progress_count += 1;
+                self.session
+                    .non_progress_shapes
+                    .push(non_progress_shape(tool_skipped, &action_for_maintainer));
+
+                if self.session.non_progress_count >= NON_PROGRESS_CAP {
+                    let shapes = self.session.non_progress_shapes.join(", ");
+                    self.session.non_progress_count = 0;
+                    self.session.non_progress_shapes.clear();
+
+                    entries.push(system_entry(
+                        next_harness.step,
+                        "non_progress_cap",
+                        serde_json::json!({"shapes": shapes}),
+                    ));
+
+                    let base = self
+                        .session
+                        .pending_observation
+                        .as_ref()
+                        .map(|o| o.as_str().to_string())
+                        .unwrap_or_default();
+                    let message = format!(
+                        "{base}\n\nThe model has sent {NON_PROGRESS_CAP} steps in a row \
+                         without progress ({shapes}). Reply with what it should do next."
+                    );
+                    let message =
+                        self.restore_green_and_append(next_harness.step, &mut entries, message);
+                    outcome = Outcome::Parked(Park::AskUser(message));
+                }
+            } else {
+                self.session.non_progress_count = 0;
+                self.session.non_progress_shapes.clear();
+            }
+        } else {
+            self.session.non_progress_count = 0;
+            self.session.non_progress_shapes.clear();
         }
 
         Ok(StepRecord::new(entries, outcome))
@@ -1974,6 +2191,7 @@ where
                         if name == "shell" || name == "test" {
                             if let Some(cmd) = extract_command(&args) {
                                 self.session.last_verify = Some(VerifyRun {
+                                    tool: name.clone(),
                                     cmd,
                                     summary: summarize_verify_output(full.as_ref()),
                                 });
@@ -2143,6 +2361,17 @@ where
                             // same command on a blind approval rather than
                             // an auto-detected one.
                             harness.last_test_cmd = extract_command(&args);
+                            // `edits_since_test` (`core/src/version.rs`):
+                            // every `test` call resets the counter, pass or
+                            // fail -- this is the harness's own record of
+                            // whether anything changed since the run the
+                            // model is about to point at.
+                            harness.edits_since_test = 0;
+                        } else if matches!(
+                            name.as_str(),
+                            "edit_file" | "write_file" | "revert_file"
+                        ) {
+                            harness.edits_since_test = harness.edits_since_test.saturating_add(1);
                         }
                         // This call actually executed -- see
                         // `HarnessState::tool_calls`'s doc. Folded into this
@@ -2151,6 +2380,43 @@ where
                         // round-trip.
                         harness.tool_calls += 1;
                         self.session.store.set_harness(harness).await?;
+
+                        // Milestone 10: `Skill::after_tool` -- called right
+                        // after this call's execution and bookkeeping have
+                        // committed, on the success path only (never on a
+                        // tool error, never on a skipped-redundant call
+                        // above; a paged read reaches here with its
+                        // rewritten `args`, already in scope). Never fails
+                        // the step: a patch error is logged as a `System`
+                        // `note` and otherwise ignored. Writes straight to
+                        // `self.session.log` (not the local `entries`
+                        // buffer, which `step()` has already mostly
+                        // finished accumulating by the time `execute` runs)
+                        // -- the same convention `run_maintainer` and
+                        // `apply_trusted_patch`'s other callers use for a
+                        // harness-authored commit made after the step's own
+                        // patch/action have already committed.
+                        let (after_cur, _after_version) = self.session.state().await?;
+                        if let Some(hook_patch) = self.skill.after_tool(
+                            &after_cur.agent,
+                            &after_cur.harness,
+                            step,
+                            &name,
+                            &args,
+                            full.as_ref(),
+                        ) && let Err(e) =
+                            self.apply_after_tool_patch(hook_patch, "after_tool").await
+                        {
+                            let _ = self.session.log.append(system_entry(
+                                step,
+                                "note",
+                                serde_json::json!({
+                                    "text": format!(
+                                        "after_tool patch for `{name}` could not be applied: {e}"
+                                    )
+                                }),
+                            ));
+                        }
 
                         Ok(Outcome::Continue)
                     }
@@ -2528,6 +2794,20 @@ where
         self.session.last_continue_note = None;
         self.session.continue_repeat_count = 0;
 
+        // Same reset for the repeated-skip guard (see `last_skip_key`): a
+        // rejection is not a repeat of a skip either, and never reaches the
+        // skip handling in `execute`.
+        self.session.last_skip_key = None;
+        self.session.skip_repeat_count = 0;
+
+        // Same reset for the mixed-shape non-progress guard
+        // (`NON_PROGRESS_CAP`): a rejected step never committed, so it is
+        // not itself one of the non-progress steps the cap counts, and it
+        // should not let two non-progress steps on either side of it count
+        // as consecutive.
+        self.session.non_progress_count = 0;
+        self.session.non_progress_shapes.clear();
+
         // Prefix the *observation* (never the logged/returned `reason`
         // itself, which tests assert on verbatim) with the attempt count,
         // and, from the second consecutive rejection with the same reason,
@@ -2737,6 +3017,134 @@ where
         })
     }
 
+    /// Applies a [`Skill::after_tool`] patch (milestone 10): unlike
+    /// `apply_trusted_patch`, which runs `raw` through the skill's
+    /// `PatchStrategy` (JSON Merge Patch's keyed-array merge for the
+    /// project default), each top-level key present in `raw` REPLACES that
+    /// field's value outright -- no deep merge, no keyed-array merge by
+    /// `id`/`path`. A harness hook always knows the field's whole new value
+    /// (e.g. the coding skills' `seen`, an array keyed by `path` that must
+    /// be able to shrink on eviction or drop an entry on `revert_file` --
+    /// exactly what the keyed merge would refuse to do, since it only ever
+    /// updates or appends entries, never removes one absent from the
+    /// patch), so a plain top-level assign is both simpler and correct
+    /// where the keyed merge is not.
+    ///
+    /// Still runs the skill's `rules` on the candidate next state, and
+    /// commits/logs exactly like `apply_trusted_patch` (source `"harness"`,
+    /// one extra version, a `Patch` log entry), except the log entry also
+    /// carries `"reason": reason` so it is distinguishable from commitment
+    /// clearing and other harness-authored patches.
+    async fn apply_after_tool_patch(
+        &mut self,
+        raw: Value,
+        reason: &str,
+    ) -> Result<AppliedTrustedPatch, SessionError> {
+        let (cur, version) = self.session.state().await?;
+
+        let Value::Object(patch_map) = &raw else {
+            return Err(SessionError::Patch(crate::error::PatchError::Malformed(
+                "after_tool patch must be a JSON object".to_string(),
+            )));
+        };
+
+        let mut next_value = serde_json::to_value(&cur.agent)
+            .map_err(|e| SessionError::Patch(crate::error::PatchError::Malformed(e.to_string())))?;
+        {
+            let Value::Object(next_map) = &mut next_value else {
+                return Err(SessionError::Patch(crate::error::PatchError::Malformed(
+                    "workspace does not serialize to a JSON object".to_string(),
+                )));
+            };
+            for (k, v) in patch_map {
+                if v.is_null() {
+                    next_map.remove(k);
+                } else {
+                    next_map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let next: K::Workspace = serde_json::from_value(next_value)
+            .map_err(|e| SessionError::Patch(crate::error::PatchError::Malformed(e.to_string())))?;
+
+        self.skill.rules(&cur, &next).map_err(SessionError::Patch)?;
+
+        let checked = crate::patch::CheckedPatch::new(raw, next, version);
+        let validated = crate::patch::ValidatedPatch::from_checked(checked);
+
+        let mut next_harness = cur.harness.clone();
+        next_harness.step += 1;
+        next_harness.active_tools = self.skill.tools();
+        next_harness.activation = self.skill.name().to_string();
+
+        let cur_value = serde_json::to_value(&cur.agent).unwrap_or(Value::Null);
+        let next_value_for_keys = serde_json::to_value(validated.next()).unwrap_or(Value::Null);
+        let changed = changed_top_level_keys(&cur_value, &next_value_for_keys);
+        let mut keys: Vec<String> = changed
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+
+        let patch_raw = validated.raw().clone();
+        let new_version = self
+            .session
+            .store
+            .commit(validated, next_harness.clone(), &Action::Yield, version)
+            .await?;
+
+        self.session.log.append(LogEntry {
+            step: next_harness.step,
+            kind: LogKind::Patch,
+            ts: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "version": new_version,
+                "patch": patch_raw,
+                "source": "harness",
+                "reason": reason,
+            }),
+            agent: None,
+        })?;
+
+        Ok(AppliedTrustedPatch {
+            version: new_version,
+            step: next_harness.step,
+            keys,
+        })
+    }
+
+    /// `Skill::on_activate`: called once right after this activation's
+    /// state/harness have been committed and the `activate` System entry
+    /// logged (i.e. right before `Session::activate_inner` hands the built
+    /// `Active` back to its caller) -- covering every activation path
+    /// (fresh activate, handoff, resume with `--skill` via
+    /// `Session::activate`, and `activate_forced`), since all of them
+    /// funnel through `activate_inner`.
+    ///
+    /// Applies the returned patch the same way an `after_tool` hook's is
+    /// (`apply_after_tool_patch`, top-level field replacement, source
+    /// `"harness"`), just with `reason: "on_activate"` so the two are
+    /// distinguishable in the log. Never fails activation: an error
+    /// applying the patch is logged as a `System` `note` and otherwise
+    /// ignored, mirroring `after_tool`'s own error handling in `execute`.
+    async fn run_on_activate(&mut self) -> Result<(), SessionError> {
+        let (cur, _version) = self.session.state().await?;
+        let Some(patch) = self.skill.on_activate(&cur.agent) else {
+            return Ok(());
+        };
+        if let Err(e) = self.apply_after_tool_patch(patch, "on_activate").await {
+            let step = cur.harness.step;
+            let _ = self.session.log.append(system_entry(
+                step,
+                "note",
+                serde_json::json!({
+                    "text": format!("on_activate patch could not be applied: {e}")
+                }),
+            ));
+        }
+        Ok(())
+    }
+
     /// Context maintenance (statie-spec.md "9. Context maintenance"): runs
     /// after a committed step's action has been fully handled -- tool
     /// executed and the next observation produced, or an `AskUser`/`Yield`
@@ -2749,6 +3157,13 @@ where
     /// its patch rejected twice) logs `maintainer_error`, keeps the
     /// previous notes, and never changes the step outcome -- callers must
     /// not propagate its `Result` into the step's own.
+    ///
+    /// The `maintainer` System entry logged on success carries
+    /// `reasoning_chars`/`observation_chars` (`reasoning.map(str::len)
+    /// .unwrap_or(0)` / `observation_text.len()`) alongside `notes_tokens`/
+    /// `next_set`, so a run's log can show whether the maintainer ever
+    /// actually saw any reasoning -- the maintainer's own output carries no
+    /// record of what it was given.
     async fn run_maintainer(
         &mut self,
         reasoning: Option<&str>,
@@ -2786,6 +3201,12 @@ where
         let notes = self.skill.notes(&cur.agent).unwrap_or_default();
         let budget = cur.harness.budgets.notes;
         let active_tools = cur.harness.active_tools.clone();
+
+        // Recorded in the `maintainer` System entry below so a run can show
+        // whether the maintainer ever actually saw any reasoning: the
+        // maintainer's own log entry does not otherwise say.
+        let reasoning_chars = reasoning.map(str::len).unwrap_or(0);
+        let observation_chars = observation_text.len();
 
         let input = MaintainInput {
             reasoning,
@@ -2898,7 +3319,12 @@ where
                 let _ = self.session.log.append(system_entry(
                     applied.step,
                     "maintainer",
-                    serde_json::json!({"notes_tokens": notes_tokens, "next_set": propose_next}),
+                    serde_json::json!({
+                        "notes_tokens": notes_tokens,
+                        "next_set": propose_next,
+                        "reasoning_chars": reasoning_chars,
+                        "observation_chars": observation_chars,
+                    }),
                 ));
                 sink.maintainer_done(notes_tokens, propose_next);
             }
@@ -2917,7 +3343,12 @@ where
                         let _ = self.session.log.append(system_entry(
                             applied.step,
                             "maintainer",
-                            serde_json::json!({"notes_tokens": notes_tokens, "next_set": false}),
+                            serde_json::json!({
+                                "notes_tokens": notes_tokens,
+                                "next_set": false,
+                                "reasoning_chars": reasoning_chars,
+                                "observation_chars": observation_chars,
+                            }),
                         ));
                         sink.maintainer_done(notes_tokens, false);
                     }

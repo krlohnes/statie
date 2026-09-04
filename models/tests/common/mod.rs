@@ -56,6 +56,7 @@ pub fn build_prompt(version: Version) -> BoundedPrompt {
         green_filtered: false,
         tool_calls: 0,
         last_test_cmd: None,
+        edits_since_test: 0,
     };
     let harness_view = HarnessView::new(&harness);
 

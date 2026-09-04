@@ -771,7 +771,8 @@ mod tests {
         assert_eq!(
             parsed.guards,
             Guards::default(),
-            "an absent guards section must leave every rule on"
+            "an absent guards section must match Guards::default() exactly (every rule on \
+             except done_stays_done, off by default since the first bench battery's audit)"
         );
     }
 
@@ -792,7 +793,10 @@ mod tests {
         assert!(parsed.guards.redundant_reads);
         assert!(parsed.guards.read_guard);
         assert!(parsed.guards.redundant_verify);
-        assert!(parsed.guards.done_stays_done);
+        assert!(
+            !parsed.guards.done_stays_done,
+            "done_stays_done defaults to false, unlike the other rules"
+        );
         assert!(parsed.guards.commitment_read_cap);
 
         // Round-trips through serialize -> deserialize unchanged.

@@ -435,6 +435,130 @@ async fn maintainer_called_once_after_committed_tool_step_with_expected_inputs()
 }
 
 // ---------------------------------------------------------------------
+// 1b. The `maintainer` System entry carries `reasoning_chars`/
+//     `observation_chars` -- the maintainer's own output says nothing about
+//     what it was given, so this is a run's only way to tell whether the
+//     maintainer ever actually saw any reasoning.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn maintainer_entry_records_reasoning_chars_when_reasoning_given() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let reasoning_text = "decided to bump the counter because X";
+    let model = ReasoningModel::new(vec![(
+        reasoning_text.to_string(),
+        serde_json::json!({
+            "patch": {"value": 1},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+    )]);
+
+    let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
+        notes: "bumped value to 1".to_string(),
+        next: None,
+    })]));
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 400),
+    )
+    .with_maintainer(Arc::clone(&maintainer) as Arc<dyn statie_core::Maintainer>);
+
+    let skill = Arc::new(MaintainedSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+
+    let calls = maintainer.calls();
+    let call = &calls[0];
+    let expected_observation_chars = call.observation.len();
+
+    let entries = log.entries(None, 100);
+    let maintainer_event = entries
+        .iter()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer"))
+        .expect("expected a maintainer system entry");
+    assert_eq!(
+        maintainer_event
+            .payload
+            .get("reasoning_chars")
+            .and_then(Value::as_u64),
+        Some(reasoning_text.len() as u64),
+        "reasoning_chars must equal the given reasoning's length: {maintainer_event:?}"
+    );
+    assert_eq!(
+        maintainer_event
+            .payload
+            .get("observation_chars")
+            .and_then(Value::as_u64),
+        Some(expected_observation_chars as u64),
+        "observation_chars must equal the observation text's length: {maintainer_event:?}"
+    );
+}
+
+#[tokio::test]
+async fn maintainer_entry_records_zero_reasoning_chars_when_reasoning_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let model = RecordingModel::new(vec![
+        serde_json::json!({
+            "patch": {"value": 1},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+    ]);
+
+    let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
+        notes: "bumped value to 1".to_string(),
+        next: None,
+    })]));
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 400),
+    )
+    .with_maintainer(Arc::clone(&maintainer) as Arc<dyn statie_core::Maintainer>);
+
+    let skill = Arc::new(MaintainedSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+
+    let calls = maintainer.calls();
+    assert_eq!(calls[0].reasoning, None, "this model gives no reasoning");
+
+    let entries = log.entries(None, 100);
+    let maintainer_event = entries
+        .iter()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer"))
+        .expect("expected a maintainer system entry");
+    assert_eq!(
+        maintainer_event
+            .payload
+            .get("reasoning_chars")
+            .and_then(Value::as_u64),
+        Some(0),
+        "reasoning_chars must be 0 when no reasoning was given: {maintainer_event:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // 2. The maintainer's notes appear in the next prompt under the "notes
 //    (kept by the harness ...)" header.
 // ---------------------------------------------------------------------

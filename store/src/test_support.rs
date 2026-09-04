@@ -80,6 +80,7 @@ pub fn harness(step: u64) -> HarnessState {
         green_filtered: false,
         tool_calls: 0,
         last_test_cmd: None,
+        edits_since_test: 0,
     }
 }
 

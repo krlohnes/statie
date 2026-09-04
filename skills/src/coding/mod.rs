@@ -17,8 +17,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use statie_core::{
-    Commitment, CommittedState, ParsedOutput, PatchError, Report, Skill, SkillSpec, ValidatedStep,
-    validate_default,
+    Commitment, CommittedState, HarnessState, ParsedOutput, Patch, PatchError, Report, Skill,
+    SkillSpec, ValidatedStep, parse_read_header, validate_default,
 };
 use statie_patch::JsonMergePatch;
 
@@ -116,6 +116,40 @@ pub struct CodingWorkspace {
     /// `next` and say why in `recent_summary`.
     #[serde(default)]
     pub next: Option<Commitment>,
+    /// Kept by the harness: for each file, its length and the line ranges
+    /// you have read and edited, with the step of the last change. Read it
+    /// before re-reading a file; you cannot patch it.
+    #[serde(default)]
+    pub seen: Vec<SeenFile>,
+}
+
+/// One entry of `CodingWorkspace::seen` (milestone 10): what the harness
+/// has recorded about a single file from `read_file`/`edit_file`/
+/// `write_file`/`revert_file` calls, so the model doesn't have to
+/// re-derive it (and doesn't have to re-read a file from the top to find
+/// out what it already read) after working-set eviction, a handoff, or a
+/// resume.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SeenFile {
+    /// Path to the file, relative to the sandbox root.
+    pub path: String,
+    /// The file's length in lines, as of the last time the harness learned
+    /// it (a `read_file` header, or a `write_file`/`revert_file` that
+    /// reported a line count). `0` if never learned.
+    #[serde(default)]
+    pub lines: u32,
+    /// Line ranges (1-based, inclusive, `[start, end]`) read so far,
+    /// merged and sorted; adjacent/overlapping ranges are coalesced into
+    /// one.
+    #[serde(default)]
+    pub read: Vec<[u32; 2]>,
+    /// Line ranges (1-based, inclusive, `[start, end]`) edited so far,
+    /// merged and sorted the same way as `read`.
+    #[serde(default)]
+    pub edited: Vec<[u32; 2]>,
+    /// The harness step of the most recent change recorded for this entry.
+    #[serde(default)]
+    pub step: u64,
 }
 
 const KNOWN_SKILLS: [&str; 4] = ["router", "plan", "implement", "review"];
@@ -178,6 +212,27 @@ fn common_is_terminal(ws: &CodingWorkspace) -> bool {
     ws.done
 }
 
+/// `on_activate` shared by every coding skill (`Skill::on_activate`,
+/// `core/src/skill.rs`): a handoff is requested by setting `next_skill`
+/// (paired with action `done`); the session consumes it by activating the
+/// named skill next, but nothing else clears the field on the newly
+/// committed workspace. Left in place, the stale value can be misread by
+/// this activation's own bare-`done`/handoff logic (e.g. `implement_
+/// bare_done`'s `next_skill.is_some()` check) as a handoff already named --
+/// eleven bench-battery rejections traced to exactly this. Clears it
+/// unconditionally whenever set: whatever `next_skill` said before this
+/// activation started is meaningless now (either it named THIS skill, the
+/// ordinary "no handoff yet" resting state, or it named the handoff that
+/// was just consumed to get here) -- nothing else about the workspace is
+/// touched.
+fn common_on_activate(ws: &CodingWorkspace) -> Option<Patch> {
+    if ws.next_skill.is_some() {
+        Some(serde_json::json!({"next_skill": null}))
+    } else {
+        None
+    }
+}
+
 /// `commitment` shared by `plan`/`implement`/`review`: the workspace's
 /// `next` field, verbatim.
 fn common_commitment(ws: &CodingWorkspace) -> Option<Commitment> {
@@ -186,11 +241,17 @@ fn common_commitment(ws: &CodingWorkspace) -> Option<Commitment> {
 
 /// `harness_owned_fields` shared by every coding skill: `notes` (maintained
 /// by the harness's `Maintainer` call after each step, see statie-spec.md
-/// "9. Context maintenance") and `reports` (written by `absorb_report` after
-/// a `delegate` action) are never model-patchable. Checked uniformly by
-/// `validate_default` against every action.
+/// "9. Context maintenance"), `reports` (written by `absorb_report` after
+/// a `delegate` action), and `seen` (milestone 10, written by `Skill::
+/// after_tool` after a `read_file`/`edit_file`/`write_file`/`revert_file`
+/// call) are never model-patchable. Checked uniformly by `validate_default`
+/// against every action.
 fn common_harness_owned_fields() -> Vec<String> {
-    vec!["notes".to_string(), "reports".to_string()]
+    vec![
+        "notes".to_string(),
+        "reports".to_string(),
+        "seen".to_string(),
+    ]
 }
 
 /// `notes` shared by every coding skill: the harness-maintained notes text,
@@ -206,6 +267,281 @@ fn common_notes(ws: &CodingWorkspace) -> Option<String> {
 /// Tools `next.tool` may name: the mutating calls a commitment is allowed to
 /// bind to.
 const MUTATING_TOOLS: [&str; 5] = ["edit_file", "write_file", "revert_file", "shell", "test"];
+
+// -----------------------------------------------------------------------
+// `seen` (milestone 10): `Skill::after_tool` for `plan`/`implement`/
+// `review`, shared via `common_after_tool`.
+// -----------------------------------------------------------------------
+
+/// At most this many `SeenFile` entries are kept; the entry with the
+/// smallest `step` (least recently touched) is evicted first when a new
+/// path would exceed the cap.
+const SEEN_CAP: usize = 12;
+
+/// Merges `[start, end]` (1-based, inclusive) into `ranges`, coalescing
+/// with any range it touches or overlaps, and keeps `ranges` sorted by
+/// start. Tolerates unsorted input (the whole vector is re-sorted before
+/// merging) and disjoint ranges (appended as their own entry).
+fn merge_range(ranges: &mut Vec<[u32; 2]>, new: [u32; 2]) {
+    ranges.push(new);
+    ranges.sort_unstable_by_key(|r| r[0]);
+    let mut merged: Vec<[u32; 2]> = Vec::with_capacity(ranges.len());
+    for r in ranges.drain(..) {
+        match merged.last_mut() {
+            // Touching (adjacent, r[0] == last_end + 1) or overlapping
+            // (r[0] <= last_end + 1 covers both, since r[0] is unsigned and
+            // sorted by start).
+            Some(last) if r[0] <= last[1].saturating_add(1) => {
+                last[1] = last[1].max(r[1]);
+            }
+            _ => merged.push(r),
+        }
+    }
+    *ranges = merged;
+}
+
+/// Finds the `SeenFile` entry for `path` in `seen`, or inserts a fresh one
+/// (evicting the entry with the smallest `step` first if `seen` is already
+/// at `SEEN_CAP` and `path` is not already present) and returns a mutable
+/// reference to it.
+fn seen_entry<'a>(seen: &'a mut Vec<SeenFile>, path: &str) -> &'a mut SeenFile {
+    if let Some(idx) = seen.iter().position(|f| f.path == path) {
+        return &mut seen[idx];
+    }
+    if seen.len() >= SEEN_CAP {
+        let evict_idx = seen
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, f)| f.step)
+            .map(|(i, _)| i)
+            .expect("seen.len() >= SEEN_CAP > 0");
+        seen.remove(evict_idx);
+    }
+    seen.push(SeenFile {
+        path: path.to_string(),
+        ..Default::default()
+    });
+    seen.last_mut().expect("just pushed")
+}
+
+/// Parses `edit_file`'s success output header for the `(lines a-b)` range
+/// of the region it just changed. Handles both header shapes
+/// `tools/src/edit_file.rs` emits (see that module):
+/// - `"edited <path>: replaced 1 occurrence (lines a-b)"` / `"... deleted N
+///   line(s) (lines a-b)"` -- the range is read straight from the
+///   parenthesized suffix.
+/// - `"edited <path>: inserted N line(s) after|before line X"` -- no
+///   explicit range in the text, so it's derived from `N` and `X`: an
+///   `after` insert lands at `[X+1, X+N]`; a `before` insert lands at
+///   `[X-N, X-1]` (saturating so an insert before line 1 never underflows).
+///
+/// Tolerant of a leading `note: ...; ` prefix (the whitespace-tolerant-
+/// match and repeated-anchor notes edit_file sometimes prepends).
+/// `write_file`/`revert_file` never emit this shape, so this parser is
+/// specific to `edit_file`.
+fn parse_edit_header(text: &str) -> Option<[u32; 2]> {
+    let first_line = text.lines().next()?;
+    let header = match first_line.split_once("edited ") {
+        Some((_, rest)) => rest,
+        None => return None,
+    };
+
+    if let Some(open) = header.rfind('(')
+        && let Some(close_rel) = header[open..].find(')')
+    {
+        let inner = &header[open + 1..open + close_rel];
+        if let Some(rest) = inner.strip_prefix("lines ")
+            && let Some((a, b)) = rest.split_once('-')
+        {
+            let a: u32 = a.trim().parse().ok()?;
+            let b: u32 = b.trim().parse().ok()?;
+            if a <= b {
+                return Some([a, b]);
+            }
+        }
+    }
+
+    // Insert shape: "...: inserted N line(s) after|before line X"
+    let (_, rest) = header.split_once(": inserted ")?;
+    let (n_str, rest) = rest.split_once(" line(s) ")?;
+    let n: u32 = n_str.trim().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let (dir, rest) = rest.split_once(" line ")?;
+    let x: u32 = rest.split_whitespace().next()?.parse().ok()?;
+    match dir {
+        "after" => Some([x + 1, x + n]),
+        "before" => Some([x.saturating_sub(n).max(1), x.saturating_sub(1).max(1)]),
+        _ => None,
+    }
+}
+
+/// Parses `revert_file`'s success output for the line count in `"reverted
+/// <path> to its content from before this session's first edit (N
+/// lines)"` (`tools/src/revert_file.rs`). Returns `None` for the "removed
+/// <path>; it did not exist before this session" shape (nothing to record
+/// a line count for -- the caller drops the entry instead).
+fn parse_revert_lines(text: &str) -> Option<u32> {
+    let first_line = text.lines().next()?;
+    let open = first_line.rfind('(')?;
+    let close_rel = first_line[open..].find(')')?;
+    let inner = &first_line[open + 1..open + close_rel];
+    let n_str = inner
+        .strip_suffix(" lines")
+        .or_else(|| inner.strip_suffix(" line"))?;
+    n_str.trim().parse().ok()
+}
+
+/// Counts lines the way `str::lines()` would (one per `\n`, plus one more
+/// for a final non-empty line with no trailing newline) -- mirrors
+/// `tools/src/write_file.rs`'s/`revert_file.rs`'s `bytecount_lines`, used
+/// here to derive `write_file`'s line count from its `content` arg (the
+/// tool's own output only reports bytes written, not lines).
+fn count_lines(text: &str) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let newlines = text.matches('\n').count();
+    let n = if text.ends_with('\n') {
+        newlines
+    } else {
+        newlines + 1
+    };
+    n as u32
+}
+
+/// `Skill::after_tool` shared by `plan`/`implement`/`review`: maintains
+/// `CodingWorkspace::seen` from a successfully executed `read_file`,
+/// `edit_file`, `write_file`, or `revert_file` call. Any other tool
+/// (`search`, `list_files`, `shell`, `test`, `recall`,
+/// `filter_last_tool_call`) returns `None` -- nothing to record.
+fn common_after_tool(
+    ws: &CodingWorkspace,
+    step: u64,
+    name: &str,
+    args: &serde_json::Value,
+    output: &str,
+) -> Option<Patch> {
+    let mut seen = ws.seen.clone();
+
+    match name {
+        "read_file" => {
+            let header = parse_read_header(output)?;
+            let path = args.get("path").and_then(serde_json::Value::as_str)?;
+            let entry = seen_entry(&mut seen, path);
+            entry.lines = header.total as u32;
+            merge_range(&mut entry.read, [header.from as u32, header.to as u32]);
+            entry.step = step;
+        }
+        "edit_file" => {
+            let range = parse_edit_header(output)?;
+            let path = args.get("path").and_then(serde_json::Value::as_str)?;
+            let entry = seen_entry(&mut seen, path);
+            merge_range(&mut entry.edited, range);
+            entry.step = step;
+        }
+        "write_file" => {
+            let path = args.get("path").and_then(serde_json::Value::as_str)?;
+            // The tool's own output only reports bytes written ("wrote N
+            // bytes to <path>", `tools/src/write_file.rs`), never a line
+            // count, so N is derived from the call's own `content` arg
+            // when present; `[[1, 0]]` ("whole file, length unknown") is
+            // the fallback the spec calls for when it isn't.
+            let content = args.get("content").and_then(serde_json::Value::as_str);
+            let entry = seen_entry(&mut seen, path);
+            match content {
+                Some(c) => {
+                    let lines = count_lines(c);
+                    entry.lines = lines;
+                    entry.edited = vec![[1, lines]];
+                }
+                None => {
+                    entry.edited = vec![[1, 0]];
+                }
+            }
+            entry.read.clear();
+            entry.step = step;
+        }
+        "revert_file" => {
+            let path = args.get("path").and_then(serde_json::Value::as_str)?;
+            if output.trim_start().starts_with("removed ") {
+                // The file never existed before this session: drop the
+                // entry outright, there is nothing left to describe.
+                seen.retain(|f| f.path != path);
+            } else {
+                let lines = parse_revert_lines(output);
+                let entry = seen_entry(&mut seen, path);
+                if let Some(n) = lines {
+                    entry.lines = n;
+                }
+                entry.edited.clear();
+                entry.read.clear();
+                entry.step = step;
+            }
+        }
+        _ => return None,
+    }
+
+    Some(serde_json::json!({ "seen": seen }))
+}
+
+/// Shared by `plan`/`implement`/`review`'s `validate` overrides, called
+/// before `strip_malformed_next`/`validate_default` run: a model patch
+/// touching a harness-owned key (`notes`, `reports`, `seen` -- see
+/// `common_harness_owned_fields`) used to have the WHOLE step rejected by
+/// `validate_default`'s owned-field check, discarding any real progress the
+/// same patch carried (a plan step marked done, a file note, `recent_
+/// summary`) and burning a retry, even though the model sees these fields
+/// in its own workspace view and so predictably echoes or edits them back
+/// (a bench battery run saw this twice in one run, losing a retry each
+/// time). The project's rule since run 26 is commit-and-note, not
+/// reject-the-lot (see `strip_malformed_next` and everything below it for
+/// the same treatment applied to other shapes) -- so this strips each
+/// harness-owned key present in the RAW patch object before
+/// `validate_default`'s comparison ever runs, and returns one note per key
+/// removed for the caller to attach the same way `strip_malformed_next`
+/// does.
+///
+/// "Present in the raw patch" (key membership), not "differs from the
+/// committed value": `validate_default`'s own check compares values so a
+/// patch strategy that always carries every key (e.g. `ReplaceStrategy`)
+/// isn't punished for merely echoing a harness-owned field back unchanged,
+/// but this function runs on the merge-patch shape these three skills
+/// actually use (`JsonMergePatch`), where a harness-owned key appears in
+/// the raw object only when the model wrote it -- so presence here already
+/// means "the model tried to patch this", no value comparison needed.
+/// Removing the key outright (rather than overwriting it with the
+/// committed value) leaves the merge to `validate_default` producing the
+/// same committed value for that field either way, since an absent merge-
+/// patch key means "leave unchanged".
+///
+/// Returns the (possibly empty) list of notes, one per removed key, each
+/// reading exactly: "`<field>` is kept by the harness; that part of your
+/// patch was dropped and the rest was kept." Order follows
+/// `harness_owned_fields()`'s own order. Operator patches
+/// (`validate_user_patch`) never call this -- the operator and the
+/// maintainer are trusted writers of these fields, and an operator typing a
+/// harness-owned field by hand is a mistake worth stopping, not silently
+/// dropping.
+fn strip_harness_owned(
+    owned_fields: &[String],
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Some(obj) = out.patch_mut().0.as_object_mut() else {
+        return notes;
+    };
+    for field in owned_fields {
+        if obj.remove(field.as_str()).is_some() {
+            notes.push(format!(
+                "`{field}` is kept by the harness; that part of your patch was dropped and the \
+                 rest was kept."
+            ));
+        }
+    }
+    notes
+}
 
 /// Shared by `plan`/`implement`/`review`'s `validate` overrides, called
 /// before `validate_default` runs: a commitment is the mutating call the
@@ -350,6 +686,36 @@ fn merged_workspace(
     })
 }
 
+/// Whether `merged.next_skill` names a real handoff for `skill_name`: `Some`
+/// naming any OTHER skill counts; `None`, or `Some` naming `skill_name`
+/// itself, does not -- a self-handoff is never valid (`common_handoff`
+/// already filters it out of `Skill::handoff`'s own result), so a stale
+/// `next_skill` left over from the handoff that landed THIS activation
+/// (`Skill::on_activate` normally clears it, but a hook error or a caller
+/// that bypasses it could still leave one in place) must not be misread as
+/// "a handoff is already named" by conversions like `implement_bare_done`.
+///
+/// When `merged.next_skill` is the stale self-referential case, also strips
+/// `next_skill` from `out`'s raw patch if it carries one there too, so a
+/// step this fires for doesn't accidentally commit the very value it just
+/// decided to ignore.
+fn has_named_handoff(
+    skill_name: &str,
+    merged: &CodingWorkspace,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> bool {
+    match merged.next_skill.as_deref() {
+        Some(target) if target != skill_name => true,
+        Some(_) => {
+            if let Some(obj) = out.patch_mut().0.as_object_mut() {
+                obj.remove("next_skill");
+            }
+            false
+        }
+        None => false,
+    }
+}
+
 /// The harness has learned that rejecting a step throws away the state
 /// progress in its patch and burns one of three retries, and that a small
 /// local model then flails: `done`/`ask_user` sent in a shape that can
@@ -377,6 +743,18 @@ fn merged_workspace(
 ///    action is no longer `Done`. Points at the first open step in plan
 ///    order. When the merged plan has NO open step, this check does not
 ///    fire -- `done` falls through to the existing terminal/handoff rules.
+///
+///    For `implement`, this case no longer has top priority: it is called
+///    AFTER `implement_no_green_runs_test` now (see that function's doc),
+///    which substitutes a real `test` call ahead of this note whenever
+///    verification is unverified (`green_step: None`) and either something
+///    was edited since the last test or none has ever run -- an open plan
+///    step no longer blocks that substitution. This case (a) still fires,
+///    for `implement`, only in the one shape `implement_no_green_runs_test`
+///    leaves alone: `green_step: None`, an open step, a FAILING run as the
+///    latest, and NOTHING edited since -- there the open step is real work,
+///    since re-running the identical failing command would tell the model
+///    nothing new.
 /// b. `ask_user` with an empty/whitespace `message` -- nothing was
 ///    actually asked, so parking the session on it would just stall.
 ///
@@ -415,20 +793,65 @@ fn premature_done_note(
 /// (a) fired, and the handoff landed with a tree that does not compile.
 /// `review` then ran the unfiltered test, saw it fail, and approved anyway.
 ///
+/// The bench battery's implement-side sibling of
+/// `review_blind_approval_runs_test`: three of four bench misses were
+/// `implement` sending `done` where it should have run `test` -- the
+/// note-only conversion this replaces (`implement_no_green_note`, telling
+/// the model to "Run `test` now") told it so three times running, and the
+/// repeat cap parked the run anyway. Telling this model to run the test
+/// does not work; running it for it does, the same lesson
+/// `review_blind_approval_runs_test` already applied on the review side.
+///
+/// A later live run showed the priority below was itself wrong: the model
+/// sent `done` with its "run cargo test" plan step still open AND its edits
+/// unverified (`edits_since_test > 0`) -- `premature_done_note`'s case (a)
+/// fired first (open step), converting to a `Continue` note that just told
+/// the model to run the test itself. It didn't; the note repeated three
+/// times and the repeat cap parked the session as a question. Running the
+/// test is the right next move regardless of what plan step is open, so
+/// this function is now called in `ImplementSkill::validate` BEFORE
+/// `premature_done_note`, and its own open-step check is gone from the
+/// test-substitution branch below: an open step no longer blocks it.
+/// `premature_done_note` keeps priority only in the one case where running
+/// the test again would tell the model nothing new -- see that case below.
+///
 /// Called in `ImplementSkill::validate` AFTER `green_done_note` and
-/// `premature_done_note`: only reached when the action is still `Done`
-/// after both of those, which -- for `premature_done_note` -- means its
-/// case (a) did not fire, i.e. the merged plan has no open step (an open
-/// step takes priority over this check) and the merged workspace is not
-/// itself terminal (`done: true`). Fires when `cur.harness.green_step` is
-/// `None`: the most recent `test` run anywhere in the session failed, or
-/// none has ever run. Converts the action to `Action::Continue`; the patch
-/// is kept, and `next_skill` is stripped from the raw patch so no handoff
-/// lands (same treatment as `premature_done_note`'s case (a)).
+/// `implement_bare_done`: only reached when the action is still `Done`
+/// after both of those, i.e. `cur.harness.green_step` is `None` (they both
+/// require `green_step.is_some()`) or, for `green_done_note`, the merged
+/// plan had no open step to rewrite and `implement_bare_done` didn't apply
+/// either. Fires when `cur.harness.green_step` is `None`: the most recent
+/// `test` run anywhere in the session failed, or none has ever run, AND the
+/// merged workspace is not itself terminal (`done: true`). Two cases:
+///
+/// - `cur.harness.edits_since_test > 0` (something was edited since the
+///   last/only test run) OR `cur.harness.last_test_cmd.is_none()` (no
+///   `test` call has ever run this session, so there is nothing to point
+///   the model back at as "the failure to go fix"): the action is replaced
+///   with `Action::Tool { name: "test", args }`, `args = {"cmd": cmd}`
+///   when `cur.harness.last_test_cmd` is `Some`, else `{}` (auto-detect).
+///   `"done"` and `"next_skill"` are stripped from the raw patch, the same
+///   "leave the committed field alone" treatment
+///   `review_blind_approval_runs_test` gives an approval it substitutes a
+///   test for. This mirrors `review_blind_approval_runs_test` exactly: the
+///   harness runs the tests itself rather than just asking the model to.
+///   Fires regardless of whether the merged plan has an open step: running
+///   the test is the right next move whatever is open, and the substituted
+///   call's own observation says what it says.
+/// - Otherwise (a failing run is the latest, AND nothing has been edited
+///   since): running the same failing command again would tell the model
+///   nothing new, so this function does not touch the step (`None`) when
+///   the merged plan has an open step -- the open step is real work, so
+///   `premature_done_note`'s case (a) keeps its priority and converts with
+///   the "still open" note instead. With no open step, this falls back to
+///   the old behaviour -- `next_skill` stripped, action converted to
+///   `Continue` with the unchanged note -- so the repeat cap still catches
+///   a model that will not edit before trying `done` again.
 ///
 /// A patch that fails to deserialize/apply is left alone (`None`): it falls
-/// straight through to `validate_default`, which reports the real error.
-fn implement_no_green_note(
+/// straight through to `premature_done_note`/`validate_default`, which
+/// report the real error.
+fn implement_no_green_runs_test(
     cur: &CommittedState<CodingWorkspace>,
     out: &mut statie_core::ParsedOutput<CodingWorkspace>,
 ) -> Option<String> {
@@ -439,12 +862,43 @@ fn implement_no_green_note(
         return None;
     }
     let merged = merged_workspace(&cur.agent, out)?;
-    if merged.done
-        || merged
-            .plan
-            .iter()
-            .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))
-    {
+    if merged.done {
+        return None;
+    }
+    let has_open_step = merged
+        .plan
+        .iter()
+        .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress));
+
+    let should_run_test = cur.harness.edits_since_test > 0 || cur.harness.last_test_cmd.is_none();
+
+    if should_run_test {
+        // Fires even with an open plan step: running the test is the right
+        // next move whatever is open (see this function's doc).
+        if let Some(obj) = out.patch_mut().0.as_object_mut() {
+            obj.remove("done");
+            obj.remove("next_skill");
+        }
+        let args = match &cur.harness.last_test_cmd {
+            Some(cmd) => serde_json::json!({"cmd": cmd}),
+            None => serde_json::json!({}),
+        };
+        out.set_action(statie_core::Action::Tool {
+            name: "test".to_string(),
+            args,
+        });
+
+        return Some(
+            "you sent `done` without a passing test run, so the harness ran the tests for you \
+             (below). If they pass, send `done` again; if they fail, fix what they report first."
+                .to_string(),
+        );
+    }
+
+    if has_open_step {
+        // The latest test failed and nothing has been edited since: the
+        // open step is real work, and `premature_done_note`'s case (a)
+        // keeps priority over this fallback (see this function's doc).
         return None;
     }
 
@@ -545,6 +999,77 @@ fn green_done_note(
         "verification passed at step {green_step}; open plan steps marked done and handed off \
          to review"
     ))
+}
+
+/// With thinking on, eight of the bench battery's `implement` rejections
+/// were `validate_default`'s core rule "action `done` is only valid when the
+/// workspace is terminal or hands off": `implement` sent `done` with neither
+/// `done: true` nor `next_skill` set, after finishing the plan and passing
+/// verification -- a shape none of the checks above catch, since
+/// `green_done_note` only rewrites the patch when the merged plan has an
+/// OPEN step (`open_ids` non-empty) and `premature_done_note`'s case (a)
+/// only fires on an open step too. A plan that is already fully done, with
+/// verification already green, has nothing left for either of those to
+/// steer -- the model just forgot to name a handoff, and eight rejections
+/// telling it to set `next_skill` never got it to add the field.
+///
+/// Called in `ImplementSkill::validate` right after `green_done_note`
+/// (reached only when that did not already rewrite the patch: either
+/// `cur.harness.green_step` is `None`, or it fired and found no open step to
+/// rewrite) and before `premature_done_note`. Fires when the action is
+/// `Done`, the merged workspace is not itself terminal (`done: true`) and
+/// has no `next_skill` set (a real bare `done` -- one that already names a
+/// target, or that sets `done: true`, is not touched: the ordinary
+/// terminal/handoff rules already accept it). Two cases:
+///
+/// - `cur.harness.green_step.is_some()` AND the merged plan has no open
+///   step: verification already passed and there is nothing left to do, so
+///   this converts what would otherwise be a rejection into the intended
+///   handoff -- `next_skill: "review"` is injected into the raw patch,
+///   action stays `Done`, and a note records what happened.
+/// - Otherwise (a plan step is still open, or no green run): this function
+///   does not touch the step at all (`None`) -- it falls straight through
+///   to `premature_done_note` (open step) or `implement_no_green_runs_test`
+///   (no green), which already handle a `done` in that shape regardless of
+///   whether `next_skill` was set, so the caller's existing chain covers it
+///   without this function's help.
+///
+/// A patch that fails to deserialize/apply is left alone (`None`): it falls
+/// straight through to `premature_done_note`/`implement_no_green_runs_test`/
+/// `validate_default`, which report the real error.
+fn implement_bare_done(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    if !matches!(out.action(), statie_core::Action::Done) {
+        return None;
+    }
+    let merged = merged_workspace(&cur.agent, out)?;
+    if merged.done {
+        return None;
+    }
+    if has_named_handoff("implement", &merged, out) {
+        return None;
+    }
+    cur.harness.green_step?;
+    let has_open_step = merged
+        .plan
+        .iter()
+        .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress));
+    if has_open_step {
+        return None;
+    }
+
+    let obj = out.patch_mut().0.as_object_mut()?;
+    obj.insert(
+        "next_skill".to_string(),
+        serde_json::Value::String("review".to_string()),
+    );
+
+    Some(
+        "`done` with no handoff named; verification passed, so this hands off to review."
+            .to_string(),
+    )
 }
 
 /// `review`-only: live runs 69/70 showed `review` sending `done: true` with
@@ -784,8 +1309,8 @@ fn review_no_green_note(
 ///
 /// Implement is NOT affected: a filtered pass is still a green checkpoint
 /// for `implement`'s own `done` validation
-/// (`implement_no_green_note`/plan-complete check), which only cares that
-/// SOME recent run passed, not whether it was filtered.
+/// (`implement_no_green_runs_test`/plan-complete check), which only cares
+/// that SOME recent run passed, not whether it was filtered.
 ///
 /// A patch that fails to deserialize/apply is left alone (`None`): it falls
 /// straight through to `validate_default`, which reports the real error.
@@ -1003,9 +1528,19 @@ fn ask_user_statement_note(out: &mut statie_core::ParsedOutput<CodingWorkspace>)
 /// of the reopened steps in this same patch, so the redirect never sends the
 /// model back to the very step it just illegally reopened.
 ///
-/// `enabled` is `guards.done_stays_done` (default `true`, statie-spec.md
-/// "10. After it works: the rule audit"); when `false`, the whole rule is a
-/// no-op and reopening a done step is allowed.
+/// `enabled` is `guards.done_stays_done` (statie-spec.md "10. After it
+/// works: the rule audit"; defaults to `false` as of the first bench
+/// battery's audit -- the switch off was shown no worse, since the bench's
+/// fourth miss was this rule rejecting the model twelve times over for
+/// moving its "run cargo test" plan step back to in-progress after an edit,
+/// until the retry cap parked it as a failure with the crate already
+/// green); when `false`, the whole rule is a no-op and reopening a done
+/// step is allowed. The individual `PlanSkill`/`ImplementSkill`/
+/// `ReviewSkill` constructors (`::new()`/`Default`) still default their own
+/// `done_stays_done` field to `true` -- only the config-facing defaults
+/// (`Guards::default()`, `coding_skills()`/`coding_skills_with_delegates()`,
+/// and `CodingRegistry::with_guards` with no configured `guards` section)
+/// now thread `false` through.
 fn plan_rules(
     cur: &CodingWorkspace,
     next: &CodingWorkspace,
@@ -1057,6 +1592,155 @@ fn plan_rules(
     Err(PatchError::RuleViolation(format!(
         "plan step {offending_id} is done and stays done ({offending_text}). {redirect}"
     )))
+}
+
+/// `implement`-only: `done: true` is never `implement`'s to set -- only
+/// `review`'s approval (empty `findings`) finishes the task
+/// (statie-spec.md §5/§10; `ImplementSkill::is_terminal` is unconditionally
+/// `false`, mirroring `PlanSkill::is_terminal`/`RouterSkill::is_terminal`).
+/// Unlike `plan`/`router`'s shared `done_not_ours_note`, this does NOT
+/// decide the action -- `implement`'s existing chain (`green_done_note` /
+/// `implement_bare_done` / `implement_no_green_runs_test` /
+/// `premature_done_note`) already makes that decision, and does it better
+/// than a plain "not yours" `Continue` would: with a passing test and a
+/// complete plan those conversions hand off to review; without a passing
+/// test they substitute a real `test` call; with an open step and nothing
+/// new to learn from re-running, they attach the open-step note. Folding a
+/// bare-`done` short-circuit in here (the way `done_not_ours_note` does for
+/// `plan`/`router`, which have no such chain) would pre-empt all of that.
+///
+/// So this only ever strips `done` from the raw patch (when the *merged*,
+/// i.e. post-patch, workspace would read `done: true`) and returns a note;
+/// it never touches `out.action()`. Called in `ImplementSkill::validate`
+/// FIRST, before `green_done_note`/`implement_bare_done`/
+/// `implement_no_green_runs_test`/`premature_done_note` run, so every one of
+/// those sees a raw patch (and therefore a merged workspace) with no `done`
+/// key at all -- exactly as if the model had never sent it. Each of those
+/// functions already has its own `if merged.done { return None; }` guard (or
+/// equivalent), so this also ensures none of them short-circuits on a
+/// `done: true` that was never review's to commit in the first place.
+///
+/// A patch that fails to deserialize/apply is left alone (`None`): it falls
+/// straight through to the chain/`validate_default`, which report the real
+/// error.
+fn implement_done_not_ours_strip(
+    cur: &CodingWorkspace,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    let merged = merged_workspace(cur, out)?;
+    if !merged.done {
+        return None;
+    }
+    if let Some(obj) = out.patch_mut().0.as_object_mut() {
+        obj.remove("done");
+    }
+    Some(
+        "`done: true` is review's to set; implement hands off with `next_skill: \"review\"` \
+         once verification passes."
+            .to_string(),
+    )
+}
+
+/// `plan`-only: `done: true` is never `plan`'s to set -- only `review`'s
+/// approval (empty `findings`) finishes the task. Thin wrapper around
+/// `done_not_ours_note` (see its doc for the full case analysis and the
+/// bench run that motivated it) with `plan`'s note text. Called from
+/// `PlanSkill::validate` AFTER the existing bare-`done`/empty-plan
+/// handling, so that logic's own note wins for an empty plan (its `done`
+/// is already stripped there, so this becomes a no-op for that step: the
+/// merged workspace it recomputes reads `done: false`).
+fn plan_done_not_ours_note(
+    cur: &CodingWorkspace,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    done_not_ours_note(
+        cur,
+        out,
+        "`done: true` is not the plan skill's to set; the task is finished by review. \
+         Write the plan and hand off to implement with `next_skill`.",
+    )
+}
+
+/// `router`-only sibling of `plan_done_not_ours_note`: router has no
+/// plan-emptiness case of its own (it never writes `plan`), so this is
+/// exactly the shared logic, no wrapping needed. See
+/// `RouterSkill::validate` for where this is wired in and
+/// `plan_done_not_ours_note`'s doc for the full case analysis (both
+/// functions behave identically -- strip `done`, convert a bare `done` to
+/// `Continue`, leave a named handoff alone -- only the note text differs).
+fn router_done_not_ours_note(
+    cur: &CodingWorkspace,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    done_not_ours_note(
+        cur,
+        out,
+        "`done: true` is not the router's to set; the task is finished by review. Decide the \
+         next skill and hand off with `next_skill`.",
+    )
+}
+
+/// Shared by `plan_done_not_ours_note`/`router_done_not_ours_note`: neither
+/// `plan` nor `router` can finish the task (`common_is_terminal`'s `done`
+/// flag is `review`-only, statie-spec.md §5/§10; `PlanSkill::is_terminal`
+/// and `RouterSkill::is_terminal` are both unconditionally `false`, so a
+/// `done: true` that slipped past this would not even end the session --
+/// this still strips it so the workspace itself never carries a lie). A
+/// bench run showed the `plan` case of this
+/// (`{"patch": {"done": true}, "action": {"type": "done"}}` sent as
+/// `plan`'s very first step, empty plan) commit `done: true`: the
+/// empty-plan conversion that already existed only stripped `next_skill`,
+/// not `done`, so the workspace became terminal and the session ended
+/// after three steps with no edit and no test -- a false completion. This
+/// function is the general fix for the underlying hole, for both skills
+/// that share it: whenever the *merged* (post-patch) workspace would be
+/// `done: true`, `done` is stripped from the raw patch before it can
+/// commit, regardless of what else the patch carries or what action the
+/// model sent ("with any action" -- a model could in principle attach
+/// `done: true` to a tool call or an `ask_user` too, not just `done`).
+///
+/// Two cases, both leaving the rest of the patch (including `next_skill`
+/// when present) alone:
+///
+/// - The action is `done` AND the raw patch (pre-strip) carries no
+///   `next_skill`: nothing else about this step is a real handoff, so the
+///   whole step converts to the harness-internal `Action::Continue`
+///   (`core/src/model.rs`) with `note` -- the same "commit the patch,
+///   spend no retry, tell the model what to do instead" treatment
+///   `premature_done_note` and the empty-plan conversion already use
+///   elsewhere in this module.
+/// - Otherwise (the action was not `done`, or it was `done` with a
+///   `next_skill` already named -- a legitimate handoff): the action is
+///   left as the caller set it; `note` is returned for the caller to
+///   attach to the step instead of converting it. A `done` +
+///   `next_skill: "implement"` step still hands off; it just does so
+///   without ever committing `done: true` into the shared workspace.
+///
+/// A patch that fails to deserialize/apply is left alone (`None`): it
+/// falls straight through to `validate_default`, which reports the real
+/// error.
+fn done_not_ours_note(
+    cur: &CodingWorkspace,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+    note: &str,
+) -> Option<String> {
+    let merged = merged_workspace(cur, out)?;
+    if !merged.done {
+        return None;
+    }
+
+    let had_next_skill = out.patch().0.get("next_skill").is_some();
+    if let Some(obj) = out.patch_mut().0.as_object_mut() {
+        obj.remove("done");
+    }
+
+    if matches!(out.action(), statie_core::Action::Done) && !had_next_skill {
+        out.set_action(statie_core::Action::Continue {
+            note: note.to_string(),
+        });
+    }
+
+    Some(note.to_string())
 }
 
 /// `absorb_report` shared by every coding skill: insert the finished child's
@@ -1224,8 +1908,13 @@ impl Skill for RouterSkill {
         ]
     }
 
-    fn is_terminal(&self, s: &Self::Workspace) -> bool {
-        common_is_terminal(s)
+    /// `router` can never finish the task on its own, the same as `plan`
+    /// (see `PlanSkill::is_terminal`'s doc) -- only `review`'s approval
+    /// does that. Unconditionally `false`: router only ever hands off via
+    /// `next_skill`. See `router_done_not_ours_note` for the
+    /// `validate`-side half.
+    fn is_terminal(&self, _s: &Self::Workspace) -> bool {
+        false
     }
 
     fn allows_yield(&self) -> bool {
@@ -1234,6 +1923,10 @@ impl Skill for RouterSkill {
 
     fn handoff(&self, s: &Self::Workspace) -> Option<String> {
         common_handoff(self.name(), s)
+    }
+
+    fn on_activate(&self, ws: &Self::Workspace) -> Option<Patch> {
+        common_on_activate(ws)
     }
 
     fn rules(
@@ -1254,6 +1947,32 @@ impl Skill for RouterSkill {
 
     fn notes(&self, ws: &Self::Workspace) -> Option<String> {
         common_notes(ws)
+    }
+
+    /// `router` gets the same `done: true`-stripping treatment as `plan`
+    /// (`plan_done_not_ours_note`): router has no plan-emptiness case of
+    /// its own (it never writes `plan`), so this is the plain form --
+    /// whenever the merged workspace would be `done: true`, strip it from
+    /// the raw patch, and convert a bare `done` (no `next_skill`) to
+    /// `Action::Continue` with the note; a `done` that already names a
+    /// `next_skill` keeps handing off, just without ever committing
+    /// `done: true`.
+    fn validate(
+        &self,
+        cur: &CommittedState<Self::Workspace>,
+        mut out: ParsedOutput<Self::Workspace>,
+    ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
+        let mut notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
+        let note = strip_malformed_next(&cur.agent, &mut out);
+        let not_ours_note = router_done_not_ours_note(&cur.agent, &mut out);
+        let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
+        notes.extend(note);
+        notes.extend(not_ours_note);
+        Ok(if notes.is_empty() {
+            step
+        } else {
+            step.with_notes(notes)
+        })
     }
 }
 
@@ -1341,8 +2060,18 @@ impl Skill for PlanSkill {
         vec!["implement".to_string(), "router".to_string()]
     }
 
-    fn is_terminal(&self, s: &Self::Workspace) -> bool {
-        common_is_terminal(s)
+    /// `plan` can never finish the task on its own -- only `review`'s
+    /// approval (empty `findings`) does that (`common_is_terminal`,
+    /// `ReviewSkill::is_terminal`). Unconditionally `false`, even when
+    /// `ws.done` is somehow `true`: `plan`'s job is to write the plan and
+    /// hand off to `implement` with `next_skill`, never to end the session
+    /// itself. See `plan_done_not_ours_note` for the `validate`-side half
+    /// of this: it strips a `done: true` a model sends from `plan`'s patch
+    /// before it can commit, so `ws.done` should never actually reach
+    /// `true` here in practice -- this override is the second, independent
+    /// line of defense.
+    fn is_terminal(&self, _s: &Self::Workspace) -> bool {
+        false
     }
 
     fn allows_yield(&self) -> bool {
@@ -1351,6 +2080,10 @@ impl Skill for PlanSkill {
 
     fn handoff(&self, s: &Self::Workspace) -> Option<String> {
         common_handoff(self.name(), s)
+    }
+
+    fn on_activate(&self, ws: &Self::Workspace) -> Option<Patch> {
+        common_on_activate(ws)
     }
 
     fn rules(
@@ -1387,6 +2120,18 @@ impl Skill for PlanSkill {
         common_notes(ws)
     }
 
+    fn after_tool(
+        &self,
+        ws: &Self::Workspace,
+        _harness: &HarnessState,
+        step: u64,
+        name: &str,
+        args: &serde_json::Value,
+        output: &str,
+    ) -> Option<Patch> {
+        common_after_tool(ws, step, name, args, output)
+    }
+
     /// A bare `done` (no `next_skill` set) in `plan` means "the plan is
     /// solid, go implement it": if the model sends `done` with `next_skill`
     /// left unset and the merged plan is non-empty, inject
@@ -1408,17 +2153,22 @@ impl Skill for PlanSkill {
     /// real progress it carried and spending a retry) with the
     /// non-empty-plan rule below, which used to fire here too.
     ///
-    /// Also strips a malformed `next` (see `strip_malformed_next`) before
-    /// `validate_default` runs, attaching the note it returns to the
-    /// resulting `ValidatedStep`, and converts an empty `ask_user` into the
-    /// harness-internal `Action::Continue` instead of rejecting the step
-    /// (case (b) of `premature_done_note`'s doc; `plan` does not get case
-    /// (a) -- its bare-`done` handling above already covers `done`).
+    /// Before any of that, strips every harness-owned key present in the
+    /// raw patch (see `strip_harness_owned`) so a model patch touching
+    /// `notes`/`reports`/`seen` commits the rest of the patch instead of
+    /// being rejected outright. Also strips a malformed `next` (see
+    /// `strip_malformed_next`) before `validate_default` runs, attaching the
+    /// note it returns to the resulting `ValidatedStep`, and converts an
+    /// empty `ask_user` into the harness-internal `Action::Continue` instead
+    /// of rejecting the step (case (b) of `premature_done_note`'s doc;
+    /// `plan` does not get case (a) -- its bare-`done` handling above
+    /// already covers `done`).
     fn validate(
         &self,
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
+        let mut notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let note = strip_malformed_next(&cur.agent, &mut out);
 
         if let Some(note) = ask_user_empty_note(&mut out) {
@@ -1445,10 +2195,19 @@ impl Skill for PlanSkill {
             .map(|next| !next.plan.is_empty());
 
             match merged_plan_nonempty {
-                Some(true) if out.patch().0.get("next_skill").is_none() => {
+                Some(true)
+                    if out.patch().0.get("next_skill").is_none()
+                        && out.patch().0.get("done").is_none() =>
+                {
                     // Inject the missing key into the raw merge patch; the
                     // Patch log entry will simply show this key alongside
-                    // whatever else the model sent.
+                    // whatever else the model sent. Guarded on the raw patch
+                    // ALSO carrying no `done` field: a model that explicitly
+                    // sent `done: true` (rather than just the bare `done`
+                    // action with nothing in the patch about it) gets
+                    // `plan_done_not_ours_note`'s treatment below instead --
+                    // `done: true` is never `plan`'s to set, so that shape
+                    // must not silently become an auto-handoff.
                     if let Some(obj) = out.patch_mut().0.as_object_mut() {
                         obj.insert(
                             "next_skill".to_string(),
@@ -1463,6 +2222,7 @@ impl Skill for PlanSkill {
                                           kept."
                         .to_string();
                     if let Some(obj) = out.patch_mut().0.as_object_mut() {
+                        obj.remove("done");
                         obj.remove("next_skill");
                     }
                     out.set_action(statie_core::Action::Continue {
@@ -1472,10 +2232,24 @@ impl Skill for PlanSkill {
                 _ => {}
             }
         }
+        // `done: true` is never `plan`'s to set, with any action (see
+        // `plan_done_not_ours_note`'s doc) -- so this runs unconditionally,
+        // not just when the action is `done`. Runs AFTER the empty-plan
+        // handling above so that case's own note wins for an empty plan
+        // (its `done` is already stripped there, hence this becomes a
+        // no-op for that step: the merged workspace it recomputes now
+        // reads `done: false`). For every other shape that still carries
+        // `done: true` -- most notably a non-empty plan with no
+        // `next_skill`, the `Some(true)` arm above deliberately leaves
+        // alone -- this strips `done` and attaches its own note.
+        let not_ours_note = plan_done_not_ours_note(&cur.agent, &mut out);
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
-        Ok(match note {
-            Some(note) => step.with_notes(vec![note]),
-            None => step,
+        notes.extend(note);
+        notes.extend(not_ours_note);
+        Ok(if notes.is_empty() {
+            step
+        } else {
+            step.with_notes(notes)
         })
     }
 }
@@ -1585,8 +2359,17 @@ impl Skill for ImplementSkill {
         ]
     }
 
-    fn is_terminal(&self, s: &Self::Workspace) -> bool {
-        common_is_terminal(s)
+    /// Only `review`'s approval (empty `findings`) finishes the task
+    /// (statie-spec.md §5/§10) -- `implement` only ever hands off, via
+    /// `next_skill`, whatever `ws.done` says. Unconditionally `false`,
+    /// mirroring `PlanSkill::is_terminal`/`RouterSkill::is_terminal`: a raw
+    /// `done: true` that somehow reached the committed workspace (it should
+    /// not -- see `implement_done_not_ours_strip`, which strips it from the
+    /// patch before it can commit) still could not end the session by
+    /// itself. See `implement_done_not_ours_strip` for the `validate`-side
+    /// half that keeps `ws.done` itself from ever going true.
+    fn is_terminal(&self, _s: &Self::Workspace) -> bool {
+        false
     }
 
     fn allows_yield(&self) -> bool {
@@ -1595,6 +2378,10 @@ impl Skill for ImplementSkill {
 
     fn handoff(&self, s: &Self::Workspace) -> Option<String> {
         common_handoff(self.name(), s)
+    }
+
+    fn on_activate(&self, ws: &Self::Workspace) -> Option<Patch> {
+        common_on_activate(ws)
     }
 
     fn rules(
@@ -1638,6 +2425,18 @@ impl Skill for ImplementSkill {
         common_notes(ws)
     }
 
+    fn after_tool(
+        &self,
+        ws: &Self::Workspace,
+        _harness: &HarnessState,
+        step: u64,
+        name: &str,
+        args: &serde_json::Value,
+        output: &str,
+    ) -> Option<Patch> {
+        common_after_tool(ws, step, name, args, output)
+    }
+
     fn silent_read_cap(&self) -> Option<u32> {
         // Two free looks that write nothing: a read whose patch records a
         // file note, a plan step, or `recent_summary` is never counted, so
@@ -1645,44 +2444,87 @@ impl Skill for ImplementSkill {
         Some(2)
     }
 
-    /// Strips a malformed `next` (see `strip_malformed_next`) before
-    /// `validate_default` runs, attaching the note it returns to the
-    /// resulting `ValidatedStep`. Then, when verification passed as of this
-    /// activation (`cur.harness.green_step.is_some()`) and the action is
+    /// First strips every harness-owned key present in the raw patch (see
+    /// `strip_harness_owned`) so a model patch touching
+    /// `notes`/`reports`/`seen` commits the rest of the patch instead of
+    /// being rejected outright. Then strips a malformed `next` (see
+    /// `strip_malformed_next`) before `validate_default` runs, attaching the
+    /// note it returns to the resulting `ValidatedStep`. Then
+    /// `implement_done_not_ours_strip`: whenever the raw patch would commit
+    /// `done: true`, that key is removed before any of the conversions below
+    /// run -- `done` is never `implement`'s to set, only `review`'s (see
+    /// that function's doc for why this only strips the key and returns a
+    /// note, rather than also deciding the action the way `plan`/`router`'s
+    /// `done_not_ours_note` does). Every conversion below therefore sees a
+    /// merged workspace exactly as if `done` had never been sent. Then, when
+    /// verification passed as of this activation
+    /// (`cur.harness.green_step.is_some()`) and the action is
     /// `done`, `green_done_note` overrides the ordinary premature-done
     /// bookkeeping: it marks every open plan step done and hands off to
     /// review instead of converting to `Continue` (see its doc -- this is
     /// what closes the gap where a passing-test `done` used to get steered
-    /// into an unrelated edit that broke the checkpointed state).
-    /// Otherwise, converts a premature `done` (a plan step still open) or
-    /// an empty `ask_user` into the harness-internal `Action::Continue`
-    /// instead of rejecting the step (see `premature_done_note`'s doc): the
-    /// patch is kept, no retry is spent, and the model is told in its next
-    /// observation what is still open. Finally, when the action is still
-    /// `Done` after both of those (the merged plan has no open step) and
-    /// `cur.harness.green_step` is `None` (the most recent `test` run
-    /// anywhere in the session failed, or none has run), `implement_no_green_
-    /// note` converts the handoff to `Continue` too -- run 59: `implement`
-    /// handed off to `review` right after its own `test` call failed, and
-    /// `review` approved the failing tree anyway.
+    /// into an unrelated edit that broke the checkpointed state). Next,
+    /// `implement_bare_done` catches the gap `green_done_note` leaves open:
+    /// verification already green, plan already fully done, but `done` was
+    /// sent with no `next_skill` -- it injects `next_skill: "review"`
+    /// instead of letting `validate_default`'s bare-`done` rule reject the
+    /// step (see its doc). Next, `implement_no_green_runs_test`: when the
+    /// action is still `Done` after both of those (so `cur.harness.
+    /// green_step` is `None` -- the most recent `test` run anywhere in the
+    /// session failed, or none has run) and either something was edited
+    /// since the last test or none has ever run, this substitutes a real
+    /// `test` call for the handoff -- run 59: `implement` handed off to
+    /// `review` right after its own `test` call failed, and `review`
+    /// approved the failing tree anyway. This runs BEFORE
+    /// `premature_done_note` now, and fires even when a plan step is still
+    /// open: a later live run showed the open-step note just getting
+    /// repeated three times (into the repeat cap) instead of the model
+    /// running the test itself, so the harness now runs it regardless of
+    /// what plan step is open (see that function's doc). Finally,
+    /// `premature_done_note` converts a premature `done` (a plan step still
+    /// open, in the one shape `implement_no_green_runs_test` leaves alone --
+    /// a failing run with nothing edited since) or an empty `ask_user` into
+    /// the harness-internal `Action::Continue` instead of rejecting the step
+    /// (see its doc): the patch is kept, no retry is spent, and the model is
+    /// told in its next observation what is still open.
     fn validate(
         &self,
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
+        let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let strip_note = strip_malformed_next(&cur.agent, &mut out);
+        let not_ours_note = implement_done_not_ours_strip(&cur.agent, &mut out);
         let mut extra_note = None;
         if let Some(note) = green_done_note(cur, &mut out) {
             // Action stays `Done`: verification already passed, so this is
             // a real handoff, not a harness-internal `Continue`.
             extra_note = Some(note);
+        } else if let Some(note) = implement_bare_done(cur, &mut out) {
+            // Action stays `Done`: verification already passed and the plan
+            // is complete, so this is a real handoff too.
+            extra_note = Some(note);
+        } else if let Some(note) = implement_no_green_runs_test(cur, &mut out) {
+            // `implement_no_green_runs_test` substitutes a real `test` tool
+            // call for the test-needed case (action already set, see its
+            // doc); for the Continue-fallback case it leaves the action
+            // untouched (still `Done`) and relies on the caller to convert
+            // it, the same as every other note function here.
+            if matches!(out.action(), statie_core::Action::Done) {
+                out.set_action(statie_core::Action::Continue { note });
+            } else {
+                extra_note = Some(note);
+            }
         } else if let Some(note) = premature_done_note(&cur.agent, &mut out) {
-            out.set_action(statie_core::Action::Continue { note });
-        } else if let Some(note) = implement_no_green_note(cur, &mut out) {
             out.set_action(statie_core::Action::Continue { note });
         }
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
-        let notes: Vec<String> = strip_note.into_iter().chain(extra_note).collect();
+        let notes: Vec<String> = owned_notes
+            .into_iter()
+            .chain(strip_note)
+            .chain(not_ours_note)
+            .chain(extra_note)
+            .collect();
         Ok(if notes.is_empty() {
             step
         } else {
@@ -1784,6 +2626,10 @@ impl Skill for ReviewSkill {
         common_handoff(self.name(), s)
     }
 
+    fn on_activate(&self, ws: &Self::Workspace) -> Option<Patch> {
+        common_on_activate(ws)
+    }
+
     fn rules(
         &self,
         cur: &CommittedState<Self::Workspace>,
@@ -1818,10 +2664,26 @@ impl Skill for ReviewSkill {
         common_notes(ws)
     }
 
-    /// Strips a malformed `next` (see `strip_malformed_next`) before
-    /// `validate_default` runs, attaching the note it returns to the
-    /// resulting `ValidatedStep`; converts one of two send-back shapes a
-    /// live run sent (see `review_sendback_note`'s doc) into the intended
+    fn after_tool(
+        &self,
+        ws: &Self::Workspace,
+        _harness: &HarnessState,
+        step: u64,
+        name: &str,
+        args: &serde_json::Value,
+        output: &str,
+    ) -> Option<Patch> {
+        common_after_tool(ws, step, name, args, output)
+    }
+
+    /// First strips every harness-owned key present in the raw patch (see
+    /// `strip_harness_owned`) so a model patch touching
+    /// `notes`/`reports`/`seen` commits the rest of the patch instead of
+    /// being rejected outright. Then strips a malformed `next` (see
+    /// `strip_malformed_next`) before `validate_default` runs, attaching the
+    /// note it returns to the resulting `ValidatedStep`; converts one of two
+    /// send-back shapes a live run sent (see `review_sendback_note`'s doc)
+    /// into the intended
     /// handoff to `implement` instead of a rejection; converts an empty
     /// `ask_user` into the harness-internal `Action::Continue` instead of
     /// rejecting the step (case (b) of `premature_done_note`'s doc;
@@ -1856,6 +2718,7 @@ impl Skill for ReviewSkill {
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
+        let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let note = strip_malformed_next(&cur.agent, &mut out);
         let sendback_note = review_sendback_note(self, &cur.agent, &mut out);
         let mut blind_approval_note = None;
@@ -1876,8 +2739,9 @@ impl Skill for ReviewSkill {
             }
         }
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
-        let notes: Vec<String> = note
+        let notes: Vec<String> = owned_notes
             .into_iter()
+            .chain(note)
             .chain(sendback_note)
             .chain(blind_approval_note)
             .collect();
@@ -1907,6 +2771,11 @@ pub fn coding_skills() -> Vec<(
 /// self-contained job to via action `delegate`; `router` never delegates.
 /// When `delegates` is empty, instruction text is byte-identical to the
 /// no-delegation form (no "Subagents:" paragraph is appended).
+///
+/// `done_stays_done` defaults to `false` here (`coding_skills_configured`'s
+/// default path, the first bench battery's audit showed the switch off no
+/// worse -- see `plan_rules`'s doc); use `coding_skills_configured` directly
+/// to opt back in.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_with_delegates(
     delegates: Vec<String>,
@@ -1914,7 +2783,7 @@ pub fn coding_skills_with_delegates(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
 )> {
-    coding_skills_configured(delegates, true)
+    coding_skills_configured(delegates, false)
 }
 
 /// All four coding skills with both knobs: `delegates` as in

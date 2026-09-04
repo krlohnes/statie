@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 use statie_core::{
     Action, ApplyFn, Capabilities, CommittedState, HarnessState, InboxItem, LoggedPatch, Model,
     ModelError, ParseError, ParsedOutput, PatchError, PatchStrategy, RawOutput, Reasoning, Schema,
-    Session, SessionConfig, SessionLog, Skill, SkillSpec, StateStore, StepSink, StoreError,
-    ToolSet, Version, validate_default,
+    Session, SessionConfig, SessionLog, Skill, SkillSpec, StateStore, StepOutput, StepSink,
+    StoreError, ToolSet, Version, validate_default,
 };
 
 /// A tiny `Replace`-style patch strategy for tests: the patch *is* the new
@@ -98,6 +98,7 @@ fn committed(value: i64, inbox: Vec<InboxItem>) -> CommittedState<Workspace> {
             green_filtered: false,
             tool_calls: 0,
             last_test_cmd: None,
+            edits_since_test: 0,
         },
         agent: Workspace {
             value,
@@ -1338,4 +1339,176 @@ async fn operator_patch_touching_harness_owned_field_is_accepted() {
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(state.agent.recent_summary, "operator wrote this");
+}
+
+// ---------------------------------------------------------------------
+// A well-formed `patch` with no `action` at all: with thinking on, the
+// server does not enforce the schema, and a bench run sent this shape four
+// times in a row, hitting the retry cap on what should have been a
+// recoverable step. `ParsedOutput::parse_with_fixes` now parses this as the
+// harness-internal `Action::Continue` (patch kept, model told every output
+// needs an action) instead of rejecting -- see `core/src/skill.rs`.
+// ---------------------------------------------------------------------
+
+/// The exact note text `ParsedOutput::parse_with_fixes` must produce for a
+/// `patch`-with-no-`action` output.
+const NO_ACTION_NOTE: &str = "your output had no `action`; the patch was kept. Every output \
+                               needs an action: a tool call, `done`, or `ask_user`.";
+
+/// A patch strategy whose `Patch` type IS `Value` (mirrors
+/// `core/tests/continue_action.rs`'s `MergePatch`): a raw JSON object round
+/// trips through it byte-for-byte, so it is the right strategy to prove "the
+/// patch value is intact" with, unmuddied by a typed strategy's own
+/// round-trip normalization (e.g. `MergeStrategy`'s `MergeWorkspacePatch`
+/// adding an explicit `"value": null` for a field the raw JSON never
+/// mentioned).
+struct RawValueStrategy;
+
+impl PatchStrategy<Workspace> for RawValueStrategy {
+    type Patch = serde_json::Value;
+
+    fn name() -> &'static str {
+        "raw"
+    }
+
+    fn describe() -> &'static str {
+        "The patch is an arbitrary JSON value, applied by the test's own merge logic."
+    }
+
+    fn apply(cur: &Workspace, patch: &serde_json::Value) -> Result<Workspace, PatchError> {
+        let mut cur_value =
+            serde_json::to_value(cur).map_err(|e| PatchError::Malformed(e.to_string()))?;
+        if let (serde_json::Value::Object(cur_map), serde_json::Value::Object(patch_map)) =
+            (&mut cur_value, patch)
+        {
+            for (k, v) in patch_map {
+                cur_map.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(cur_value).map_err(|e| PatchError::Malformed(e.to_string()))
+    }
+}
+
+/// `{"patch": {"recent_summary": "x"}}` (no `action` at all) parses to
+/// `Action::Continue` with the exact note, and the patch value is intact.
+#[test]
+fn patch_with_no_action_parses_as_continue_with_exact_note() {
+    let content = r#"{"patch":{"recent_summary":"x"}}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<RawValueStrategy>(raw)
+        .expect("a patch with no action should parse as Continue, not be rejected");
+    match parsed.action() {
+        Action::Continue { note } => assert_eq!(note, NO_ACTION_NOTE),
+        other => panic!("expected Action::Continue, got {other:?}"),
+    }
+    assert_eq!(
+        parsed.patch().0,
+        serde_json::json!({"recent_summary": "x"}),
+        "the patch must be kept intact"
+    );
+}
+
+/// Same, but with an empty patch object (`{"patch": {}}`): still parses as
+/// `Continue`, with the empty patch kept as-is (not treated as "no patch").
+#[test]
+fn empty_patch_with_no_action_parses_as_continue() {
+    let content = r#"{"patch":{}}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<RawValueStrategy>(raw)
+        .expect("an empty patch with no action should parse as Continue, not be rejected");
+    match parsed.action() {
+        Action::Continue { note } => assert_eq!(note, NO_ACTION_NOTE),
+        other => panic!("expected Action::Continue, got {other:?}"),
+    }
+    assert_eq!(parsed.patch().0, serde_json::json!({}));
+}
+
+/// `{}` (no `patch`, no `action`) is NOT recovered as `Continue` -- there is
+/// no patch to keep. It keeps the existing "missing field `patch`" rejection
+/// (asserted verbatim, since this exact message is part of the contract this
+/// change must not disturb).
+#[test]
+fn completely_empty_object_keeps_existing_missing_patch_error() {
+    let raw = raw_output(Version(0), "{}");
+    let err = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid JSON output: missing field `patch`"
+    );
+}
+
+/// `{"action": {"type": "done"}}` with no `patch` at all: also not
+/// recovered (no `patch` member present), keeps the existing "missing field
+/// `patch`" rejection.
+#[test]
+fn action_done_without_patch_keeps_existing_missing_patch_error() {
+    let content = r#"{"action":{"type":"done"}}"#;
+    let raw = raw_output(Version(0), content);
+    let err = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid JSON output: missing field `patch`"
+    );
+}
+
+/// `{"patch": {}, "action": {"type": "continue", "note": "n"}}` -- `action`
+/// IS present (even though it names the harness-internal "continue" type),
+/// so this must NOT be recovered by the no-`action` path; it keeps falling
+/// through to the existing "model sent type continue" rejection.
+#[test]
+fn patch_with_explicit_continue_action_is_still_rejected() {
+    let content = r#"{"patch":{},"action":{"type":"continue","note":"n"}}"#;
+    let raw = raw_output(Version(0), content);
+    let err = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw)
+        .expect_err("an explicit action.type=continue must still be rejected outright");
+    assert!(matches!(err, ParseError::InvalidJson(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "invalid JSON output: unknown action type \"continue\": not a valid Action"
+    );
+}
+
+/// A `patch` that is present but not an object (e.g. a string) with no
+/// `action`: does not match the recovery shape (`patch` must itself be an
+/// object), falls through to the ordinary deserialize and its error.
+#[test]
+fn non_object_patch_with_no_action_is_not_recovered() {
+    let content = r#"{"patch":"not an object"}"#;
+    let raw = raw_output(Version(0), content);
+    let err = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw)
+        .expect_err("a non-object patch must not be recovered as Continue");
+    assert!(matches!(err, ParseError::InvalidJson(_)), "{err:?}");
+}
+
+/// The schema check on `patch` still applies to the no-`action` recovery
+/// path: a `patch` that is a well-formed JSON object but not a valid
+/// `Workspace` value (wrong field type) is still a parse error, not silently
+/// accepted just because `action` also happens to be missing.
+#[test]
+fn patch_with_no_action_but_wrong_shaped_patch_is_still_rejected() {
+    // `ReplaceStrategy::Patch = Workspace`, whose `value` field is `i64`.
+    let content = r#"{"patch":{"value":"not a number"}}"#;
+    let raw = raw_output(Version(0), content);
+    let err = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw)
+        .expect_err("a patch that doesn't match the workspace shape must still fail to parse");
+    assert!(matches!(err, ParseError::InvalidJson(_)), "{err:?}");
+}
+
+/// The model-facing schema is unchanged: `action` is still a required
+/// field in the `StepOutput` JSON Schema advertised to the model (the
+/// no-`action` recovery is a harness-side parse-time tolerance, not a
+/// relaxation of what the model is told to send).
+#[test]
+fn model_facing_schema_still_requires_action() {
+    let schema = Schema::of::<StepOutput<Workspace>>();
+    let value = serde_json::to_value(&schema).expect("schema serializes");
+    let required = value
+        .get("required")
+        .and_then(|r| r.as_array())
+        .expect("schema has a top-level `required` array");
+    let required: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        required.contains(&"action"),
+        "`action` must still be required in the model-facing schema: {required:?}"
+    );
 }

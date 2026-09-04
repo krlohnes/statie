@@ -20,6 +20,14 @@
 //! `make_file_tools_session`: `skills/tests/common/mod.rs` exports items
 //! this file has no use for, and `-D warnings` fails a binary that leaves
 //! any of a shared module's items unused.
+//!
+//! Fix 3 (a later bench battery) reordered `ImplementSkill::validate`'s
+//! chain so `implement_no_green_runs_test` runs BEFORE `premature_done_note`
+//! and fires even with an open plan step, as long as `green_step: None` and
+//! either something was edited since the last test or none has ever run --
+//! see `implement_done_with_open_step_and_no_green_run_ever_runs_test_instead`
+//! and `implement_done_with_open_step_and_failing_run_uses_premature_done_note`
+//! below for the priority split this left behind.
 
 use std::sync::Arc;
 
@@ -162,20 +170,23 @@ const FILTERED_PASS_CMD: &str = "sh -c 'echo \"test result: ok. 1 passed; 0 fail
                                   0 measured; 17 filtered out; finished in 0.00s\"'";
 
 // ---------------------------------------------------------------------
-// implement: plan fully done, green_step: None, done + next_skill: review
-// -> Continue with the exact implement note; other patch fields kept;
-// next_skill stripped; no handoff.
+// implement: plan fully done, green_step: None, no `test` call has ever run
+// (last_test_cmd: None) -> `implement_no_green_runs_test` substitutes a real
+// `test` tool call instead of just asking for one (mirrors
+// `review_blind_approval_runs_test`'s substitution on the review side; see
+// `skills/tests/no_green_runs_test.rs` for the auto-detect `args: {}` case
+// and the edits-since-test case with a known `last_test_cmd`).
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn implement_done_with_no_green_run_continues_instead_of_handoff() {
+async fn implement_done_with_no_green_run_ever_runs_test_instead_of_continue() {
     let root = tempfile::tempdir().unwrap();
 
     let turns = vec![
         // Step 1: seed a one-step plan, already done (no open step), and set
         // recent_summary so we can assert it's kept when the done is
         // converted. No `test` call has run yet, so `green_step` stays
-        // `None`.
+        // `None` and `last_test_cmd` stays `None`.
         MockTurn::new(
             json!({
                 "patch": {
@@ -210,13 +221,15 @@ async fn implement_done_with_no_green_run_continues_instead_of_handoff() {
         state.harness.green_step, None,
         "no `test` call has run yet: green_step must be None"
     );
+    assert_eq!(state.harness.last_test_cmd, None);
+    assert_eq!(state.harness.edits_since_test, 0);
 
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome2 = log.append_record(rec2).unwrap();
 
     assert!(
         matches!(outcome2, Outcome::Continue),
-        "got {outcome2:?}; done with no passing test run must convert to Continue, not hand off"
+        "got {outcome2:?}; done with no passing test run must run the test, not hand off"
     );
     assert!(!any_rejected(&log), "must not have been rejected");
 
@@ -229,10 +242,17 @@ async fn implement_done_with_no_green_run_continues_instead_of_handoff() {
         state.agent.recent_summary, "finished the only step",
         "the rest of the patch from step 1 must be untouched"
     );
+    assert_eq!(
+        state.harness.tool_calls, 1,
+        "the substituted `test` call must have actually executed"
+    );
 
     let notes = continued_notes(&log);
-    let note = notes.last().expect("a `continued` System entry must exist");
-    assert_eq!(note, IMPLEMENT_NOTE, "note text must match exactly");
+    assert!(
+        notes.is_empty(),
+        "the runs-test note is appended to the tool observation, not logged as its own \
+         `continued` System entry: {notes:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -291,12 +311,18 @@ async fn implement_done_with_passing_test_still_hands_off_to_review() {
 }
 
 // ---------------------------------------------------------------------
-// implement: plan has an open step and green_step: None -> the existing
-// premature-done note fires, NOT the new one (priority check).
+// implement: plan has an open step and green_step: None, no test call has
+// ever run (last_test_cmd: None) -> fix 3 (`skills/src/coding/mod.rs`)
+// reordered the chain so `implement_no_green_runs_test` now runs BEFORE
+// `premature_done_note` and fires even with the open step: running the
+// test is the right next move whatever plan step is open. See
+// `implement_done_with_open_step_and_failing_run_uses_premature_done_note`
+// below for the one case where the premature-done note keeps its old
+// priority.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn implement_done_with_open_step_and_no_green_run_uses_premature_done_note() {
+async fn implement_done_with_open_step_and_no_green_run_ever_runs_test_instead() {
     let root = tempfile::tempdir().unwrap();
 
     let turns = vec![
@@ -333,7 +359,85 @@ async fn implement_done_with_open_step_and_no_green_run_uses_premature_done_note
 
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome2 = log.append_record(rec2).unwrap();
-    assert!(matches!(outcome2, Outcome::Continue), "got {outcome2:?}");
+    assert!(
+        matches!(outcome2, Outcome::Continue),
+        "got {outcome2:?}; no test call ever run must run the test instead of converting to the \
+         premature-done note"
+    );
+    assert!(!any_rejected(&log));
+
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.tool_calls, 1,
+        "the substituted test call must have executed"
+    );
+
+    let notes = continued_notes(&log);
+    assert!(
+        notes
+            .iter()
+            .all(|n| !n.contains("plan step 2 is still open")),
+        "the premature-done note must not fire when the test substitution takes priority: \
+         {notes:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// implement: plan has an open step, green_step: None, but a FAILING test is
+// the latest run and nothing has been edited since -> the test substitution
+// declines (re-running the identical failing command would tell the model
+// nothing new) and the premature-done note keeps its old priority, exactly
+// as before fix 3.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn implement_done_with_open_step_and_failing_run_uses_premature_done_note() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![
+        // Step 1: seed a two-step plan (one open).
+        MockTurn::new(
+            json!({
+                "patch": {
+                    "plan": [
+                        {"id": 1, "text": "first change", "status": "done"},
+                        {"id": 2, "text": "second change", "status": "pending"},
+                    ]
+                },
+                "action": {"type": "ask_user", "message": "seed?"},
+            })
+            .to_string(),
+        ),
+        // Step 2: a failing test establishes last_test_cmd with green_step
+        // staying None, and edits_since_test at 0.
+        test_turn("false"),
+        // Step 3: premature done with an open step.
+        MockTurn::new(
+            json!({
+                "patch": {"next_skill": "review"},
+                "action": {"type": "done"},
+            })
+            .to_string(),
+        ),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec1).unwrap();
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec2).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.green_step, None, "the test call failed");
+    assert_eq!(state.harness.edits_since_test, 0);
+
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(matches!(outcome3, Outcome::Continue), "got {outcome3:?}");
     assert!(!any_rejected(&log));
 
     let notes = continued_notes(&log);
@@ -345,6 +449,85 @@ async fn implement_done_with_open_step_and_no_green_run_uses_premature_done_note
     assert_ne!(
         note, IMPLEMENT_NOTE,
         "the no-green-run note must not fire when a plan step is still open"
+    );
+}
+
+// ---------------------------------------------------------------------
+// implement: plan fully done, a FAILING test is the latest run, and nothing
+// has been edited since (edits_since_test: 0) -> falls back to the old
+// Continue-with-note behaviour instead of re-running the same failing
+// command (see `skills/tests/no_green_runs_test.rs` for the case where
+// edits_since_test > 0, which DOES run the test again).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn implement_done_with_failing_run_and_no_edits_since_continues_with_note() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![
+        // Step 1: seed a one-step plan, already done.
+        MockTurn::new(
+            json!({
+                "patch": {"plan": [{"id": 1, "text": "only step", "status": "done"}]},
+                "action": {"type": "ask_user", "message": "seed?"},
+            })
+            .to_string(),
+        ),
+        // Step 2: a failing test -> green_step stays None, last_test_cmd is
+        // Some, edits_since_test is reset to 0 by the test call itself.
+        test_turn("false"),
+        // Step 3: done, handing off to review, with the failing run still
+        // the latest and nothing edited since.
+        MockTurn::new(
+            json!({
+                "patch": {"next_skill": "review"},
+                "action": {"type": "done"},
+            })
+            .to_string(),
+        ),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec1).unwrap();
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec2).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.green_step, None, "the test call failed");
+    assert_eq!(state.harness.last_test_cmd, Some("false".to_string()));
+    assert_eq!(
+        state.harness.edits_since_test, 0,
+        "the test call itself resets edits_since_test, and nothing was edited after it"
+    );
+
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(
+        matches!(outcome3, Outcome::Continue),
+        "got {outcome3:?}; a failing run with nothing edited since must fall back to Continue"
+    );
+    assert!(!any_rejected(&log));
+
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.agent.next_skill, None,
+        "next_skill must have been stripped, not committed -- no handoff happened"
+    );
+    assert_eq!(
+        state.harness.tool_calls, 1,
+        "the test must NOT have been re-run: only step 2's own test call executed"
+    );
+
+    let notes = continued_notes(&log);
+    let note = notes.last().expect("a `continued` System entry must exist");
+    assert_eq!(
+        note, IMPLEMENT_NOTE,
+        "the unchanged Continue-fallback note text must match exactly"
     );
 }
 

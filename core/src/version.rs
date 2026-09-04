@@ -93,6 +93,20 @@ pub struct HarnessState {
     /// this field existed still deserializes.
     #[serde(default)]
     pub last_test_cmd: Option<String>,
+    /// Number of successfully executed `edit_file`/`write_file`/
+    /// `revert_file` calls since the most recent `test` call -- incremented
+    /// on each such call, and reset to 0 on every `test` call (pass or
+    /// fail), committed at the same site as `green_step`/`green_filtered`/
+    /// `last_test_cmd` (`core/src/session.rs`). Harness-owned: patches
+    /// cannot touch it. Read by the coding skills' `implement` validation
+    /// (`skills/src/coding/mod.rs`) to tell a `done` sent with edits made
+    /// since the last (or only) test run apart from a `done` sent with
+    /// nothing changed since a prior failing run. Survives a handoff to a
+    /// new activation, the same as `green_step`/`last_test_cmd` (unlike
+    /// `tool_calls`, which resets on activation). `#[serde(default)]` so
+    /// state persisted before this field existed still deserializes.
+    #[serde(default)]
+    pub edits_since_test: u32,
 }
 
 /// A guide pinned into the prompt's Pinned section, with a step-counted

@@ -285,6 +285,7 @@ impl Skill for GreenSkill {
         vec![
             "edit_file".to_string(),
             "write_file".to_string(),
+            "revert_file".to_string(),
             "test".to_string(),
         ]
     }
@@ -334,6 +335,10 @@ fn edit_action(path: &str, old: &str, new: &str) -> Value {
 
 fn test_action(cmd: &str) -> Value {
     serde_json::json!({"type": "tool", "name": "test", "args": {"cmd": cmd}})
+}
+
+fn revert_action(path: &str) -> Value {
+    serde_json::json!({"type": "tool", "name": "revert_file", "args": {"path": path}})
 }
 
 fn ask_user_action(message: &str) -> Value {
@@ -1064,5 +1069,209 @@ async fn last_test_cmd_survives_a_new_activation() {
         state.harness.last_test_cmd,
         Some("sh -c 'exit 0'".to_string()),
         "last_test_cmd must survive the new activation, unlike tool_calls"
+    );
+}
+
+// =======================================================================
+// (i) `HarnessState.edits_since_test` (harness-owned, committed at the same
+// site as `green_step`/`green_filtered`/`last_test_cmd`,
+// `core/src/session.rs`): counts successfully executed `edit_file`/
+// `write_file`/`revert_file` calls since the most recent `test` call, and
+// resets to 0 on every `test` call (pass or fail). Survives a handoff to a
+// new activation, the same as `green_step`/`last_test_cmd` (unlike
+// `tool_calls`, which resets on activation).
+// =======================================================================
+
+#[tokio::test]
+async fn edits_since_test_counts_write_and_edit_and_resets_on_a_passing_test() {
+    let root = tempfile::tempdir().unwrap();
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), write_action("a.txt", "PASS\n")),
+        step_output(
+            serde_json::json!({}),
+            edit_action("a.txt", "PASS", "PASS EDITED"),
+        ),
+        step_output(
+            serde_json::json!({}),
+            test_action("sh -c 'grep -q PASS a.txt'"),
+        ),
+    ]);
+
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        real_tools(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 3),
+    );
+    let mut active = session.activate(Arc::new(GreenSkill)).await.unwrap();
+
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.edits_since_test, 0,
+        "must start at 0 before any edit"
+    );
+
+    // Step 1: write_file -- one edit.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.edits_since_test, 1,
+        "write_file must increment edits_since_test"
+    );
+
+    // Step 2: edit_file -- a second edit.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.edits_since_test, 2,
+        "edit_file must also increment edits_since_test"
+    );
+
+    // Step 3: test (passes) -- must reset the counter back to 0.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec3).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.edits_since_test, 0,
+        "a passing test call must reset edits_since_test to 0"
+    );
+}
+
+#[tokio::test]
+async fn edits_since_test_resets_on_a_failing_test_too() {
+    let root = tempfile::tempdir().unwrap();
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), write_action("a.txt", "PASS\n")),
+        step_output(
+            serde_json::json!({}),
+            test_action("sh -c 'grep -q NOPE a.txt'"), // fails
+        ),
+    ]);
+
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        real_tools(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 3),
+    );
+    let mut active = session.activate(Arc::new(GreenSkill)).await.unwrap();
+
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.edits_since_test, 1);
+
+    // Step 2: test fails -- must still reset the counter to 0 (pass or
+    // fail resets it, per the field's doc).
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.edits_since_test, 0,
+        "a failing test call must also reset edits_since_test to 0"
+    );
+    assert_eq!(
+        state.harness.green_step, None,
+        "sanity: this test call failed"
+    );
+}
+
+#[tokio::test]
+async fn edits_since_test_counts_revert_file_too() {
+    let root = tempfile::tempdir().unwrap();
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), write_action("a.txt", "PASS\n")),
+        step_output(
+            serde_json::json!({}),
+            test_action("sh -c 'grep -q PASS a.txt'"),
+        ),
+        step_output(
+            serde_json::json!({}),
+            edit_action("a.txt", "PASS", "BROKEN"),
+        ),
+        step_output(serde_json::json!({}), revert_action("a.txt")),
+    ]);
+
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        real_tools(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 3),
+    );
+    let mut active = session.activate(Arc::new(GreenSkill)).await.unwrap();
+
+    // Step 1: write_file, step 2: passing test -- resets to 0.
+    for _ in 0..2 {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+    }
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.edits_since_test, 0);
+
+    // Step 3: edit_file -- one edit.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec3).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.edits_since_test, 1);
+
+    // Step 4: revert_file -- must also increment.
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec4).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.edits_since_test, 2,
+        "revert_file must also increment edits_since_test"
+    );
+}
+
+#[tokio::test]
+async fn edits_since_test_survives_a_new_activation() {
+    let root = tempfile::tempdir().unwrap();
+
+    let model = ScriptedModel::new(vec![step_output(
+        serde_json::json!({}),
+        write_action("a.txt", "PASS\n"),
+    )]);
+
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        real_tools(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 3),
+    );
+    {
+        let mut active = session.activate(Arc::new(GreenSkill)).await.unwrap();
+        let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+        let (state, _version) = active.session().state().await.unwrap();
+        assert_eq!(state.harness.edits_since_test, 1);
+    }
+
+    // A fresh activation resets `tool_calls` back to 0, but
+    // `edits_since_test` -- like `green_step`/`last_test_cmd` -- is not
+    // reset: it persists across the handoff.
+    let mut active2 = session.activate(Arc::new(GreenSkill)).await.unwrap();
+    let (state, _version) = active2.session().state().await.unwrap();
+    assert_eq!(state.harness.tool_calls, 0);
+    assert_eq!(
+        state.harness.edits_since_test, 1,
+        "edits_since_test must survive the new activation, unlike tool_calls"
     );
 }

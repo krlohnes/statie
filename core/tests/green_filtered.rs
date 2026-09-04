@@ -479,6 +479,7 @@ fn harness_view_marks_filtered_pass() {
         green_filtered: true,
         tool_calls: 1,
         last_test_cmd: None,
+        edits_since_test: 0,
     };
 
     let view = HarnessView::new(&state);

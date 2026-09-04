@@ -937,7 +937,9 @@ async fn plan_skill_also_rejects_a_done_step_moved_back_to_pending() {
 
 /// A single-step turn: patches `notes` to the given string and takes action
 /// `ask_user` (never rejected by the yield/tool gates, so the only thing
-/// that can reject the step is the owned-field check under test).
+/// that could reject the step is the owned-field check under test -- which
+/// no longer does; see `model_patch_setting_notes_is_stripped_and_noted`
+/// below).
 fn set_notes_turn(notes: &str) -> MockTurn {
     MockTurn::new(
         json!({
@@ -948,8 +950,18 @@ fn set_notes_turn(notes: &str) -> MockTurn {
     )
 }
 
+/// A model patch touching `notes` (harness-owned) used to have the whole
+/// step rejected by `validate_default`'s owned-field check. It now goes
+/// through `strip_harness_owned` (`skills/src/coding/mod.rs`, called at the
+/// top of `plan`/`implement`/`review`'s `validate` overrides, in the same
+/// place `strip_malformed_next` runs) before `validate_default` ever sees
+/// it: the `notes` key is dropped from the raw patch, the step commits
+/// (here, the `ask_user` action still parks the session), and a note
+/// explaining the drop is recorded -- logged as a `System` `event: "note"`
+/// entry since `ask_user` leaves no pending observation to append to (see
+/// `core/src/session.rs`'s "10b. Validation notes").
 #[tokio::test]
-async fn model_patch_setting_notes_is_rejected_as_harness_owned() {
+async fn model_patch_setting_notes_is_stripped_and_noted() {
     let root = tempfile::tempdir().unwrap();
     let turns = vec![set_notes_turn("the model wrote this")];
     let model = Arc::new(MockModel::new(turns));
@@ -961,18 +973,37 @@ async fn model_patch_setting_notes_is_rejected_as_harness_owned() {
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome = log.append_record(rec).unwrap();
-    assert!(matches!(outcome, Outcome::Continue), "got {outcome:?}");
-
-    let reason = last_rejection_reason(&log);
     assert!(
-        reason.contains("`notes`") && reason.contains("harness-owned"),
-        "rejection reason should be the harness-owned message: {reason}"
+        matches!(outcome, Outcome::Parked(statie_core::Park::AskUser(_))),
+        "the ask_user action should still park the session; got {outcome:?}"
+    );
+
+    let sys_entries = log.entries(Some(LogKind::System), 10_000);
+    let rejection = sys_entries
+        .iter()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("rejected"));
+    assert!(
+        rejection.is_none(),
+        "the notes-patch step must not be rejected: {sys_entries:?}"
+    );
+
+    let note_entry = sys_entries
+        .iter()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("note"));
+    let note_text = note_entry
+        .and_then(|e| e.payload.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        note_text,
+        "`notes` is kept by the harness; that part of your patch was dropped and the rest was kept.",
+        "expected the strip-and-note text, got: {note_text}"
     );
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.agent.notes, "",
-        "the rejected patch must not have been committed"
+        "the dropped patch must not have overwritten the harness-owned `notes`"
     );
 }
 

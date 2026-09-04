@@ -101,7 +101,7 @@ pub use report::{FileNote, Report, ReportOutcome, ReportStats, ReportWorkspace};
 pub use sandbox::{SandboxPath, SandboxRoot};
 pub use session::{Active, CancelHandle, Session, SessionConfig};
 pub use skill::{
-    Commitment, ParsedOutput, Skill, SkillRules, SkillSpec, ValidatedStep, check_inbox,
+    Commitment, ParsedOutput, Patch, Skill, SkillRules, SkillSpec, ValidatedStep, check_inbox,
     validate_default,
 };
 pub use store::{ApplyFn, LoggedPatch, StateStore, apply_fn};

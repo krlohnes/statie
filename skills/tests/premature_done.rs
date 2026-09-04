@@ -140,6 +140,17 @@ fn green_checkpoint_entries(log: &Arc<dyn SessionLog>) -> Vec<Value> {
 
 // ---------------------------------------------------------------------
 // implement + `done` with an open plan step -> Continue, not a rejection.
+//
+// Fix 3 (`skills/src/coding/mod.rs`) reordered `ImplementSkill::validate`'s
+// chain so `implement_no_green_runs_test` now runs BEFORE
+// `premature_done_note` and fires even with an open plan step, as long as
+// `green_step: None` and either something was edited since the last test or
+// none has ever run -- running the test is the right next move whatever is
+// open. For `premature_done_note`'s open-step conversion to still be the
+// one that fires here (this test's whole point), the scenario now includes
+// a FAILING test first, with nothing edited since: that is the one shape
+// `implement_no_green_runs_test` leaves alone (see its doc), so the
+// premature-done note keeps its old priority.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -162,7 +173,12 @@ async fn implement_done_with_open_step_continues_patch_lands_step2_still_open() 
             })
             .to_string(),
         ),
-        // Step 2: mark step 1 done, send a premature `done` (with
+        // Step 2: a failing test establishes last_test_cmd with green_step
+        // staying None, and edits_since_test at 0 (nothing edited since) --
+        // the one shape that keeps `implement_no_green_runs_test` from
+        // substituting a fresh test call ahead of the premature-done note.
+        test_turn("false"),
+        // Step 3: mark step 1 done, send a premature `done` (with
         // next_skill: review) while step 2 is still pending.
         MockTurn::new(
             json!({
@@ -174,7 +190,7 @@ async fn implement_done_with_open_step_continues_patch_lands_step2_still_open() 
             })
             .to_string(),
         ),
-        // Step 3: harmless filler, just so the third `active.step()` call
+        // Step 4: harmless filler, just so the fourth `active.step()` call
         // below (which reads what the Continue note put in *this* prompt)
         // has a scripted turn to answer with.
         MockTurn::new(
@@ -195,12 +211,18 @@ async fn implement_done_with_open_step_continues_patch_lands_step2_still_open() 
     );
 
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
-    let outcome2 = log.append_record(rec2).unwrap();
+    let _ = log.append_record(rec2).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.green_step, None, "the test call failed");
+    assert_eq!(state.harness.edits_since_test, 0);
+
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
 
     // Outcome: Continue, not a rejection and not a handoff.
     assert!(
-        matches!(outcome2, Outcome::Continue),
-        "got {outcome2:?}; a premature done must convert to Continue, not reject or hand off"
+        matches!(outcome3, Outcome::Continue),
+        "got {outcome3:?}; a premature done must convert to Continue, not reject or hand off"
     );
     assert!(
         !any_rejected(&log),
@@ -244,18 +266,87 @@ async fn implement_done_with_open_step_continues_patch_lands_step2_still_open() 
     assert!(note.contains("run `test`"), "{note}");
 
     // The note appears in the *next* prompt's observation.
-    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
-    let _ = log.append_record(rec3).unwrap();
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec4).unwrap();
     let prompts = model.prompts();
     assert!(
-        prompts.len() >= 3,
-        "expected at least 3 model calls, got {}",
+        prompts.len() >= 4,
+        "expected at least 4 model calls, got {}",
         prompts.len()
     );
     assert!(
-        prompts[2].user.contains("plan step 2 is still open"),
-        "the third prompt's observation should contain the Continue note:\n{}",
-        prompts[2].user
+        prompts[3].user.contains("plan step 2 is still open"),
+        "the fourth prompt's observation should contain the Continue note:\n{}",
+        prompts[3].user
+    );
+}
+
+// ---------------------------------------------------------------------
+// implement + `done` with an open plan step, no test ever run at all (as
+// opposed to the failing-run case above) -> fix 3 now runs the substituted
+// test call instead of the premature-done note: running the test is the
+// right next move whatever plan step is open.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn implement_done_with_open_step_and_no_test_ever_run_runs_test_instead() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![
+        MockTurn::new(
+            json!({
+                "patch": {
+                    "plan": [
+                        {"id": 1, "text": "first change", "status": "pending"},
+                        {"id": 2, "text": "second change", "status": "pending"},
+                    ]
+                },
+                "action": {"type": "ask_user", "message": "confirm?"},
+            })
+            .to_string(),
+        ),
+        MockTurn::new(
+            json!({
+                "patch": {
+                    "plan": [{"id": 1, "status": "done"}],
+                    "next_skill": "review",
+                },
+                "action": {"type": "done"},
+            })
+            .to_string(),
+        ),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec1).unwrap();
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome2 = log.append_record(rec2).unwrap();
+    assert!(
+        matches!(outcome2, Outcome::Continue),
+        "got {outcome2:?}; no test call ever run must run the test instead of converting to the \
+         premature-done note"
+    );
+    assert!(!any_rejected(&log));
+
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.tool_calls, 1,
+        "the substituted test call must have executed"
+    );
+
+    let notes = continued_notes(&log);
+    assert!(
+        notes
+            .iter()
+            .all(|n| !n.contains("plan step 2 is still open")),
+        "the premature-done note must not fire when the test substitution takes priority: \
+         {notes:?}"
     );
 }
 
@@ -433,7 +524,7 @@ async fn implement_done_with_all_steps_done_still_hands_off_to_review() {
 /// through to `implement`'s ordinary "done is only valid when terminal or
 /// hands off" rule.
 #[tokio::test]
-async fn implement_bare_done_with_no_open_steps_is_still_rejected_not_converted() {
+async fn implement_bare_done_with_no_open_steps_and_green_hands_off_to_review() {
     let root = tempfile::tempdir().unwrap();
 
     let turns = vec![
@@ -469,14 +560,16 @@ async fn implement_bare_done_with_no_open_steps_is_still_rejected_not_converted(
 
     let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome3 = log.append_record(rec3).unwrap();
-    // No open step, but also no next_skill and not terminal: the premature-
-    // done conversion does not fire (no open step), so `implement`'s
-    // ordinary rules apply -- still a rejection, unchanged from before this
-    // unit.
-    assert!(matches!(outcome3, Outcome::Continue), "got {outcome3:?}");
+    // No open step, no next_skill, not terminal, and a passing test:
+    // `implement_bare_done` (`skills/src/coding/mod.rs`) names the handoff
+    // for the model, so this is a handoff to review, not a rejection.
     assert!(
-        any_rejected(&log),
-        "bare done with no open steps and no next_skill must still be rejected"
+        matches!(outcome3, Outcome::Handoff(ref t) if t == "review"),
+        "got {outcome3:?}"
+    );
+    assert!(
+        !any_rejected(&log),
+        "bare done with green and no open steps is converted, never rejected"
     );
 }
 

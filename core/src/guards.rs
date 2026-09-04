@@ -1,7 +1,13 @@
 //! Switches for the non-progress guards audited in statie-spec.md "10.
 //! After it works: the rule audit" (milestone 12). Every field defaults to
 //! `true`, so a config with no `guards` section (or one missing individual
-//! fields) behaves exactly as it did before this type existed.
+//! fields) behaves exactly as it did before this type existed -- except
+//! `done_stays_done`, which the first bench battery's audit turned off by
+//! default (see its own doc below): the rule rejected the model twelve
+//! times over for moving its "run cargo test" plan step back to
+//! in-progress after an edit, until the retry cap parked it as a failure
+//! with the crate already green, and the audit showed the switch off no
+//! worse.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +39,12 @@ pub struct Guards {
     pub redundant_verify: bool,
     /// `plan_rules` in the coding skills: a plan step that is `done` may
     /// not be moved back to `pending`/`in_progress`. Off: reopening is
-    /// allowed.
+    /// allowed. Defaults to `false` (unlike every other field here): the
+    /// first bench battery's audit showed a local model reopening a `done`
+    /// "run cargo test" step after an edit, having this rule reject it
+    /// twelve times running until the retry cap parked the run as a
+    /// failure with the crate already green -- the audit showed the switch
+    /// off is no worse.
     pub done_stays_done: bool,
     /// The commitment read cap (`COMMITMENT_READ_CAP` = 2): reads against a
     /// set commitment beyond the cap are rejected and clear it. Off: reads
@@ -50,7 +61,7 @@ impl Default for Guards {
             silent_reads: true,
             read_guard: true,
             redundant_verify: true,
-            done_stays_done: true,
+            done_stays_done: false,
             commitment_read_cap: true,
         }
     }

@@ -14,6 +14,15 @@ use crate::promptable::{Promptable, sealed};
 use crate::report::Report;
 use crate::version::{CommittedState, HarnessState, Version};
 
+/// A harness-trusted JSON merge-patch value: the raw wire shape a skill's
+/// [`Skill::after_tool`] hook returns to write durable, harness-owned state
+/// (e.g. `seen`, milestone 10) after a tool call. Applied by the session
+/// with `apply_trusted_patch`-style top-level field replacement -- each key
+/// present in the value becomes the field's new value outright, not a
+/// deep/keyed-array merge -- so a hook that wants to shrink or reorder an
+/// array (e.g. evicting an entry) can just send the finished array.
+pub type Patch = Value;
+
 /// A binding decision: the mutating call the model has committed to making
 /// next, set in the workspace before it starts reading toward that call.
 /// While a commitment is set, the session's commitment-slot rule (see
@@ -135,6 +144,54 @@ impl<W> ParsedOutput<W> {
             ));
         }
         fixes.extend(normalize_action(&mut value));
+
+        // A well-formed `patch` with no `action` at all is not the model
+        // choosing anything -- with thinking on, the server does not
+        // enforce the schema, and a bench run sent this shape four times in
+        // a row, hitting the retry cap on what should have been a
+        // recoverable step. Rather than rejecting (the schema still
+        // requires `action` -- this is not a model-facing relaxation, see
+        // `StepOutput`), treat it as the harness-internal `Action::Continue`:
+        // the patch commits, the model is told every output needs an
+        // action. Only this exact shape (an object, a `patch` member that
+        // is itself an object, and NO `action` member) is recovered this
+        // way; `action` present-but-malformed, `patch` missing, or the
+        // value not an object at all all keep falling through to the
+        // ordinary deserialize below and its existing error.
+        if let Value::Object(map) = &value
+            && matches!(map.get("patch"), Some(Value::Object(_)))
+            && !map.contains_key("action")
+        {
+            let raw_patch_value = map.get("patch").cloned().unwrap_or(Value::Null);
+            // Same schema check the ordinary path applies to `patch`
+            // (deserialize into `P::Patch`, then re-serialize): a `patch`
+            // that is well-formed JSON but not a valid `P::Patch` should
+            // still fail to parse, not be silently accepted just because
+            // `action` happened to be missing too.
+            let typed_patch: P::Patch = serde_json::from_value(raw_patch_value)
+                .map_err(|e| ParseError::InvalidJson(e.to_string()))?;
+            let patch_value = serde_json::to_value(&typed_patch)
+                .map_err(|e| ParseError::InvalidJson(e.to_string()))?;
+            let ack_inbox = map
+                .get("ack_inbox")
+                .and_then(|v| serde_json::from_value::<Vec<u64>>(v.clone()).ok())
+                .unwrap_or_default();
+            return Ok((
+                ParsedOutput {
+                    patch: RawPatch(patch_value),
+                    action: Action::Continue {
+                        note: "your output had no `action`; the patch was kept. Every output \
+                               needs an action: a tool call, `done`, or `ask_user`."
+                            .to_string(),
+                    },
+                    ack_inbox,
+                    version,
+                    _marker: std::marker::PhantomData,
+                },
+                fixes,
+            ));
+        }
+
         let parsed: StepOutput<P::Patch> =
             serde_json::from_value(value).map_err(classify_step_output_error)?;
         let patch_value = serde_json::to_value(&parsed.patch)
@@ -781,6 +838,58 @@ pub trait Skill: Send + Sync + 'static {
     /// The harness-maintained notes text, if this workspace carries one.
     /// Default `None`. See `harness_owned_fields`.
     fn notes(&self, _ws: &Self::Workspace) -> Option<String> {
+        None
+    }
+
+    /// Called by the session right after a tool call has executed
+    /// successfully -- not on a tool error, not on a skipped-redundant
+    /// call, but a paged `read_file` repeat counts as executed (with its
+    /// rewritten `args`) -- and after the model's own patch for the step
+    /// has already committed. `ws` is the just-committed workspace, `step`
+    /// the harness step the call ran at, `name`/`args` the tool call
+    /// (post-paging-rewrite where relevant), and `output` its full text
+    /// output.
+    ///
+    /// Returning `Some(patch)` has the session apply `patch` as one extra,
+    /// harness-trusted commit (source `"harness"`, a `Patch` log entry with
+    /// `"reason": "after_tool"`), the same way a maintainer or absorbed-
+    /// report patch commits -- never failing the step: an error applying it
+    /// is logged as a `System` `note` and otherwise ignored. Default
+    /// `None`: a skill that doesn't maintain any harness-owned, tool-
+    /// derived state never triggers this.
+    fn after_tool(
+        &self,
+        _ws: &Self::Workspace,
+        _harness: &HarnessState,
+        _step: u64,
+        _name: &str,
+        _args: &Value,
+        _output: &str,
+    ) -> Option<Patch> {
+        None
+    }
+
+    /// Called once right after this skill is activated, with the workspace
+    /// as committed; a returned patch is applied as a harness-sourced
+    /// version, e.g. to clear a consumed handoff.
+    ///
+    /// A handoff is requested by the model setting the workspace's
+    /// `next_skill` (paired with action `done`, per `Skill::handoff`). The
+    /// session consumes it by activating the named skill next, but nothing
+    /// else clears the field: without this hook, the new activation runs
+    /// with the old `next_skill` still committed, which a skill's own
+    /// bare-`done`/handoff logic can then misread as a (self-)handoff
+    /// already named. Runs for every activation path -- fresh activate,
+    /// handoff, resume with `--skill`, and `activate_forced` -- since all of
+    /// them funnel through `Session::activate_inner`.
+    ///
+    /// Applied the same way an [`after_tool`](Skill::after_tool) patch is:
+    /// one extra harness-trusted commit (source `"harness"`, a `Patch` log
+    /// entry with `"reason": "on_activate"`), never failing activation --
+    /// an error applying it is logged as a `System` `note` and otherwise
+    /// ignored. Default `None`: a skill with no such state never triggers
+    /// this.
+    fn on_activate(&self, _ws: &Self::Workspace) -> Option<Patch> {
         None
     }
 

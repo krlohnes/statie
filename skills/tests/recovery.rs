@@ -3117,11 +3117,17 @@ async fn failed_committed_edit_keeps_next_set() {
         !third.contains("commitment fulfilled"),
         "a failed edit must not be reported as fulfilled:\n{third}"
     );
+    // Milestone 10: step 1's successful `read_file` (toward the
+    // commitment) legitimately produces its own harness-authored `seen`
+    // patch (`reason: "after_tool"`) -- unrelated to the commitment-clear
+    // path this assertion guards, which is distinguished by carrying no
+    // `reason` field and patching `next` specifically.
     let patch_entries = log.entries(Some(LogKind::Patch), 10_000);
     assert!(
-        patch_entries
-            .iter()
-            .all(|e| e.payload.get("source").and_then(Value::as_str) != Some("harness")),
+        patch_entries.iter().all(|e| {
+            e.payload.get("source").and_then(Value::as_str) != Some("harness")
+                || e.payload.get("reason").and_then(Value::as_str) == Some("after_tool")
+        }),
         "no harness clear patch should have been committed: {patch_entries:?}"
     );
     assert_eq!(
@@ -3384,14 +3390,26 @@ async fn different_shell_commands_are_both_accepted() {
 }
 
 #[tokio::test]
-async fn test_tool_then_shell_with_same_command_string_is_skipped() {
+async fn test_tool_then_shell_with_same_command_string_both_run() {
+    // Fix 1 (`core/src/session.rs`, `VerifyRun::tool`): the redundant-
+    // verification guard's memory is now keyed on the TOOL as well as the
+    // normalized command -- a `test` after a `shell` of the identical
+    // command (or vice versa) is no longer treated as redundant, because
+    // the green checkpoint (`note_test_result`) only listens to the `test`
+    // tool. A live run showed the model run `cargo test` through `shell`
+    // once, then have every following `test` call with the same command
+    // skipped as redundant: the harness never saw a passing test, so its
+    // own substitution kept inserting `test`, and the guard kept skipping
+    // it -- 51 skips in one run. This test proves the fix: a `test` call
+    // right after a `shell` call of the identical command actually runs
+    // (and vice versa would too, by the same symmetric check).
+    //
     // The `test` tool's own auto-detected/explicit command isn't portable
     // in a bare temp sandbox (no Cargo.toml/package.json/etc. to detect,
     // and the underlying command must actually run in CI); an explicit
     // `cmd` on the `test` tool runs the given string exactly the way
     // `shell` does (see `tools/src/test_tool.rs`), so `echo hi` works
-    // identically through either tool and is enough to prove the two
-    // share the comparison state.
+    // identically through either tool.
     let root = tempfile::tempdir().unwrap();
 
     let turns = vec![coding_test_call("echo hi"), coding_shell_call("echo hi")];
@@ -3407,20 +3425,19 @@ async fn test_tool_then_shell_with_same_command_string_is_skipped() {
 
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     assert!(
-        !rec2.entries().iter().any(|e| e.kind == LogKind::ToolOutput),
-        "the second `shell echo hi` must not actually run: {:?}",
+        rec2.entries().iter().any(|e| e.kind == LogKind::ToolOutput),
+        "the second `shell echo hi` must actually run -- a `test` run of the same command does \
+         not make a later `shell` run of it redundant: {:?}",
+        rec2.entries()
+    );
+    assert!(
+        !rec2.entries().iter().any(|e| e.kind == LogKind::System
+            && e.payload.get("event").and_then(Value::as_str) == Some("skipped_redundant")),
+        "the second call must not be logged as a skip: {:?}",
         rec2.entries()
     );
     let outcome2 = log.append_record(rec2).unwrap();
     assert!(matches!(outcome2, Outcome::Continue), "got {outcome2:?}");
-
-    let skipped = last_skipped_redundant(&log);
-    let reason = skipped.get("reason").and_then(Value::as_str).unwrap_or("");
-    assert!(
-        reason.contains("nothing has changed since you last ran `echo hi`"),
-        "the `test` tool's run should be comparable against a later `shell` run of the same \
-         command: {reason}"
-    );
 }
 
 // ---------------------------------------------------------------------
@@ -4277,6 +4294,14 @@ async fn a_third_identical_shell_attempt_still_yields_the_loop_guard_note() {
     // baseline and the *skips* are what must recur three times -- i.e. this
     // needs a fourth attempt overall (one real run, three skips) before the
     // occurrence counter (keyed on the skip text) reaches 3.
+    //
+    // Fix 2 (`core/src/session.rs`, `CONTINUE_REPEAT_CAP` shared with the
+    // repeated-skip guard) also caps at three CONSECUTIVE identical skips
+    // (same tool, same call key): the third skip here (the fourth attempt
+    // overall) is both the loop guard's third occurrence AND the repeated-
+    // skip guard's third consecutive skip, so this step now parks
+    // (`Park::AskUser`) instead of returning `Outcome::Continue` -- the
+    // fifth scripted turn (`coding_ask_user_turn`) is never reached.
     let root = tempfile::tempdir().unwrap();
 
     let turns = vec![
@@ -4284,7 +4309,6 @@ async fn a_third_identical_shell_attempt_still_yields_the_loop_guard_note() {
         coding_shell_call("echo hi"),
         coding_shell_call("echo hi"),
         coding_shell_call("echo hi"),
-        coding_ask_user_turn(),
     ];
     let model = Arc::new(MockModel::new(turns));
     let cfg = common::config(&root);
@@ -4292,7 +4316,7 @@ async fn a_third_identical_shell_attempt_still_yields_the_loop_guard_note() {
     let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
     let mut active = session.activate(skill).await.unwrap();
 
-    for i in 0..4 {
+    for i in 0..3 {
         let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
         let outcome = log.append_record(rec).unwrap();
         assert!(
@@ -4301,6 +4325,27 @@ async fn a_third_identical_shell_attempt_still_yields_the_loop_guard_note() {
         );
     }
 
+    // The fourth attempt (the third consecutive identical skip) parks
+    // instead of continuing, carrying both the loop guard's "occurrence #3"
+    // note and the repeated-skip guard's own message.
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome4 = log.append_record(rec4).unwrap();
+    let Outcome::Parked(Park::AskUser(message)) = outcome4 else {
+        panic!("got {outcome4:?}; the third consecutive identical skip must park as a question");
+    };
+    assert!(
+        message.contains("[harness] This is occurrence #3"),
+        "a third identical skipped attempt must still trip the loop guard: {message}"
+    );
+    assert!(
+        message.contains("repeated the same skipped call 3 times in a row"),
+        "the repeated-skip guard's own message must also be present: {message}"
+    );
+    assert!(
+        message.contains("shell") && message.contains("echo hi"),
+        "the repeated-skip guard's message must name the tool and command: {message}"
+    );
+
     // The second, third, and fourth attempts were all skipped (never re-run).
     let skipped_count = log
         .entries(Some(LogKind::System), 10_000)
@@ -4308,18 +4353,6 @@ async fn a_third_identical_shell_attempt_still_yields_the_loop_guard_note() {
         .filter(|e| e.payload.get("event").and_then(Value::as_str) == Some("skipped_redundant"))
         .count();
     assert_eq!(skipped_count, 3, "expected three skipped repeats");
-
-    // The prompt built after the fourth attempt (the third identical skip)
-    // carries the loop-guard's "occurrence #3" note, exactly as it would
-    // for three real repeats.
-    let rec5 = active.step(Event::Tick, &mut NullSink).await.unwrap();
-    let _ = log.append_record(rec5).unwrap();
-    let prompts = model.prompts();
-    let obs = &prompts[4].user;
-    assert!(
-        obs.contains("[harness] This is occurrence #3"),
-        "a third identical skipped attempt must still trip the loop guard: {obs}"
-    );
 }
 
 #[tokio::test]

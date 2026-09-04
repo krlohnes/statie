@@ -247,11 +247,15 @@ async fn blind_approval_with_last_test_cmd_reruns_the_same_command() {
 
     let (state, _version) = active.session().state().await.unwrap();
     assert!(!state.agent.done, "the approval must not have landed");
-    // `next_skill` was already "review" from implement's own handoff patch
-    // (a workspace field, committed before review activated) -- this
-    // step's raw patch carries no `next_skill` at all, so there is nothing
-    // to strip; the committed value is simply untouched.
-    assert_eq!(state.agent.next_skill.as_deref(), Some("review"));
+    // `next_skill` was "review" from implement's own handoff patch (a
+    // workspace field, committed before review activated), but it names
+    // review itself once review is the active skill -- a stale
+    // self-handoff, which `Skill::on_activate` (`core/src/skill.rs`,
+    // `common_on_activate` in `skills/src/coding/mod.rs`) now clears right
+    // when review activates, before this step even runs. This step's own
+    // raw patch carries no `next_skill` at all, so there is nothing further
+    // for it to strip.
+    assert_eq!(state.agent.next_skill, None);
     assert_eq!(
         state.harness.tool_calls, 1,
         "the substituted test call must have executed"

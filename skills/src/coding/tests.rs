@@ -3,14 +3,15 @@ use std::sync::Arc;
 use serde_json::json;
 
 use statie_core::{
-    Action, CommittedState, HarnessState, ParsedOutput, PatchError, RawOutput, Report,
-    ReportOutcome, ReportStats, Skill, Version,
+    Action, CommittedState, HarnessState, ParsedOutput, RawOutput, Report, ReportOutcome,
+    ReportStats, Skill, Version,
 };
 use statie_patch::JsonMergePatch;
 
 use super::{
     CodingWorkspace, FileNote, ImplementSkill, PlanSkill, PlanStep, ReviewSkill, RouterSkill,
-    StepStatus, coding_skills, coding_skills_with_delegates,
+    SeenFile, StepStatus, coding_skills, coding_skills_with_delegates, common_after_tool,
+    count_lines, has_named_handoff, merge_range, parse_edit_header, parse_revert_lines, seen_entry,
 };
 
 fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
@@ -27,6 +28,7 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             green_filtered: false,
             tool_calls: 0,
             last_test_cmd: None,
+            edits_since_test: 0,
         },
         agent,
     }
@@ -371,8 +373,183 @@ fn plan_done_with_explicit_next_skill_is_not_overridden() {
     assert_eq!(patch.next().next_skill.as_deref(), Some("router"));
 }
 
+// ---------------------------------------------------------------------
+// `done: true` is never `plan`'s (or `router`'s) to set: the fix for the
+// bench log where `plan`'s first step after activation sent
+// `{"patch": {"done": true}, "action": {"type": "done"}}` with an empty
+// plan and it committed `done: true`, ending the session as falsely `done`.
+// See `plan_done_not_ours_note`/`router_done_not_ours_note`/
+// `done_not_ours_note` in `skills/src/coding/mod.rs`. Session-level
+// coverage of the exact bug-report sequence lives in
+// `skills/tests/plan_done.rs`.
+// ---------------------------------------------------------------------
+
 #[test]
-fn implement_bare_done_is_not_affected_by_plan_only_fix() {
+fn plan_done_true_with_empty_plan_gets_the_empty_plan_note_not_the_not_ours_note() {
+    // The empty-plan note must win when the plan is empty -- not the more
+    // general not-ours note -- even though both fire on `done: true`.
+    let skill = PlanSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {"done": true},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("done:true with an empty plan must continue, not reject");
+    let (patch, action, _) = step.into_parts();
+    match action {
+        Action::Continue { note } => {
+            assert!(note.contains("the plan is empty"), "{note}");
+        }
+        other => panic!("expected Action::Continue, got {other:?}"),
+    }
+    assert!(!patch.next().done, "done must not have committed as true");
+}
+
+#[test]
+fn plan_done_true_with_valid_plan_and_no_next_skill_converts_to_continue() {
+    // A non-empty, valid plan with `done: true` and no `next_skill`: NOT
+    // the old auto-inject-next_skill shortcut (that shortcut only applies
+    // when the raw patch carries no `done` field at all -- see
+    // `plan_bare_done_with_nonempty_committed_plan_injects_next_skill_implement`
+    // above). `done: true` is never plan's to set, so this converts to
+    // `Continue` with the not-ours note instead of silently handing off.
+    let skill = PlanSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {
+            "done": true,
+            "plan": [{"id": 1, "text": "do the thing", "status": "pending"}],
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("done:true with a valid plan and no next_skill must continue, not reject");
+    let (patch, action, _) = step.into_parts();
+    match action {
+        Action::Continue { note } => {
+            assert!(
+                note.contains("not the plan skill's to set"),
+                "expected the not-ours note, got: {note}"
+            );
+        }
+        other => panic!("expected Action::Continue, got {other:?}"),
+    }
+    assert!(!patch.next().done, "done must not have committed as true");
+    assert_eq!(
+        patch.next().next_skill,
+        None,
+        "no next_skill was sent and none must have been injected"
+    );
+    // The plan itself still landed -- only `done` was stripped.
+    assert_eq!(patch.next().plan.len(), 1);
+}
+
+#[test]
+fn plan_done_true_with_next_skill_keeps_handoff_but_strips_done() {
+    // A malformed-but-well-intentioned patch that sets both `done: true`
+    // AND a valid `next_skill`: the handoff still proceeds (action stays
+    // `Done`), but `done` itself is stripped -- `plan` never gets to
+    // commit `done: true`, even when it also names a real handoff.
+    let skill = PlanSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {
+            "done": true,
+            "next_skill": "implement",
+            "plan": [{"id": 1, "text": "do the thing", "status": "pending"}],
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("done:true with a named handoff must still validate");
+    let (patch, action, _) = step.into_parts();
+    assert!(
+        matches!(action, Action::Done),
+        "a named handoff must not be converted to Continue"
+    );
+    assert!(
+        !patch.next().done,
+        "done must not have committed as true even alongside a real handoff"
+    );
+    assert_eq!(patch.next().next_skill.as_deref(), Some("implement"));
+}
+
+#[test]
+fn plan_proper_handoff_with_no_done_field_is_unaffected() {
+    // The positive control: a proper handoff with no `done` field in the
+    // patch at all (the ordinary shape `plan`'s instructions describe)
+    // passes straight through -- `plan_done_not_ours_note` never fires
+    // since the raw patch never set `done` to anything.
+    let skill = PlanSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {
+            "next_skill": "implement",
+            "plan": [{"id": 1, "text": "do the thing", "status": "pending"}],
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("proper handoff should validate");
+    let (patch, action, _) = step.into_parts();
+    assert!(matches!(action, Action::Done));
+    assert_eq!(patch.next().next_skill.as_deref(), Some("implement"));
+    assert!(!patch.next().done);
+}
+
+#[test]
+fn router_done_true_bare_converts_to_continue_and_strips_done() {
+    let skill = RouterSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {"done": true},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("router done:true with no next_skill must continue, not reject");
+    let (patch, action, _) = step.into_parts();
+    match action {
+        Action::Continue { note } => {
+            assert!(
+                note.contains("not the router's to set"),
+                "expected the router not-ours note, got: {note}"
+            );
+        }
+        other => panic!("expected Action::Continue, got {other:?}"),
+    }
+    assert!(!patch.next().done, "done must not have committed as true");
+}
+
+#[test]
+fn router_done_true_with_next_skill_keeps_handoff_but_strips_done() {
+    let skill = RouterSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {"done": true, "next_skill": "plan"},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("router done:true with a named handoff must still validate");
+    let (patch, action, _) = step.into_parts();
+    assert!(
+        matches!(action, Action::Done),
+        "a named handoff must not be converted to Continue"
+    );
+    assert!(
+        !patch.next().done,
+        "done must not have committed as true even alongside a real handoff"
+    );
+    assert_eq!(patch.next().next_skill.as_deref(), Some("plan"));
+}
+
+#[test]
+fn implement_bare_done_with_green_and_complete_plan_is_converted_to_handoff() {
     // The injection is specific to `plan`; `implement` (also transitions
     // via next_skill/done) must still reject a bare done with the
     // ordinary message, not silently pick a target. `green_step: Some(0)`
@@ -394,22 +571,28 @@ fn implement_bare_done_is_not_affected_by_plan_only_fix() {
         "action": {"type": "done"},
         "ack_inbox": []
     });
-    let err = parse_and_validate(&skill, &cur, content).unwrap_err();
-    assert!(
-        matches!(err, statie_core::PatchError::RuleViolation(_)),
-        "got {err:?}"
-    );
+    // `implement_bare_done` (`skills/src/coding/mod.rs`): a bare `done`
+    // with a passing test and no open step is no longer rejected by the
+    // "terminal or hands off" rule; it becomes the handoff to review.
+    let step = parse_and_validate(&skill, &cur, content).expect("converted, not rejected");
+    assert!(matches!(step.action(), statie_core::Action::Done));
 }
 
 /// Previously: `done` with `next_skill: "review"` while a plan step is
 /// pending was rejected (`PatchError::RuleViolation`) and the patch (here,
-/// the attempted `next_skill` change) was discarded. Now: the premature-done
-/// conversion (`premature_done_note`) fires first -- the step is no longer
-/// rejected, `next_skill` is stripped so the handoff does not silently
-/// land, and the action becomes the harness-internal `Action::Continue`
-/// naming the still-open step.
+/// the attempted `next_skill` change) was discarded. Then:
+/// `premature_done_note` converted it to `Action::Continue` naming the still
+/// -open step. Now (fix 3, `skills/src/coding/mod.rs`): with `green_step:
+/// None` and no `test` call ever having run (`last_test_cmd: None`),
+/// `implement_no_green_runs_test` runs BEFORE `premature_done_note` and
+/// fires even with the plan step still open -- running the test is the
+/// right next move whatever is open, and the substituted `test` call's own
+/// observation says what it says. See
+/// `implement_handoff_to_review_with_pending_step_and_failing_run_continues_instead_of_handoff`
+/// below for the one case where `premature_done_note` keeps its old
+/// priority.
 #[test]
-fn implement_handoff_to_review_with_pending_step_continues_instead_of_handoff() {
+fn implement_handoff_to_review_with_pending_step_runs_test_instead_of_continuing() {
     let skill = ImplementSkill::new();
     let cur = committed(CodingWorkspace {
         plan: vec![PlanStep {
@@ -419,6 +602,51 @@ fn implement_handoff_to_review_with_pending_step_continues_instead_of_handoff() 
         }],
         ..Default::default()
     });
+    let content = json!({
+        "patch": {"next_skill": "review"},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("the substituted test call should not be rejected");
+    let (patch, action, _) = step.into_parts();
+    assert!(
+        matches!(
+            action,
+            statie_core::Action::Tool { ref name, .. } if name == "test"
+        ),
+        "expected a substituted `test` tool call, got {action:?}"
+    );
+    assert_eq!(
+        patch.next().next_skill,
+        None,
+        "next_skill must be stripped so the handoff does not land"
+    );
+}
+
+/// The one shape where `premature_done_note`'s open-step conversion still
+/// keeps priority over the test substitution (see fix 3's doc on
+/// `implement_no_green_runs_test`): `green_step: None`, an open plan step,
+/// a FAILING run as the most recent one, and nothing edited since. Running
+/// the identical failing command again would tell the model nothing new, so
+/// `implement_no_green_runs_test`'s test-substitution branch does not fire
+/// (`should_run_test` is false: `edits_since_test == 0` and `last_test_cmd`
+/// is `Some`), and it explicitly declines when an open step is present in
+/// that case, falling through to `premature_done_note`.
+#[test]
+fn implement_handoff_to_review_with_pending_step_and_failing_run_continues_instead_of_handoff() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 1,
+            text: "a".to_string(),
+            status: StepStatus::Pending,
+        }],
+        ..Default::default()
+    });
+    cur.harness.last_test_cmd = Some("cargo test".to_string());
+    cur.harness.edits_since_test = 0;
+    // green_step stays None: the latest test run failed.
     let content = json!({
         "patch": {"next_skill": "review"},
         "action": {"type": "done"},
@@ -440,6 +668,217 @@ fn implement_handoff_to_review_with_pending_step_continues_instead_of_handoff() 
         patch.next().next_skill,
         None,
         "next_skill must be stripped so the handoff does not land"
+    );
+}
+
+/// Fix 4 reproduction (bench battery, live run, thinking on): `implement_
+/// bare_done` should convert a `done` with neither `done: true` nor
+/// `next_skill` into a handoff to review when `green_step` is `Some` and the
+/// merged plan has no open step -- but in this live run it did not, 11
+/// times across the battery, and the core "action `done` is only valid when
+/// the workspace is terminal or hands off" rule rejected the step instead.
+/// Exact reproduction from the log: a committed workspace with a plan whose
+/// three steps are `done`/`in_progress`/`pending`, a maintainer-set `next`
+/// commitment (`{"tool": "shell", "path": "cargo test", "what": "run cargo
+/// test to verify the implementation"}`), `harness.green_step: Some(13)` (a
+/// `test` pass at the previous step), and the model's output setting every
+/// plan step's `status` to `"done"` (by `id` only, no `text`) with a bare
+/// `done` action and empty `ack_inbox`.
+#[test]
+fn implement_bare_done_with_maintainer_next_and_all_steps_marked_done_hands_off_to_review() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![
+            PlanStep {
+                id: 1,
+                text: "run cargo test to record the baseline".to_string(),
+                status: StepStatus::Done,
+            },
+            PlanStep {
+                id: 2,
+                text: "implement the change".to_string(),
+                status: StepStatus::InProgress,
+            },
+            PlanStep {
+                id: 3,
+                text: "clean up".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+        next: Some(statie_core::Commitment {
+            tool: "shell".to_string(),
+            path: Some("cargo test".to_string()),
+            what: "run cargo test to verify the implementation".to_string(),
+        }),
+        ..Default::default()
+    });
+    cur.harness.green_step = Some(13);
+    let content = json!({
+        "patch": {
+            "plan": [
+                {"id": 1, "status": "done"},
+                {"id": 2, "status": "done"},
+                {"id": 3, "status": "done"},
+            ]
+        },
+        "action": {"type": "done", "name": "", "args": {}, "message": ""},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("the bare-done handoff must not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Done),
+        "expected the action to stay Done (a handoff), got {:?}",
+        step.action()
+    );
+    let (patch, _action, _) = step.into_parts();
+    assert_eq!(
+        patch.next().next_skill.as_deref(),
+        Some("review"),
+        "implement_bare_done must inject next_skill: review"
+    );
+}
+
+/// Only `review`'s approval (empty `findings`) finishes the task
+/// (statie-spec.md §5/§10) -- `implement` only ever hands off, via
+/// `next_skill`. `ImplementSkill::is_terminal` is unconditionally `false`,
+/// even when `ws.done` is somehow `true` (it should never get there in the
+/// first place -- see `implement_done_true_with_green_and_complete_plan_
+/// strips_done_and_hands_off_to_review` below for the `validate`-side half
+/// that keeps it from committing), mirroring `plan_is_terminal_is_always_
+/// false_even_when_done_is_true`/`router_is_terminal_is_always_false_even_
+/// when_done_is_true` above.
+#[test]
+fn implement_is_terminal_is_always_false_even_when_done_is_true() {
+    let skill = ImplementSkill::new();
+    let mut ws = CodingWorkspace::default();
+    assert!(!skill.is_terminal(&ws));
+    ws.done = true;
+    assert!(
+        !skill.is_terminal(&ws),
+        "implement must never be terminal, whatever ws.done says"
+    );
+}
+
+/// `implement_done_not_ours_strip` (`skills/src/coding/mod.rs`): a raw
+/// `done: true` in the patch is stripped BEFORE the rest of `implement`'s
+/// `done`-handling chain runs, so it never reaches `validate_default`'s
+/// merge. Here the plan is fully done and `green_step: Some(n)` (a passing
+/// test), so once `done` is stripped the chain's existing `green_done_note`/
+/// `implement_bare_done` handling takes over exactly as it would for a bare
+/// `done` with no `done: true` at all: the step becomes the real handoff to
+/// review, action stays `Done`, and the committed patch carries no `done`
+/// key.
+#[test]
+fn implement_done_true_with_green_and_complete_plan_strips_done_and_hands_off_to_review() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 1,
+            text: "a".to_string(),
+            status: StepStatus::Done,
+        }],
+        ..Default::default()
+    });
+    cur.harness.green_step = Some(3);
+    let content = json!({
+        "patch": {
+            "done": true,
+            "plan": [
+                {"id": 1, "status": "done"},
+            ],
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("must not be rejected -- done:true strips and the chain hands off to review");
+    assert!(
+        matches!(step.action(), statie_core::Action::Done),
+        "expected the action to stay Done (a handoff), got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.patch().raw().get("done"),
+        None,
+        "done must have been stripped from the committed patch: {:?}",
+        step.patch().raw()
+    );
+    assert!(
+        step.notes()
+            .iter()
+            .any(|n| n.contains("`done: true` is review's to set")),
+        "the not-ours note must be attached: {:?}",
+        step.notes()
+    );
+    let (patch, _action, _) = step.into_parts();
+    assert_eq!(
+        patch.next().next_skill.as_deref(),
+        Some("review"),
+        "the chain must still hand off to review once done:true is stripped"
+    );
+}
+
+/// Same `done: true` strip, but with no passing test and something edited
+/// since the last one (`edits_since_test > 0`, the default in `committed`'s
+/// `HarnessState`): once `done` is stripped, `implement_no_green_runs_test`
+/// takes over exactly as it would for a bare `done` and substitutes a real
+/// `test` tool call instead of handing off.
+#[test]
+fn implement_done_true_without_green_and_edits_since_runs_the_test() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 1,
+            text: "a".to_string(),
+            status: StepStatus::Done,
+        }],
+        ..Default::default()
+    });
+    cur.harness.edits_since_test = 1;
+    let content = json!({
+        "patch": {"done": true},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("must not be rejected -- done:true strips and the chain runs the test");
+    let (patch, action, _) = step.into_parts();
+    assert!(
+        matches!(
+            action,
+            statie_core::Action::Tool { ref name, .. } if name == "test"
+        ),
+        "expected a substituted `test` tool call, got {action:?}"
+    );
+    assert!(!patch.next().done, "done must not have committed as true");
+}
+
+/// A tool call (not `done`) that happens to carry `done: true` in its patch
+/// is left as a tool call -- `implement_done_not_ours_strip` only ever
+/// strips the key and attaches a note; it never touches `out.action()`, so a
+/// non-`done` action the model sent is unaffected.
+#[test]
+fn implement_tool_call_with_done_true_in_patch_keeps_the_tool_call_and_strips_done() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {"done": true, "next": {"tool": "shell", "path": "cargo test", "what": "run it"}},
+        "action": {"type": "tool", "name": "shell", "args": {"cmd": "cargo test"}},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("must not be rejected");
+    let (patch, action, _) = step.into_parts();
+    assert!(
+        matches!(
+            action,
+            statie_core::Action::Tool { ref name, .. } if name == "shell"
+        ),
+        "expected the tool call to be kept unchanged, got {action:?}"
+    );
+    assert!(
+        !patch.next().done,
+        "done must have been stripped so it never commits"
     );
 }
 
@@ -785,6 +1224,38 @@ fn is_terminal_follows_done_flag() {
     assert!(!skill.is_terminal(&ws));
     ws.done = true;
     assert!(skill.is_terminal(&ws));
+}
+
+/// Only `review` can end the session (statie-spec.md §5/§10): `plan` hands
+/// off to `implement` via `next_skill`, it never finishes the task itself.
+/// `PlanSkill::is_terminal` is unconditionally `false`, even when `ws.done`
+/// is somehow `true` -- unlike `ReviewSkill::is_terminal` above, which
+/// tracks the flag.
+#[test]
+fn plan_is_terminal_is_always_false_even_when_done_is_true() {
+    let skill = PlanSkill::new();
+    let mut ws = CodingWorkspace::default();
+    assert!(!skill.is_terminal(&ws));
+    ws.done = true;
+    assert!(
+        !skill.is_terminal(&ws),
+        "plan must never be terminal, whatever ws.done says"
+    );
+}
+
+/// Same guarantee as `plan_is_terminal_is_always_false_even_when_done_is_true`,
+/// for `router`: it only ever hands off via `next_skill`, never finishes the
+/// task itself.
+#[test]
+fn router_is_terminal_is_always_false_even_when_done_is_true() {
+    let skill = RouterSkill::new();
+    let mut ws = CodingWorkspace::default();
+    assert!(!skill.is_terminal(&ws));
+    ws.done = true;
+    assert!(
+        !skill.is_terminal(&ws),
+        "router must never be terminal, whatever ws.done says"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1307,8 +1778,17 @@ fn re_delegating_overwrites_the_same_key_and_still_passes_rules() {
     );
 }
 
+/// `reports` is harness-owned (see `common_harness_owned_fields`), so a
+/// model patch touching it goes through `strip_harness_owned` inside each
+/// coding skill's `validate` override before `validate_default`'s owned-
+/// field check ever sees it: the key is dropped from the raw patch, a note
+/// is recorded, and the rest of the patch (here, the tool call) proceeds --
+/// the step is no longer rejected. Direct calls to `validate_default`/
+/// `rules` (bypassing the `validate` override) still see the raw owned-
+/// field rejection; that mechanism is exercised in `core/tests/
+/// parse_validate.rs` and is unchanged by this test.
 #[test]
-fn model_patch_adding_bogus_empty_report_is_rejected() {
+fn model_patch_adding_bogus_empty_report_is_stripped_and_noted() {
     let skill = ImplementSkill::new();
     let cur = committed(CodingWorkspace::default());
     let content = json!({
@@ -1334,26 +1814,31 @@ fn model_patch_adding_bogus_empty_report_is_rejected() {
         "action": {"type": "tool", "name": "list_files", "args": {}},
         "ack_inbox": []
     });
-    let err = parse_and_validate(&skill, &cur, content).unwrap_err();
-    match err {
-        PatchError::RuleViolation(msg) => {
-            assert!(
-                msg.contains("`reports`") && msg.contains("harness-owned"),
-                "expected the harness-owned rejection message: {msg}"
-            );
-        }
-        other => panic!("expected RuleViolation, got {other:?}"),
-    }
+    let step =
+        parse_and_validate(&skill, &cur, content).expect("patch should be kept, not rejected");
+    assert_eq!(
+        step.patch().next().reports.len(),
+        0,
+        "the bogus report must not land"
+    );
+    assert_eq!(
+        step.notes(),
+        &[
+            "`reports` is kept by the harness; that part of your patch was dropped and the rest \
+           was kept."
+                .to_string()
+        ]
+    );
 }
 
 #[test]
-fn model_patch_deleting_existing_report_is_rejected() {
+fn model_patch_deleting_existing_report_is_stripped_and_noted() {
     // `reports` is harness-owned (see `common_harness_owned_fields`), so a
     // model patch that removes an existing entry is caught by
-    // `validate_default`'s owned-field check, not by `rules` -- `rules` no
-    // longer inspects `reports` at all (see
-    // `absorbed_reports_pass_rules_directly_now_that_rules_does_not_inspect_reports`
-    // for the corresponding statement about the bare `rules` call).
+    // `strip_harness_owned` before `validate_default`'s owned-field check
+    // ever runs -- the whole `reports` key is dropped from the raw patch,
+    // leaving the committed reports untouched, rather than rejecting the
+    // step.
     let skill = ImplementSkill::new();
     let mut ws = CodingWorkspace::default();
     skill
@@ -1371,25 +1856,35 @@ fn model_patch_deleting_existing_report_is_rejected() {
         "action": {"type": "tool", "name": "list_files", "args": {}},
         "ack_inbox": []
     });
-    let err = parse_and_validate(&skill, &cur, content).unwrap_err();
-    match err {
-        PatchError::RuleViolation(msg) => {
-            assert!(
-                msg.contains("`reports`") && msg.contains("harness-owned"),
-                "expected the harness-owned rejection message: {msg}"
-            );
-        }
-        other => panic!("expected RuleViolation, got {other:?}"),
-    }
+    let step =
+        parse_and_validate(&skill, &cur, content).expect("patch should be kept, not rejected");
+    assert_eq!(
+        step.patch()
+            .next()
+            .reports
+            .get("ui-review")
+            .map(|r| r.summary.clone()),
+        Some(sample_report("ui-review").summary),
+        "the existing report must survive unchanged"
+    );
+    assert_eq!(
+        step.notes(),
+        &[
+            "`reports` is kept by the harness; that part of your patch was dropped and the rest \
+           was kept."
+                .to_string()
+        ]
+    );
 }
 
 #[test]
-fn model_patch_altering_existing_report_is_rejected() {
+fn model_patch_altering_existing_report_is_stripped_and_noted() {
     // Any change to `reports` -- fabricated, legitimate-looking, or a
-    // removal -- is rejected by the harness-owned-field check in
-    // `validate_default`, which compares committed vs. post-patch values
-    // rather than trying to distinguish "looks fabricated" from "looks
-    // real". Send a patch that overwrites the existing report's `summary`.
+    // removal -- is stripped from the raw patch by `strip_harness_owned`
+    // before `validate_default`'s owned-field check ever runs, rather than
+    // trying to distinguish "looks fabricated" from "looks real". Send a
+    // patch that overwrites the existing report's `summary` alongside an
+    // unrelated tool call.
     let skill = ImplementSkill::new();
     let mut ws = CodingWorkspace::default();
     skill
@@ -1420,16 +1915,25 @@ fn model_patch_altering_existing_report_is_rejected() {
         "action": {"type": "tool", "name": "list_files", "args": {}},
         "ack_inbox": []
     });
-    let err = parse_and_validate(&skill, &cur, content).unwrap_err();
-    match err {
-        PatchError::RuleViolation(msg) => {
-            assert!(
-                msg.contains("`reports`") && msg.contains("harness-owned"),
-                "expected the harness-owned rejection message: {msg}"
-            );
-        }
-        other => panic!("expected RuleViolation, got {other:?}"),
-    }
+    let step =
+        parse_and_validate(&skill, &cur, content).expect("patch should be kept, not rejected");
+    assert_eq!(
+        step.patch()
+            .next()
+            .reports
+            .get("ui-review")
+            .map(|r| r.summary.clone()),
+        Some(sample_report("ui-review").summary),
+        "the existing report must be left exactly as committed, not overwritten"
+    );
+    assert_eq!(
+        step.notes(),
+        &[
+            "`reports` is kept by the harness; that part of your patch was dropped and the rest \
+           was kept."
+                .to_string()
+        ]
+    );
 }
 
 #[test]
@@ -1585,5 +2089,465 @@ fn plan_skill_can_run_tests_as_its_instructions_say() {
             .tools()
             .iter()
             .any(|t| t == "shell" || t == "edit_file" || t == "write_file")
+    );
+}
+
+// =======================================================================
+// `seen` (milestone 10): range merge, output parsers, `seen_entry`
+// eviction, `common_after_tool`, and the harness-owned refusal.
+// =======================================================================
+
+#[test]
+fn merge_range_coalesces_adjacent_ranges() {
+    let mut r = vec![[1, 10]];
+    merge_range(&mut r, [11, 20]);
+    assert_eq!(r, vec![[1, 20]]);
+}
+
+#[test]
+fn merge_range_coalesces_overlapping_ranges() {
+    let mut r = vec![[1, 10]];
+    merge_range(&mut r, [5, 15]);
+    assert_eq!(r, vec![[1, 15]]);
+}
+
+#[test]
+fn merge_range_keeps_disjoint_ranges_separate() {
+    let mut r = vec![[1, 10]];
+    merge_range(&mut r, [20, 30]);
+    assert_eq!(r, vec![[1, 10], [20, 30]]);
+}
+
+#[test]
+fn merge_range_tolerates_unsorted_input_and_sorts_the_result() {
+    let mut r = vec![[20, 30], [1, 10]];
+    merge_range(&mut r, [11, 19]);
+    assert_eq!(r, vec![[1, 30]]);
+}
+
+#[test]
+fn merge_range_new_range_fully_inside_an_existing_one_is_a_noop() {
+    let mut r = vec![[1, 100]];
+    merge_range(&mut r, [40, 60]);
+    assert_eq!(r, vec![[1, 100]]);
+}
+
+#[test]
+fn parse_edit_header_reads_replaced_range() {
+    let text = "edited a.rs: replaced 1 occurrence (lines 10-12)\n   10 | x\n";
+    assert_eq!(parse_edit_header(text), Some([10, 12]));
+}
+
+#[test]
+fn parse_edit_header_reads_deleted_range() {
+    let text = "edited a.rs: deleted 3 line(s) (lines 5-7)\n";
+    assert_eq!(parse_edit_header(text), Some([5, 7]));
+}
+
+#[test]
+fn parse_edit_header_derives_range_for_insert_after() {
+    let text = "edited a.rs: inserted 2 line(s) after line 4\n";
+    // Two lines inserted right after line 4 land at 5-6.
+    assert_eq!(parse_edit_header(text), Some([5, 6]));
+}
+
+#[test]
+fn parse_edit_header_derives_range_for_insert_before() {
+    let text = "edited a.rs: inserted 1 line(s) before line 2\n";
+    // One line inserted right before line 2 lands at 1-1.
+    assert_eq!(parse_edit_header(text), Some([1, 1]));
+}
+
+#[test]
+fn parse_edit_header_tolerates_a_leading_note_prefix() {
+    let text = "note: matched anchor ignoring whitespace differences; edited a.rs: inserted 1 line(s) after line 4\n";
+    assert_eq!(parse_edit_header(text), Some([5, 5]));
+}
+
+#[test]
+fn parse_edit_header_rejects_unparsable_text() {
+    assert_eq!(parse_edit_header(""), None);
+    assert_eq!(
+        parse_edit_header("(tool `edit_file` returned no output)"),
+        None
+    );
+    assert_eq!(parse_edit_header("wrote 12 bytes to a.rs"), None);
+}
+
+#[test]
+fn parse_revert_lines_reads_the_line_count() {
+    let text = "reverted a.rs to its content from before this session's first edit (42 lines)";
+    assert_eq!(parse_revert_lines(text), Some(42));
+}
+
+#[test]
+fn parse_revert_lines_singular_line() {
+    let text = "reverted a.rs to its content from before this session's first edit (1 line)";
+    assert_eq!(parse_revert_lines(text), Some(1));
+}
+
+#[test]
+fn parse_revert_lines_none_for_the_removed_shape() {
+    let text = "removed a.rs; it did not exist before this session";
+    assert_eq!(parse_revert_lines(text), None);
+}
+
+#[test]
+fn count_lines_matches_str_lines_semantics() {
+    assert_eq!(count_lines(""), 0);
+    assert_eq!(count_lines("a\nb\nc\n"), 3);
+    assert_eq!(count_lines("a\nb\nc"), 3);
+    assert_eq!(count_lines("a\n\n"), 2);
+}
+
+#[test]
+fn seen_entry_evicts_the_smallest_step_when_full() {
+    let mut seen: Vec<SeenFile> = (0..12u64)
+        .map(|i| SeenFile {
+            path: format!("f{i}.rs"),
+            step: i,
+            ..Default::default()
+        })
+        .collect();
+    // f3.rs (step 3) is the smallest step.
+    seen[3].step = 0;
+    for (i, f) in seen.iter_mut().enumerate() {
+        if i != 3 {
+            f.step = (i as u64) + 10;
+        }
+    }
+    assert_eq!(seen.len(), 12);
+    let _ = seen_entry(&mut seen, "new.rs");
+    assert_eq!(seen.len(), 12, "cap must not be exceeded");
+    assert!(
+        !seen.iter().any(|f| f.path == "f3.rs"),
+        "the smallest-step entry should have been evicted: {seen:?}"
+    );
+    assert!(seen.iter().any(|f| f.path == "new.rs"));
+}
+
+#[test]
+fn seen_entry_reuses_an_existing_path_without_evicting() {
+    let mut seen: Vec<SeenFile> = (0..12u64)
+        .map(|i| SeenFile {
+            path: format!("f{i}.rs"),
+            step: i,
+            ..Default::default()
+        })
+        .collect();
+    let entry = seen_entry(&mut seen, "f5.rs");
+    entry.lines = 99;
+    assert_eq!(seen.len(), 12);
+    assert_eq!(
+        seen.iter().find(|f| f.path == "f5.rs").map(|f| f.lines),
+        Some(99)
+    );
+}
+
+#[test]
+fn after_tool_read_file_records_range_and_total() {
+    let ws = CodingWorkspace::default();
+    let output = "src/a.rs (250 lines, showing 1-100)\n";
+    let patch = common_after_tool(&ws, 7, "read_file", &json!({"path": "src/a.rs"}), output)
+        .expect("read_file should produce a seen patch");
+    assert_eq!(
+        patch,
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 100]], "edited": [], "step": 7}]})
+    );
+}
+
+#[test]
+fn after_tool_read_file_second_read_extends_the_range() {
+    let mut ws = CodingWorkspace::default();
+    ws.seen.push(SeenFile {
+        path: "src/a.rs".to_string(),
+        lines: 250,
+        read: vec![[1, 100]],
+        edited: vec![],
+        step: 7,
+    });
+    let output = "src/a.rs (250 lines, showing 101-200)\n";
+    let patch = common_after_tool(&ws, 9, "read_file", &json!({"path": "src/a.rs"}), output)
+        .expect("second read should produce a seen patch");
+    assert_eq!(
+        patch,
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 200]], "edited": [], "step": 9}]})
+    );
+}
+
+#[test]
+fn after_tool_edit_file_records_edited_range() {
+    let mut ws = CodingWorkspace::default();
+    ws.seen.push(SeenFile {
+        path: "src/a.rs".to_string(),
+        lines: 250,
+        read: vec![[1, 200]],
+        edited: vec![],
+        step: 9,
+    });
+    let output = "edited src/a.rs: replaced 1 occurrence (lines 150-156)\n";
+    let patch = common_after_tool(&ws, 10, "edit_file", &json!({"path": "src/a.rs"}), output)
+        .expect("edit_file should produce a seen patch");
+    assert_eq!(
+        patch,
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 200]], "edited": [[150, 156]], "step": 10}]})
+    );
+}
+
+#[test]
+fn after_tool_write_file_replaces_the_entry() {
+    let ws = CodingWorkspace::default();
+    let content = (1..=12)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let patch = common_after_tool(
+        &ws,
+        3,
+        "write_file",
+        &json!({"path": "new.rs", "content": content}),
+        "wrote 42 bytes to new.rs",
+    )
+    .expect("write_file should produce a seen patch");
+    assert_eq!(
+        patch,
+        json!({"seen": [{"path": "new.rs", "lines": 12, "read": [], "edited": [[1, 12]], "step": 3}]})
+    );
+}
+
+#[test]
+fn after_tool_revert_file_clears_both_ranges() {
+    let mut ws = CodingWorkspace::default();
+    ws.seen.push(SeenFile {
+        path: "src/a.rs".to_string(),
+        lines: 250,
+        read: vec![[1, 200]],
+        edited: vec![[150, 156]],
+        step: 10,
+    });
+    let output =
+        "reverted src/a.rs to its content from before this session's first edit (250 lines)";
+    let patch = common_after_tool(&ws, 11, "revert_file", &json!({"path": "src/a.rs"}), output)
+        .expect("revert_file should produce a seen patch");
+    assert_eq!(
+        patch,
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [], "edited": [], "step": 11}]})
+    );
+}
+
+#[test]
+fn after_tool_revert_file_removed_drops_the_entry() {
+    let mut ws = CodingWorkspace::default();
+    ws.seen.push(SeenFile {
+        path: "new.rs".to_string(),
+        lines: 12,
+        read: vec![],
+        edited: vec![[1, 12]],
+        step: 3,
+    });
+    let output = "removed new.rs; it did not exist before this session";
+    let patch = common_after_tool(&ws, 4, "revert_file", &json!({"path": "new.rs"}), output)
+        .expect("revert_file (removed) should still produce a seen patch");
+    assert_eq!(patch, json!({"seen": []}));
+}
+
+#[test]
+fn after_tool_other_tools_produce_no_patch() {
+    let ws = CodingWorkspace::default();
+    for name in [
+        "search",
+        "list_files",
+        "shell",
+        "test",
+        "recall",
+        "filter_last_tool_call",
+    ] {
+        assert_eq!(
+            common_after_tool(&ws, 1, name, &json!({}), "irrelevant output"),
+            None,
+            "tool `{name}` should never produce a seen patch"
+        );
+    }
+}
+
+#[test]
+fn model_patch_touching_seen_is_stripped_and_noted() {
+    let skill = ImplementSkill::new();
+    let mut cur_ws = CodingWorkspace::default();
+    cur_ws.seen.push(SeenFile {
+        path: "a.rs".to_string(),
+        lines: 10,
+        read: vec![[1, 10]],
+        edited: vec![],
+        step: 1,
+    });
+    let cur = committed(cur_ws.clone());
+    // A non-empty replacement (an empty-array patch to a keyed array is a
+    // structural no-op under `merge_keyed` -- see `patch/src/merge.rs` --
+    // so it wouldn't exercise the strip at all; a real attempt to rewrite
+    // the field must carry content, the same way the `reports` tests above
+    // use a real report object rather than `{}`).
+    let content = json!({
+        "patch": {"seen": [{"path": "b.rs", "lines": 1, "read": [], "edited": [], "step": 99}]},
+        "action": {"type": "tool", "name": "list_files", "args": {}},
+        "ack_inbox": []
+    });
+    let step =
+        parse_and_validate(&skill, &cur, content).expect("patch should be kept, not rejected");
+    assert_eq!(
+        step.patch().next().seen,
+        cur_ws.seen,
+        "`seen` must be left unchanged by the dropped patch"
+    );
+    assert_eq!(
+        step.notes(),
+        &[
+            "`seen` is kept by the harness; that part of your patch was dropped and the rest \
+           was kept."
+                .to_string()
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------
+// `has_named_handoff` (the self-handoff helper, `skills/src/coding/
+// mod.rs`): a stale `next_skill` left over from the handoff that landed
+// THIS activation (normally cleared by `Skill::on_activate`, but this
+// helper is the second line of defense) must not be misread as "a handoff
+// is already named" by a bare-done conversion like `implement_bare_done`.
+// ---------------------------------------------------------------------
+
+/// A merged workspace whose `next_skill` names a DIFFERENT skill is a real
+/// handoff: `true`, and the raw patch (if it carried `next_skill`) is left
+/// untouched.
+#[test]
+fn has_named_handoff_true_for_a_different_target() {
+    let merged = CodingWorkspace {
+        next_skill: Some("review".to_string()),
+        ..Default::default()
+    };
+    let content = json!({
+        "patch": {"next_skill": "review"},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let mut out =
+        ParsedOutput::<CodingWorkspace>::parse::<JsonMergePatch<CodingWorkspace>>(raw(0, content))
+            .unwrap();
+
+    assert!(has_named_handoff("implement", &merged, &mut out));
+    assert_eq!(
+        out.patch().0.get("next_skill").and_then(|v| v.as_str()),
+        Some("review"),
+        "a real handoff target must not be stripped from the raw patch"
+    );
+}
+
+/// A merged workspace with no `next_skill` at all: `false`, raw patch
+/// untouched (it has nothing to strip).
+#[test]
+fn has_named_handoff_false_for_none() {
+    let merged = CodingWorkspace::default();
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let mut out =
+        ParsedOutput::<CodingWorkspace>::parse::<JsonMergePatch<CodingWorkspace>>(raw(0, content))
+            .unwrap();
+
+    assert!(!has_named_handoff("implement", &merged, &mut out));
+    assert!(out.patch().0.get("next_skill").is_none());
+}
+
+/// A merged workspace whose `next_skill` names THIS skill itself (the stale
+/// self-handoff shape this helper exists for): `false`, and if the raw
+/// patch also carried that same self-referential value, it is stripped so
+/// the step doesn't commit it back.
+#[test]
+fn has_named_handoff_false_and_strips_a_stale_self_reference() {
+    let merged = CodingWorkspace {
+        next_skill: Some("implement".to_string()),
+        ..Default::default()
+    };
+    // The model's own patch this step didn't touch `next_skill` at all --
+    // the stale value is purely inherited from the committed workspace
+    // (the shape `Skill::on_activate` is meant to have already cleared).
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let mut out =
+        ParsedOutput::<CodingWorkspace>::parse::<JsonMergePatch<CodingWorkspace>>(raw(0, content))
+            .unwrap();
+
+    assert!(!has_named_handoff("implement", &merged, &mut out));
+    assert!(
+        out.patch().0.get("next_skill").is_none(),
+        "nothing to strip: the raw patch never carried next_skill"
+    );
+}
+
+/// Same self-referential case, but the raw patch itself also carries the
+/// stale value (e.g. the model echoed it back) -- it must be stripped so
+/// the step's commit doesn't write it again.
+#[test]
+fn has_named_handoff_strips_self_reference_carried_in_the_raw_patch() {
+    let merged = CodingWorkspace {
+        next_skill: Some("implement".to_string()),
+        ..Default::default()
+    };
+    let content = json!({
+        "patch": {"next_skill": "implement"},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let mut out =
+        ParsedOutput::<CodingWorkspace>::parse::<JsonMergePatch<CodingWorkspace>>(raw(0, content))
+            .unwrap();
+
+    assert!(!has_named_handoff("implement", &merged, &mut out));
+    assert!(
+        out.patch().0.get("next_skill").is_none(),
+        "the self-referential next_skill must be stripped from the raw patch"
+    );
+}
+
+/// End-to-end at the `implement_bare_done`/`ImplementSkill::validate` level
+/// (not just the helper in isolation): a bare `done` with verification
+/// green, plan complete, and a STALE self-referential `next_skill:
+/// "implement"` already committed in the workspace (the shape a missing
+/// `Skill::on_activate` clear would leave behind) must still be converted
+/// to the handoff to review -- not stood aside because `next_skill` looked
+/// "already set".
+#[test]
+fn implement_bare_done_with_stale_self_next_skill_still_hands_off_to_review() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 1,
+            text: "a".to_string(),
+            status: StepStatus::Done,
+        }],
+        // The stale value `on_activate` should have cleared.
+        next_skill: Some("implement".to_string()),
+        ..Default::default()
+    });
+    cur.harness.green_step = Some(0);
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("a stale self-handoff must not block the bare-done conversion");
+    assert!(matches!(step.action(), statie_core::Action::Done));
+    assert_eq!(
+        step.patch().next().next_skill.as_deref(),
+        Some("review"),
+        "must hand off to review, not stay stuck on the stale self-reference"
     );
 }

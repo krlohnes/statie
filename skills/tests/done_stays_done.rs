@@ -1,9 +1,24 @@
 //! `guards.done_stays_done` on/off pair for `plan_rules` (statie-spec.md
-//! "10. After it works: the rule audit", milestone 12): on (default), a
-//! plan step committed `done` may not regress back to `pending`/
-//! `in_progress` (`skills/src/coding/mod.rs`'s `plan_rules`); off (via
-//! `ImplementSkill::with_done_stays_done(false)`), the exact same regression
-//! is accepted and the step actually reopens in the committed workspace.
+//! "10. After it works: the rule audit", milestone 12): on, a plan step
+//! committed `done` may not regress back to `pending`/`in_progress`
+//! (`skills/src/coding/mod.rs`'s `plan_rules`); off, the exact same
+//! regression is accepted and the step actually reopens in the committed
+//! workspace.
+//!
+//! The two tests below drive the mechanism directly via
+//! `ImplementSkill::with_done_stays_done(true/false)`, independent of any
+//! config-level default. The individual skill constructors
+//! (`ImplementSkill::new()`/`Default`) still default their OWN
+//! `done_stays_done` field to `true` -- it is only the config-facing
+//! defaults (`Guards::default()`, `coding_skills()`/
+//! `coding_skills_with_delegates()`, `CodingRegistry::with_guards` with no
+//! configured `guards` section) that now default to `false`, since the
+//! first bench battery's audit showed the switch off no worse: the rule
+//! rejected the model twelve times over for moving its "run cargo test"
+//! plan step back to in-progress after an edit, until the retry cap parked
+//! it as a failure with the crate already green. See
+//! `coding_skills_default_is_done_stays_done_off` below for that
+//! config-facing default.
 //!
 //! Mirrors the `plan_rules` tests in `commitment_rules.rs`: a
 //! `Session<CodingWorkspace>` wired with the real file tools, a scripted
@@ -24,11 +39,11 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use statie_core::{
-    Budgets, Capabilities, Event, LogKind, MemoryLog, NullSink, Outcome, Park, RawOutput,
+    Budgets, Capabilities, Event, Guards, LogKind, MemoryLog, NullSink, Outcome, Park, RawOutput,
     SandboxRoot, Schema, Session, SessionConfig, SessionLog, SessionLogExt, StepSink,
 };
 use statie_models::{MockModel, MockTurn};
-use statie_skills::{CodingWorkspace, ImplementSkill, StepStatus};
+use statie_skills::{CodingWorkspace, ImplementSkill, StepStatus, coding_skills};
 use statie_store::InMemoryStore;
 use statie_tools::{ToolConfig, default_tools};
 
@@ -217,5 +232,79 @@ async fn guard_off_allows_reopening_a_done_step() {
         plan.iter().find(|(id, _)| *id == 1).map(|(_, s)| *s),
         Some(StepStatus::InProgress),
         "step 1 must actually have reopened to in_progress in the committed workspace: {plan:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Config-facing default: `Guards::default().done_stays_done` is `false`,
+// and `coding_skills()` (which threads that same default through
+// `coding_skills_configured`) accepts the reopen out of the box, with no
+// explicit `with_done_stays_done` call at all -- this is what a fresh CLI
+// config (no `guards` section) actually runs with as of the first bench
+// battery's audit.
+// ---------------------------------------------------------------------
+
+#[test]
+fn guards_default_has_done_stays_done_off() {
+    assert!(
+        !Guards::default().done_stays_done,
+        "done_stays_done must default to false, unlike every other guard"
+    );
+}
+
+#[tokio::test]
+async fn coding_skills_default_accepts_reopening_a_done_step() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![
+        set_plan_turn(json!([
+            {"id": 1, "status": "done", "text": "first"},
+            {"id": 2, "status": "pending", "text": "second"},
+        ])),
+        set_plan_turn(json!([
+            {"id": 1, "status": "in_progress", "text": "first"},
+            {"id": 2, "status": "pending", "text": "second"},
+        ])),
+    ];
+    let model = Arc::new(MockModel::new(turns.clone()));
+    let cfg = config(&root);
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), cfg);
+
+    let implement = coding_skills()
+        .into_iter()
+        .find(|(name, _)| name == "implement")
+        .map(|(_, skill)| skill)
+        .expect("coding_skills() must include implement");
+    let mut active = session.activate(implement).await.unwrap();
+
+    for _ in &turns {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        let outcome = log.append_record(rec).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Continue | Outcome::Parked(Park::AskUser(_))
+            ),
+            "got {outcome:?}"
+        );
+    }
+
+    assert_eq!(
+        last_rejection_reason(&log),
+        "",
+        "coding_skills()'s default must accept the reopen with no rejection at all"
+    );
+
+    let (state, _version) = active.session().state().await.unwrap();
+    let step1_status = state
+        .agent
+        .plan
+        .iter()
+        .find(|s| s.id == 1)
+        .map(|s| s.status);
+    assert_eq!(
+        step1_status,
+        Some(StepStatus::InProgress),
+        "step 1 must actually have reopened under coding_skills()'s default"
     );
 }

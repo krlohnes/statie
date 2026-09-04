@@ -66,10 +66,27 @@ impl Tool for FilterLastToolCall {
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .min(HARD_MAX_RESULTS);
 
-        let regex = RegexBuilder::new(&args.pattern)
+        // If `pattern` doesn't compile as a regex, the model likely passed a
+        // literal snippet (e.g. a chunk of source containing regex
+        // metacharacters). Fall back to matching it literally instead of
+        // erroring, so the model doesn't have to figure out how to escape
+        // it. A literal containing escaped `\n` sequences is unescaped to
+        // real newlines first, so a multi-line snippet can still be found
+        // even though matching is otherwise per line (see `line_span_matches`).
+        let (regex, literal_fallback) = match RegexBuilder::new(&args.pattern)
             .case_insensitive(case_insensitive)
             .build()
-            .map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+        {
+            Ok(regex) => (regex, false),
+            Err(_) => {
+                let literal = args.pattern.replace("\\n", "\n");
+                let regex = RegexBuilder::new(&regex::escape(&literal))
+                    .case_insensitive(case_insensitive)
+                    .build()
+                    .map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+                (regex, true)
+            }
+        };
 
         let recent = ctx.log.entries(Some(LogKind::ToolOutput), LOOKBACK);
         let target = recent.iter().rev().find(|e| {
@@ -97,13 +114,23 @@ impl Tool for FilterLastToolCall {
         let lines: Vec<&str> = output.lines().collect();
         let total = lines.len();
 
-        // Which line indices (0-based) are matches.
-        let match_idxs: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| regex.is_match(l))
-            .map(|(i, _)| i)
-            .collect();
+        // Which line indices (0-based) are matches. Ordinarily this matches
+        // line-by-line (the whole tool works one line at a time). But the
+        // literal fallback's pattern may itself contain real newlines (from
+        // unescaping `\n`), which can never match within a single output
+        // line — so in that case the whole output text is searched instead,
+        // and every line the match spans is recorded, so a multi-line
+        // snippet can still be found.
+        let match_idxs: Vec<usize> = if regex.as_str().contains('\n') {
+            line_span_matches(&regex, output)
+        } else {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| regex.is_match(l))
+                .map(|(i, _)| i)
+                .collect()
+        };
 
         if match_idxs.is_empty() {
             let out = format!(
@@ -172,8 +199,54 @@ impl Tool for FilterLastToolCall {
             ));
         }
 
+        if literal_fallback {
+            out = format!("note: pattern was not a valid regex; matched it literally\n{out}");
+        }
+
         Ok(ToolOutputFull::new(cap_output(out, self.max_output_bytes)))
     }
+}
+
+/// Finds every byte-offset match of `regex` in the whole `text` (used for
+/// literal fallback patterns that themselves contain newlines, which can
+/// never match within a single output line) and returns the 0-based line
+/// indices each match spans, in ascending order with duplicates removed.
+fn line_span_matches(regex: &regex::Regex, text: &str) -> Vec<usize> {
+    // Byte offset each line starts at, so a match's byte range can be
+    // mapped back to the line indices it covers.
+    let mut line_starts: Vec<usize> = Vec::new();
+    let mut offset = 0usize;
+    for line in text.lines() {
+        line_starts.push(offset);
+        offset += line.len();
+        // `str::lines` splits on `\n` (and trims a trailing `\r`), so
+        // account for the newline byte itself when it's actually there.
+        if text[offset..].starts_with("\r\n") {
+            offset += 2;
+        } else if text[offset..].starts_with('\n') {
+            offset += 1;
+        }
+    }
+
+    let mut idxs: Vec<usize> = Vec::new();
+    for m in regex.find_iter(text) {
+        let start_line = line_starts
+            .partition_point(|&s| s <= m.start())
+            .saturating_sub(1);
+        let end_line = if m.end() == m.start() {
+            start_line
+        } else {
+            line_starts
+                .partition_point(|&s| s < m.end())
+                .saturating_sub(1)
+        };
+        for l in start_line..=end_line {
+            idxs.push(l);
+        }
+    }
+    idxs.sort_unstable();
+    idxs.dedup();
+    idxs
 }
 
 /// Cuts `line` to at most `MAX_LINE_CHARS` chars, appending `…` if cut.

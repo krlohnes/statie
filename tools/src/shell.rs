@@ -6,11 +6,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use statie_core::{Schema, Tool, ToolCtx, ToolError, ToolOutputFull};
 
-use crate::common::{cap_output, run_shell};
+use crate::common::{cap_output, join_string_array_args, run_shell};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShellArgs {
     /// The shell command to run (executed via `sh -c` / `cmd /C`).
+    #[serde(alias = "command")]
     pub cmd: String,
     /// Timeout in seconds. Defaults to the tool's configured shell timeout.
     pub timeout_secs: Option<u64>,
@@ -38,7 +39,8 @@ impl Tool for Shell {
         Schema::of::<ShellArgs>()
     }
 
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutputFull, ToolError> {
+    async fn call(&self, mut args: Value, ctx: &ToolCtx) -> Result<ToolOutputFull, ToolError> {
+        join_string_array_args(&mut args, &["cmd"]);
         let args: ShellArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
 

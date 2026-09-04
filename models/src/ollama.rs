@@ -37,6 +37,18 @@ pub struct OllamaConfig {
     /// harness pastes the schema into the system prompt). `None` derives it
     /// from `format` (`Schema` → true, otherwise false).
     pub schema_constrained: Option<bool>,
+    /// Number of retries after a 5xx response or a transport-level failure
+    /// (connection reset/refused, or an EOF mid-stream that isn't the
+    /// configured timeout). Live Ollama runners sometimes crash and restart
+    /// within seconds (observed: `llama-server process has terminated` /
+    /// `model runner has unexpectedly stopped`), so a short retry keeps the
+    /// run alive instead of parking it on the first transient 500. Not
+    /// retried: 4xx responses, a parse error on an otherwise-successful
+    /// response, and the configured request timeout.
+    pub retries_on_5xx: u32,
+    /// Delay between retries, in seconds. Cancellation aborts the wait
+    /// immediately.
+    pub retry_delay_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +78,8 @@ impl Default for OllamaConfig {
             timeout_secs: 600,
             format: OllamaFormat::Json,
             schema_constrained: None,
+            retries_on_5xx: 2,
+            retry_delay_secs: 15,
         }
     }
 }
@@ -167,7 +181,7 @@ impl Model for OllamaModel {
         tracing::trace!(body = %request_text, "ollama request body");
 
         tokio::select! {
-            result = self.run_request(&body, sink) => result,
+            result = self.run_request_with_retries(&body, sink, &cancel) => result,
             _ = cancel.cancelled() => Err(ModelError::Cancelled),
         }
         .map(|(reasoning_native, content, usage, finish_reason)| {
@@ -192,19 +206,77 @@ impl Model for OllamaModel {
     }
 }
 
+/// A `ModelError` tagged with whether it's worth retrying: a 5xx response,
+/// or a transport-level failure (connection reset/refused, or an EOF
+/// mid-stream) that isn't the configured request timeout. 4xx responses,
+/// NDJSON parse errors on an otherwise-successful response, and timeouts are
+/// never retried.
+struct RunError {
+    err: ModelError,
+    retryable: bool,
+}
+
+impl RunError {
+    fn fatal(err: ModelError) -> Self {
+        RunError {
+            err,
+            retryable: false,
+        }
+    }
+}
+
 impl OllamaModel {
+    /// Runs `run_request`, retrying up to `cfg.retries_on_5xx` times (with
+    /// `cfg.retry_delay_secs` between attempts) when the failure is
+    /// retryable. Reports each retry via `tracing::warn!` (no `StepSink`
+    /// hook fits a generic backend-retry notice). `cancel` aborts the wait
+    /// between attempts immediately.
+    async fn run_request_with_retries(
+        &self,
+        body: &Value,
+        sink: &mut dyn StepSink,
+        cancel: &CancellationToken,
+    ) -> Result<(Option<Reasoning>, String, Option<Usage>, Option<String>), ModelError> {
+        let mut attempt = 0u32;
+        loop {
+            match self.run_request(body, sink).await {
+                Ok(out) => return Ok(out),
+                Err(run_err) if run_err.retryable && attempt < self.cfg.retries_on_5xx => {
+                    attempt += 1;
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = self.cfg.retries_on_5xx,
+                        delay_secs = self.cfg.retry_delay_secs,
+                        error = %run_err.err,
+                        "ollama backend error, retrying"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(self.cfg.retry_delay_secs)) => {}
+                        _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                    }
+                }
+                Err(run_err) => return Err(run_err.err),
+            }
+        }
+    }
+
     async fn run_request(
         &self,
         body: &Value,
         sink: &mut dyn StepSink,
-    ) -> Result<(Option<Reasoning>, String, Option<Usage>, Option<String>), ModelError> {
-        let response = self
-            .client
-            .post(self.chat_url())
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| ModelError::Io(e.to_string()))?;
+    ) -> Result<(Option<Reasoning>, String, Option<Usage>, Option<String>), RunError> {
+        let response = self.client.post(self.chat_url()).json(body).send().await;
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                let retryable =
+                    !e.is_timeout() && (e.is_connect() || e.is_body() || e.is_request());
+                return Err(RunError {
+                    err: ModelError::Io(e.to_string()),
+                    retryable,
+                });
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -212,7 +284,10 @@ impl OllamaModel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
-            return Err(ModelError::Backend(format!("{status}: {text}")));
+            return Err(RunError {
+                err: ModelError::Backend(format!("{status}: {text}")),
+                retryable: status.is_server_error(),
+            });
         }
 
         let mut reasoning_buf = String::new();
@@ -221,7 +296,16 @@ impl OllamaModel {
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| ModelError::Io(e.to_string()))?;
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    let retryable = !e.is_timeout() && (e.is_connect() || e.is_body());
+                    return Err(RunError {
+                        err: ModelError::Io(e.to_string()),
+                        retryable,
+                    });
+                }
+            };
             let text = String::from_utf8_lossy(&chunk);
             line_buf.push_str(&text);
 
@@ -234,15 +318,17 @@ impl OllamaModel {
                 if line.is_empty() {
                     continue;
                 }
-                if let Some((usage, finish_reason)) =
-                    process_line(line, &mut reasoning_buf, &mut content_buf, sink)?
-                {
-                    return Ok((
-                        (!reasoning_buf.is_empty()).then(|| Reasoning::new(reasoning_buf)),
-                        content_buf,
-                        usage,
-                        finish_reason,
-                    ));
+                match process_line(line, &mut reasoning_buf, &mut content_buf, sink) {
+                    Ok(Some((usage, finish_reason))) => {
+                        return Ok((
+                            (!reasoning_buf.is_empty()).then(|| Reasoning::new(reasoning_buf)),
+                            content_buf,
+                            usage,
+                            finish_reason,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(RunError::fatal(e)),
                 }
             }
         }
@@ -250,7 +336,8 @@ impl OllamaModel {
         // Stream ended without a trailing newline on the final line.
         let remainder = line_buf.trim();
         if !remainder.is_empty() {
-            process_line(remainder, &mut reasoning_buf, &mut content_buf, sink)?;
+            process_line(remainder, &mut reasoning_buf, &mut content_buf, sink)
+                .map_err(RunError::fatal)?;
         }
 
         Ok((

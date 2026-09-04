@@ -39,6 +39,10 @@ pub struct RunOptions {
     /// driver never overrides `initial_skill` with the stored activation on
     /// resume, even though the replay still happens.
     pub skill_explicit: bool,
+    /// Operator patches (`--patch`, repeatable) applied in order via
+    /// `Active::apply_user_patch` before the first step, after resume
+    /// replay (if any) but before `initial_messages` are drained.
+    pub patches: Vec<serde_json::Value>,
 }
 
 impl Default for RunOptions {
@@ -50,6 +54,7 @@ impl Default for RunOptions {
             banner: Vec::new(),
             resume: false,
             replay_entries: 40,
+            patches: Vec::new(),
             skill_explicit: false,
         }
     }

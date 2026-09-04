@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use statie_core::{Schema, Tool, ToolCtx, ToolError, ToolOutputFull};
 
-use crate::common::cap_output;
+use crate::common::{cap_output, join_string_array_args};
 
 pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -23,6 +23,7 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesArgs {
     /// Directory to list, relative to the sandbox root. Defaults to ".".
+    #[serde(alias = "file", alias = "file_path")]
     pub path: Option<String>,
     /// Maximum number of entries to return. Defaults to 200.
     pub max: Option<usize>,
@@ -49,7 +50,8 @@ impl Tool for ListFiles {
         Schema::of::<ListFilesArgs>()
     }
 
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutputFull, ToolError> {
+    async fn call(&self, mut args: Value, ctx: &ToolCtx) -> Result<ToolOutputFull, ToolError> {
+        join_string_array_args(&mut args, &["path"]);
         let args: ListFilesArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
 

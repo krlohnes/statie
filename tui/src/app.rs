@@ -222,6 +222,18 @@ impl AppState {
                 self.step_started = None;
                 self.push(HistoryItem::Error(text));
             }
+            UiEvent::Maintainer {
+                notes_tokens,
+                next_set,
+            } => {
+                let suffix = if next_set { ", set next" } else { "" };
+                self.push(HistoryItem::Info(format!(
+                    "[maintainer] notes: {notes_tokens} tokens{suffix}"
+                )));
+            }
+            UiEvent::MaintainerError(reason) => {
+                self.push(HistoryItem::Info(format!("[maintainer error] {reason}")));
+            }
             UiEvent::Quit => {}
         }
     }
@@ -491,6 +503,13 @@ fn history_item_for_entry(e: &statie_core::LogEntry) -> HistoryItem {
                         serde_json::to_string(&args).unwrap_or_default()
                     )
                 }
+                // `Action::Continue` (harness-internal, see
+                // `core/src/model.rs`'s doc on the variant): show the note
+                // instead of the bare tag, the same as `render_entry_line`.
+                Some("continue") => {
+                    let note = e.payload.get("note").and_then(Value::as_str).unwrap_or("");
+                    format!("continued: {note}")
+                }
                 Some(other) => other.to_string(),
                 None => serde_json::to_string(&e.payload).unwrap_or_default(),
             };
@@ -662,6 +681,9 @@ async fn handle_input_line(line: &str, cmd_tx: &mpsc::Sender<DriverCmd>, state: 
         }
         Some(Command::Edit(v)) => {
             let _ = cmd_tx.send(DriverCmd::Edit(v)).await;
+        }
+        Some(Command::Patch(v)) => {
+            let _ = cmd_tx.send(DriverCmd::Patch(v)).await;
         }
         Some(Command::Help) => {
             state.push(HistoryItem::Info(help_text()));

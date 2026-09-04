@@ -21,6 +21,7 @@ use statie_tui::{HeadlessSummary, RunOptions, SkillRegistry};
 
 use crate::coding::CodingRegistry;
 use crate::config::Config;
+use crate::metrics::{LogMetrics, log_metrics};
 use crate::toy::{ToyRegistry, toy_tool_set};
 
 /// A huge budget standing in for "unbounded" -- big enough that the mock
@@ -33,7 +34,11 @@ const UNBOUNDED_BUDGET: usize = 1_000_000;
 /// are the backend's own reported counts (Ollama's `prompt_eval_count`/
 /// `eval_count`, or an OpenAI-compatible server's `usage`), present only for
 /// model calls that reported them (empty for the `mock` backend unless the
-/// script attaches usage).
+/// script attaches usage). `log` (non-progress and maintenance metrics --
+/// rejections, tool errors, edits landed, green-checkpoint/redundant-guard
+/// activity) is computed by [`crate::metrics::log_metrics`], shared with
+/// `statie metrics` so both agree on what counts as a "committed step" /
+/// "landed edit".
 #[derive(Debug, Clone, serde::Serialize)]
 struct HarnessMetrics {
     steps: usize,
@@ -50,10 +55,11 @@ struct HarnessMetrics {
     /// `last - first` server-reported prompt token count; 0 for an empty or
     /// flat series.
     server_growth: i64,
+    log: LogMetrics,
 }
 
 impl HarnessMetrics {
-    fn from_summary(summary: &HeadlessSummary, success: bool) -> Self {
+    fn from_summary(summary: &HeadlessSummary, success: bool, log: &dyn SessionLog) -> Self {
         let prompt_tokens = summary.prompt_tokens.clone();
         let total_prompt_tokens: usize = prompt_tokens.iter().sum();
         let max_prompt_tokens = prompt_tokens.iter().copied().max().unwrap_or(0);
@@ -83,6 +89,7 @@ impl HarnessMetrics {
             server_max_prompt_tokens,
             server_total_completion_tokens,
             server_growth,
+            log: log_metrics(log),
         }
     }
 }
@@ -127,6 +134,29 @@ pub async fn cmd_eval(
     Ok(())
 }
 
+/// `landed/attempted`, e.g. `1/2`.
+fn format_edits(log: &LogMetrics) -> String {
+    format!("{}/{}", log.edits_landed, log.edits_attempted)
+}
+
+/// The 1-based ordinal of the first landed edit's model step, or `-` when
+/// no edit landed.
+fn format_first_edit(log: &LogMetrics) -> String {
+    match log.steps_to_first_edit {
+        Some(n) => n.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// `runs/errors`, or `-` when both are 0 (the maintainer never ran).
+fn format_maint(log: &LogMetrics) -> String {
+    if log.maintainer_runs == 0 && log.maintainer_errors == 0 {
+        "-".to_string()
+    } else {
+        format!("{}/{}", log.maintainer_runs, log.maintainer_errors)
+    }
+}
+
 /// `est_*` columns are the local cl100k (`TiktokenTokenizer`) estimate;
 /// `srv_*` columns are the backend's own reported token counts (Ollama's
 /// `prompt_eval_count`/`eval_count`, or an OpenAI-compatible server's
@@ -135,7 +165,7 @@ pub async fn cmd_eval(
 /// `model.num_ctx`.
 fn print_table(result: &EvalResult) {
     println!(
-        "{:<10} {:>6} {:>8} {:>10} {:>8} {:>11} {:>9} {:>8} {:>11} {:>15}",
+        "{:<10} {:>6} {:>8} {:>10} {:>8} {:>11} {:>9} {:>8} {:>11} {:>15} {:>5} {:>9} {:>9} {:>10} {:>9} {:>9} {:>7} {:>11} {:>7} {:>10}",
         "harness",
         "steps",
         "success",
@@ -145,7 +175,17 @@ fn print_table(result: &EvalResult) {
         "srv_total",
         "srv_max",
         "srv_growth",
-        "srv_completion"
+        "srv_completion",
+        "rej",
+        "tool_err",
+        "edits",
+        "first_edit",
+        "maint",
+        "skipped",
+        "paged",
+        "continued",
+        "green",
+        "restored"
     );
     for (name, m) in [("statie", &result.statie), ("baseline", &result.baseline)] {
         let has_server = !m.server_prompt_tokens.is_empty();
@@ -170,7 +210,7 @@ fn print_table(result: &EvalResult) {
             "-".to_string()
         };
         println!(
-            "{:<10} {:>6} {:>8} {:>10} {:>8} {:>11} {:>9} {:>8} {:>11} {:>15}",
+            "{:<10} {:>6} {:>8} {:>10} {:>8} {:>11} {:>9} {:>8} {:>11} {:>15} {:>5} {:>9} {:>9} {:>10} {:>9} {:>9} {:>7} {:>11} {:>7} {:>10}",
             name,
             m.steps,
             m.success,
@@ -181,6 +221,16 @@ fn print_table(result: &EvalResult) {
             srv_max,
             srv_growth,
             srv_completion,
+            m.log.rejections,
+            m.log.tool_errors,
+            format_edits(&m.log),
+            format_first_edit(&m.log),
+            format_maint(&m.log),
+            m.log.skipped_redundant,
+            m.log.paged_reads,
+            m.log.continued,
+            m.log.green_checkpoints,
+            m.log.restored_green,
         );
     }
 }
@@ -207,7 +257,7 @@ fn fresh_sandbox() -> anyhow::Result<(tempfile::TempDir, SandboxRoot)> {
 /// bounded-workspace prompt shape, not BM25 retrieval quality).
 fn statie_session_config(cfg: &Config, root: SandboxRoot) -> SessionConfig {
     SessionConfig {
-        budgets: cfg.budget.into(),
+        budgets: cfg.effective_budgets(),
         retries: cfg.retries,
         root,
     }
@@ -233,14 +283,19 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
     let model_a = cfg.build_model()?;
     let tools_a = toy_tool_set();
     let log_a: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
-    let session_a = Session::new(
+    let mut session_a = Session::new(
         cfg.build_memory_store::<ToyWorkspace>(),
         Arc::clone(&log_a),
-        model_a,
+        model_a.into(),
         tools_a,
         Box::new(TiktokenTokenizer),
         statie_session_config(cfg, root_a),
     );
+    if let Some(m) = cfg.build_maintainer()? {
+        session_a = session_a.with_maintainer(m);
+    }
+    session_a = session_a.with_working_set(cfg.working_set.into());
+    session_a = session_a.with_guards(cfg.guards);
     let registry_a: Arc<dyn SkillRegistry<ToyWorkspace>> = Arc::new(ToyRegistry::new(steps));
     let opts_a = RunOptions {
         initial_skill: "toy".to_string(),
@@ -250,6 +305,7 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
         resume: false,
         replay_entries: 40,
         skill_explicit: false,
+        patches: Vec::new(),
     };
     let mut sink_a = transcript_sink(verbose);
     let summary_a = statie_tui::run_headless(session_a, registry_a, opts_a, &mut sink_a).await?;
@@ -270,7 +326,7 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
     let mut session_b = Session::new(
         cfg.build_memory_store::<ToyWorkspace>(),
         Arc::clone(&log_b),
-        model_b,
+        model_b.into(),
         tools_b,
         Box::new(TiktokenTokenizer),
         baseline_session_config(cfg, root_b),
@@ -279,6 +335,7 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
         Box::new(TranscriptAugmenter::new(Arc::clone(&log_b))),
         TokenBudget(UNBOUNDED_BUDGET),
     );
+    session_b = session_b.with_guards(cfg.guards);
     let registry_b: Arc<dyn SkillRegistry<ToyWorkspace>> = Arc::new(ToyRegistry::new(steps));
     let opts_b = RunOptions {
         initial_skill: "toy".to_string(),
@@ -288,6 +345,7 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
         resume: false,
         replay_entries: 40,
         skill_explicit: false,
+        patches: Vec::new(),
     };
     let mut sink_b = transcript_sink(verbose);
     let summary_b = statie_tui::run_headless(session_b, registry_b, opts_b, &mut sink_b).await?;
@@ -301,8 +359,8 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
     };
 
     Ok(EvalResult {
-        statie: HarnessMetrics::from_summary(&summary_a, success_a),
-        baseline: HarnessMetrics::from_summary(&summary_b, success_b),
+        statie: HarnessMetrics::from_summary(&summary_a, success_a, log_a.as_ref()),
+        baseline: HarnessMetrics::from_summary(&summary_b, success_b, log_b.as_ref()),
     })
 }
 
@@ -325,16 +383,21 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
     let model_a = cfg.build_model()?;
     let tools_a = statie_tools::default_tools(&cfg.tools);
     let log_a: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
-    let session_a = Session::new(
+    let mut session_a = Session::new(
         cfg.build_memory_store::<statie_skills::CodingWorkspace>(),
         Arc::clone(&log_a),
-        model_a,
+        model_a.into(),
         tools_a,
         Box::new(TiktokenTokenizer),
         statie_session_config(cfg, root_a),
     );
+    if let Some(m) = cfg.build_maintainer()? {
+        session_a = session_a.with_maintainer(m);
+    }
+    session_a = session_a.with_working_set(cfg.working_set.into());
+    session_a = session_a.with_guards(cfg.guards);
     let registry_a: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> =
-        Arc::new(CodingRegistry::new());
+        Arc::new(CodingRegistry::with_guards(cfg.guards));
     let opts_a = RunOptions {
         initial_skill: "router".to_string(),
         initial_messages: vec![CODING_TASK_MESSAGE.to_string()],
@@ -343,6 +406,7 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
         resume: false,
         replay_entries: 40,
         skill_explicit: false,
+        patches: Vec::new(),
     };
     let mut sink_a = transcript_sink(verbose);
     let summary_a = statie_tui::run_headless(session_a, registry_a, opts_a, &mut sink_a).await?;
@@ -356,7 +420,7 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
     let mut session_b = Session::new(
         cfg.build_memory_store::<statie_skills::CodingWorkspace>(),
         Arc::clone(&log_b),
-        model_b,
+        model_b.into(),
         tools_b,
         Box::new(TiktokenTokenizer),
         baseline_session_config(cfg, root_b),
@@ -365,8 +429,9 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
         Box::new(TranscriptAugmenter::new(Arc::clone(&log_b))),
         TokenBudget(UNBOUNDED_BUDGET),
     );
+    session_b = session_b.with_guards(cfg.guards);
     let registry_b: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> =
-        Arc::new(CodingRegistry::new());
+        Arc::new(CodingRegistry::with_guards(cfg.guards));
     let opts_b = RunOptions {
         initial_skill: "router".to_string(),
         initial_messages: vec![CODING_TASK_MESSAGE.to_string()],
@@ -375,13 +440,145 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
         resume: false,
         replay_entries: 40,
         skill_explicit: false,
+        patches: Vec::new(),
     };
     let mut sink_b = transcript_sink(verbose);
     let summary_b = statie_tui::run_headless(session_b, registry_b, opts_b, &mut sink_b).await?;
     let success_b = coding_success(dir_b.path(), &summary_b.final_outcome);
 
     Ok(EvalResult {
-        statie: HarnessMetrics::from_summary(&summary_a, success_a),
-        baseline: HarnessMetrics::from_summary(&summary_b, success_b),
+        statie: HarnessMetrics::from_summary(&summary_a, success_a, log_a.as_ref()),
+        baseline: HarnessMetrics::from_summary(&summary_b, success_b, log_b.as_ref()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use statie_core::{LogEntry, LogKind, MemoryLog, SessionLog};
+
+    use super::*;
+
+    fn action(step: u64, name: &str) -> LogEntry {
+        LogEntry {
+            step,
+            kind: LogKind::Action,
+            ts: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({"type": "tool", "name": name, "args": {}}),
+            agent: None,
+        }
+    }
+
+    fn system(step: u64, event: &str) -> LogEntry {
+        LogEntry {
+            step,
+            kind: LogKind::System,
+            ts: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({"event": event}),
+            agent: None,
+        }
+    }
+
+    /// Two reads, one rejected step, one edit that errors at step 4, one
+    /// edit that lands at step 6, a maintainer run and a maintainer error.
+    fn build_scenario_log() -> MemoryLog {
+        let log = MemoryLog::new();
+
+        // Step 1: a read.
+        log.append(action(1, "read_file")).unwrap();
+
+        // Step 2: another read.
+        log.append(action(2, "read_file")).unwrap();
+
+        // Step 3: a rejected step -- no Action entry is committed for a
+        // rejection, only the System "rejected" entry.
+        log.append(system(3, "rejected")).unwrap();
+
+        // Step 4: an edit that errors.
+        log.append(action(4, "edit_file")).unwrap();
+        log.append(system(4, "tool_error")).unwrap();
+
+        // Step 5: a maintainer run and a maintainer error (both can be
+        // logged against the same step; they are independent counters).
+        log.append(system(5, "maintainer")).unwrap();
+        log.append(system(5, "maintainer_error")).unwrap();
+
+        // Step 6: an edit that lands (no tool_error at this step).
+        log.append(action(6, "write_file")).unwrap();
+
+        log
+    }
+
+    #[test]
+    fn log_metrics_scenario() {
+        let log = build_scenario_log();
+        let m = log_metrics(&log);
+
+        assert_eq!(m.rejections, 1);
+        assert_eq!(m.tool_errors, 1);
+        assert_eq!(m.edits_attempted, 2);
+        assert_eq!(m.edits_landed, 1);
+        // Distinct Action steps in order: 1, 2, 4, 6 -- step 6 is the 4th.
+        assert_eq!(m.steps_to_first_edit, Some(4));
+        assert_eq!(m.maintainer_runs, 1);
+        assert_eq!(m.maintainer_errors, 1);
+    }
+
+    #[test]
+    fn log_metrics_empty_log_is_all_zeros() {
+        let log = MemoryLog::new();
+        let m = log_metrics(&log);
+
+        assert_eq!(m, LogMetrics::default());
+        assert_eq!(m.rejections, 0);
+        assert_eq!(m.tool_errors, 0);
+        assert_eq!(m.edits_attempted, 0);
+        assert_eq!(m.edits_landed, 0);
+        assert_eq!(m.steps_to_first_edit, None);
+        assert_eq!(m.maintainer_runs, 0);
+        assert_eq!(m.maintainer_errors, 0);
+    }
+
+    #[test]
+    fn format_edits_shows_landed_over_attempted() {
+        let m = LogMetrics {
+            edits_landed: 1,
+            edits_attempted: 2,
+            ..Default::default()
+        };
+        assert_eq!(format_edits(&m), "1/2");
+
+        let none = LogMetrics::default();
+        assert_eq!(format_edits(&none), "0/0");
+    }
+
+    #[test]
+    fn format_first_edit_dash_when_none() {
+        let none = LogMetrics::default();
+        assert_eq!(format_first_edit(&none), "-");
+
+        let some = LogMetrics {
+            steps_to_first_edit: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(format_first_edit(&some), "4");
+    }
+
+    #[test]
+    fn format_maint_dash_when_both_zero() {
+        let none = LogMetrics::default();
+        assert_eq!(format_maint(&none), "-");
+
+        let runs_only = LogMetrics {
+            maintainer_runs: 2,
+            ..Default::default()
+        };
+        assert_eq!(format_maint(&runs_only), "2/0");
+
+        let both = LogMetrics {
+            maintainer_runs: 1,
+            maintainer_errors: 1,
+            ..Default::default()
+        };
+        assert_eq!(format_maint(&both), "1/1");
+    }
 }

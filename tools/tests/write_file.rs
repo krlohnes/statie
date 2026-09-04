@@ -11,9 +11,7 @@ fn write_tool() -> WriteFile {
 }
 
 fn read_tool() -> ReadFile {
-    ReadFile {
-        max_output_bytes: 200_000,
-    }
+    ReadFile::new(200_000)
 }
 
 #[tokio::test]
@@ -67,4 +65,70 @@ async fn parent_dir_escape_rejected() {
         .unwrap_err();
 
     assert!(matches!(err, ToolError::Sandbox(_)), "got: {err:?}");
+}
+
+fn lines(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+#[tokio::test]
+async fn rewriting_large_existing_file_is_rejected_and_leaves_it_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("big.txt");
+    let original = lines(41);
+    std::fs::write(&file, &original).unwrap();
+
+    let err = write_tool()
+        .call(json!({"path": "big.txt", "content": "replaced"}), &ctx)
+        .await
+        .unwrap_err();
+
+    match err {
+        ToolError::ExecutionFailed(msg) => {
+            assert_eq!(
+                msg,
+                "big.txt exists with 41 lines; write_file replaces the whole file and you would be writing it from memory. Use edit_file (old/new, or after/before + new) for changes to an existing file. If the file is beyond repair, `revert_file` restores its content from before this session's first edit."
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read(&file).unwrap();
+    assert_eq!(on_disk, original.as_bytes(), "file must be byte-identical");
+}
+
+#[tokio::test]
+async fn rewriting_existing_file_at_the_threshold_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("ok.txt");
+    std::fs::write(&file, lines(40)).unwrap();
+
+    write_tool()
+        .call(json!({"path": "ok.txt", "content": "replaced"}), &ctx)
+        .await
+        .unwrap();
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, "replaced");
+}
+
+#[tokio::test]
+async fn writing_a_new_path_succeeds_regardless_of_content_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let content = lines(200);
+    write_tool()
+        .call(json!({"path": "new.txt", "content": content.clone()}), &ctx)
+        .await
+        .unwrap();
+
+    let on_disk = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
+    assert_eq!(on_disk, content);
 }

@@ -36,6 +36,22 @@ pub struct Budgets {
     pub total: usize,
     pub observation: usize,
     pub augmentation: usize,
+    /// Cap on the harness-maintained `notes` section (see
+    /// `crate::maintainer`). Default 400 tokens.
+    #[serde(default = "default_notes_budget")]
+    pub notes: usize,
+    /// Cap on the working-set section (statie-spec.md "10. Working set").
+    /// Default 6000 tokens.
+    #[serde(default = "default_working_set_budget")]
+    pub working_set: usize,
+}
+
+fn default_notes_budget() -> usize {
+    400
+}
+
+fn default_working_set_budget() -> usize {
+    6000
 }
 
 impl Default for Budgets {
@@ -44,6 +60,8 @@ impl Default for Budgets {
             total: 24000,
             observation: 3000,
             augmentation: 2000,
+            notes: default_notes_budget(),
+            working_set: default_working_set_budget(),
         }
     }
 }

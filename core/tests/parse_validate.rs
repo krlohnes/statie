@@ -1,10 +1,15 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+
 use statie_core::{
-    Action, CommittedState, HarnessState, InboxItem, ParseError, ParsedOutput, PatchError,
-    PatchStrategy, RawOutput, Reasoning, Skill, SkillSpec, Version,
+    Action, ApplyFn, Capabilities, CommittedState, HarnessState, InboxItem, LoggedPatch, Model,
+    ModelError, ParseError, ParsedOutput, PatchError, PatchStrategy, RawOutput, Reasoning, Schema,
+    Session, SessionConfig, SessionLog, Skill, SkillSpec, StateStore, StepSink, StoreError,
+    ToolSet, Version, validate_default,
 };
 
 /// A tiny `Replace`-style patch strategy for tests: the patch *is* the new
@@ -88,6 +93,11 @@ fn committed(value: i64, inbox: Vec<InboxItem>) -> CommittedState<Workspace> {
             activation: "toy".to_string(),
             step: 0,
             last_overflow: None,
+            pinned: None,
+            green_step: None,
+            green_filtered: false,
+            tool_calls: 0,
+            last_test_cmd: None,
         },
         agent: Workspace {
             value,
@@ -142,6 +152,23 @@ fn wrong_action_tag_is_normalized_to_a_tool_call() {
         Action::Tool { name, .. } => assert_eq!(name, "not_a_real_action"),
         other => panic!("expected Tool action, got {other:?}"),
     }
+}
+
+/// `Action::Continue` is harness-internal (see its doc in
+/// `core/src/model.rs`): unlike an ordinary unrecognized `action.type`
+/// (`wrong_action_tag_is_normalized_to_a_tool_call`, just above), a model
+/// output naming `"continue"` specifically must NOT be normalized to a tool
+/// call named "continue" and must NOT deserialize into `Action::Continue`
+/// via `Action`'s own `serde` tag (which would otherwise happily accept it,
+/// since it's just another `rename_all = "snake_case"` variant tag) -- it
+/// must be rejected outright, with the same "unknown action" style error an
+/// actually-unknown type gets.
+#[test]
+fn model_sending_type_continue_is_rejected_not_normalized() {
+    let content = r#"{"patch":{"value":5},"action":{"type":"continue","note":"x"},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let err = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap_err();
+    assert!(matches!(err, ParseError::InvalidJson(_)), "got {err:?}");
 }
 
 #[test]
@@ -313,6 +340,70 @@ fn done_is_rejected_unless_terminal_or_handoff() {
     assert!(
         skill.validate(&cur, parse(7)).is_ok(),
         "handoff done is accepted"
+    );
+}
+
+/// The premature-`done` rejection message includes the exact JSON to send
+/// next, using the skill's first allowed transition as `next_skill`, so a
+/// model that ignores the prose still has a copyable shape to retry with.
+#[test]
+fn premature_done_message_includes_exact_shape_with_first_allowed_target() {
+    struct TerminalAtTen;
+    impl Skill for TerminalAtTen {
+        type Workspace = Workspace;
+        type Patch = ReplaceStrategy;
+        fn name(&self) -> &str {
+            "t"
+        }
+        fn spec(&self) -> Arc<SkillSpec> {
+            Arc::new(SkillSpec::new("t", ""))
+        }
+        fn initial_workspace(&self) -> Workspace {
+            Workspace {
+                value: 0,
+                recent_summary: String::new(),
+            }
+        }
+        fn tools(&self) -> Vec<String> {
+            vec![]
+        }
+        fn allowed_transitions(&self) -> Vec<String> {
+            vec![
+                "implement".to_string(),
+                "plan".to_string(),
+                "router".to_string(),
+            ]
+        }
+        fn is_terminal(&self, s: &Workspace) -> bool {
+            s.value >= 10
+        }
+    }
+    let skill = TerminalAtTen;
+    let cur = CommittedState {
+        harness: HarnessState::default(),
+        agent: skill.initial_workspace(),
+    };
+    let content = r#"{"patch":{"value":3},"action":{"type":"done"}}"#.to_string();
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(RawOutput::new(
+        Version(0),
+        None,
+        content,
+    ))
+    .unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("non-terminal, non-handoff done must be rejected");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        _ => unreachable!("{err}"),
+    };
+    assert!(msg.contains("Exact shape:"), "{msg}");
+    assert!(msg.contains(r#""next_skill": "implement""#), "{msg}");
+    assert!(
+        msg.contains(
+            r#"{"patch": {"next_skill": "implement"}, "action": {"type": "done", "name": "", "args": {}}, "ack_inbox": []}"#
+        ),
+        "{msg}"
     );
 }
 
@@ -589,4 +680,662 @@ fn trailing_text_then_unclosed_is_not_double_repaired_wrongly() {
         !fixes.iter().any(|f| f.contains("trailing")),
         "should not report a trailing-characters fix, got {fixes:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// `delegate` action and `ask_user` gating (milestone 9).
+// ---------------------------------------------------------------------
+
+/// A skill whose `allowed_delegates()` lists `"ui-review"`, for exercising
+/// the `delegate` action's validation.
+struct DelegatingSkill;
+
+impl Skill for DelegatingSkill {
+    type Workspace = Workspace;
+    type Patch = ReplaceStrategy;
+
+    fn name(&self) -> &str {
+        "implement"
+    }
+
+    fn spec(&self) -> Arc<SkillSpec> {
+        Arc::new(SkillSpec::new("implement", ""))
+    }
+
+    fn initial_workspace(&self) -> Workspace {
+        Workspace {
+            value: 0,
+            recent_summary: String::new(),
+        }
+    }
+
+    fn tools(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn is_terminal(&self, _s: &Workspace) -> bool {
+        false
+    }
+
+    fn allowed_delegates(&self) -> Vec<String> {
+        vec!["ui-review".to_string()]
+    }
+}
+
+#[test]
+fn delegate_to_unlisted_child_is_rejected() {
+    let skill = DelegatingSkill;
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1},"action":{"type":"delegate","skill":"rust-testing","task":"run the tests"},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("delegate to an unlisted child must be rejected");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        other => panic!("expected RuleViolation, got {other:?}"),
+    };
+    assert!(msg.contains("`delegate`"), "{msg}");
+    assert!(msg.contains("`implement`"), "{msg}");
+    assert!(
+        msg.contains(&format!("{:?}", vec!["ui-review".to_string()])),
+        "{msg}"
+    );
+}
+
+#[test]
+fn delegate_to_listed_child_validates() {
+    let skill = DelegatingSkill;
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1},"action":{"type":"delegate","skill":"ui-review","task":"check the login page"},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let step = skill
+        .validate(&cur, parsed)
+        .expect("delegate to a listed child should validate");
+    match step.action() {
+        Action::Delegate { skill, task } => {
+            assert_eq!(skill, "ui-review");
+            assert_eq!(task, "check the login page");
+        }
+        other => panic!("expected Delegate action, got {other:?}"),
+    }
+}
+
+/// A `delegate` action with an empty `skill` or `task` (the placeholder
+/// value a grammar-constrained decoder can send when it collapses to the
+/// shortest branch) must be rejected before the harness ever tries to hand
+/// off to a subagent.
+#[test]
+fn delegate_with_empty_skill_is_rejected() {
+    let skill = DelegatingSkill;
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1},"action":{"type":"delegate","name":"","args":{},"skill":"","task":"check the page"},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("delegate with an empty skill must be rejected");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        other => panic!("expected RuleViolation, got {other:?}"),
+    };
+    assert_eq!(
+        msg,
+        "action `delegate` requires non-empty `skill` and `task`"
+    );
+}
+
+#[test]
+fn delegate_with_empty_task_is_rejected() {
+    let skill = DelegatingSkill;
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1},"action":{"type":"delegate","name":"","args":{},"skill":"ui-review","task":""},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("delegate with an empty task must be rejected");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        other => panic!("expected RuleViolation, got {other:?}"),
+    };
+    assert_eq!(
+        msg,
+        "action `delegate` requires non-empty `skill` and `task`"
+    );
+}
+
+/// `delegate` is validated like a parking action for inbox purposes: an
+/// unacked inbox item must be rejected the same way `yield`/`ask_user`/
+/// `done` are.
+#[test]
+fn delegate_with_unacked_inbox_is_rejected() {
+    let skill = DelegatingSkill;
+    let cur = committed(
+        0,
+        vec![InboxItem {
+            id: 1,
+            text: "hello".to_string(),
+            acked: false,
+        }],
+    );
+    let content = r#"{"patch":{"value":1},"action":{"type":"delegate","skill":"ui-review","task":"check the page"},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill.validate(&cur, parsed).unwrap_err();
+    assert!(matches!(err, PatchError::UnackedInbox(_)), "{err}");
+}
+
+/// A skill that opts out of `ask_user` (children, milestone 9).
+struct NoAskUserSkill;
+
+impl Skill for NoAskUserSkill {
+    type Workspace = Workspace;
+    type Patch = ReplaceStrategy;
+
+    fn name(&self) -> &str {
+        "ui-review"
+    }
+
+    fn spec(&self) -> Arc<SkillSpec> {
+        Arc::new(SkillSpec::new("ui-review", ""))
+    }
+
+    fn initial_workspace(&self) -> Workspace {
+        Workspace {
+            value: 0,
+            recent_summary: String::new(),
+        }
+    }
+
+    fn tools(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn is_terminal(&self, _s: &Workspace) -> bool {
+        false
+    }
+
+    fn allows_ask_user(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn ask_user_is_rejected_when_skill_disallows_it() {
+    let skill = NoAskUserSkill;
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1},"action":{"type":"ask_user","message":"which one?"},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("ask_user must be rejected when allows_ask_user is false");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        other => panic!("expected RuleViolation, got {other:?}"),
+    };
+    assert!(msg.contains("`ask_user`"), "{msg}");
+    assert!(msg.contains("`ui-review`"), "{msg}");
+}
+
+/// The toy skill keeps the default `allows_ask_user() -> true`: `ask_user`
+/// with an acked inbox still validates.
+#[test]
+fn ask_user_is_allowed_by_default() {
+    let skill = ToySkill {
+        reject_negative: false,
+    };
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1},"action":{"type":"ask_user","message":"which one?"},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let step = skill
+        .validate(&cur, parsed)
+        .expect("ask_user should be allowed by default");
+    assert!(matches!(step.action(), Action::AskUser { .. }));
+}
+
+/// The live grammar-decoding failure this schema/validation change fixes:
+/// a model sends `ask_user` with an empty (placeholder) `message`.
+/// `validate_default` must reject it with a message-specific error rather
+/// than the harness silently parking the session on a blank question.
+#[test]
+fn ask_user_with_empty_message_is_rejected() {
+    let skill = ToySkill {
+        reject_negative: false,
+    };
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1},"action":{"type":"ask_user","name":"","args":{},"message":""},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("ask_user with an empty message must be rejected");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        other => panic!("expected RuleViolation, got {other:?}"),
+    };
+    assert_eq!(
+        msg,
+        "action `ask_user` requires a non-empty `message`: the question for the user"
+    );
+}
+
+/// A whitespace-only `message` is treated the same as empty (trimmed
+/// before the emptiness check).
+#[test]
+fn ask_user_with_whitespace_only_message_is_rejected() {
+    let skill = ToySkill {
+        reject_negative: false,
+    };
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1},"action":{"type":"ask_user","name":"","args":{},"message":"   "},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("ask_user with a whitespace-only message must be rejected");
+    assert!(matches!(err, PatchError::RuleViolation(_)), "{err}");
+}
+
+// ---------------------------------------------------------------------
+// Harness-owned fields (`Skill::harness_owned_fields`): a model patch
+// touching one is rejected regardless of action; an operator patch
+// (`Active::apply_user_patch`) touching the same field is accepted.
+// ---------------------------------------------------------------------
+
+/// A skill that declares `recent_summary` as harness-owned: the model's
+/// patch may not touch it, whatever the patch strategy.
+struct HarnessOwnedSkill;
+
+impl Skill for HarnessOwnedSkill {
+    type Workspace = Workspace;
+    type Patch = ReplaceStrategy;
+
+    fn name(&self) -> &str {
+        "owned"
+    }
+
+    fn spec(&self) -> Arc<SkillSpec> {
+        Arc::new(SkillSpec::new("owned", ""))
+    }
+
+    fn initial_workspace(&self) -> Workspace {
+        Workspace {
+            value: 0,
+            recent_summary: String::new(),
+        }
+    }
+
+    fn tools(&self) -> Vec<String> {
+        vec!["echo".to_string()]
+    }
+
+    fn is_terminal(&self, _s: &Workspace) -> bool {
+        false
+    }
+
+    fn harness_owned_fields(&self) -> Vec<String> {
+        vec!["recent_summary".to_string()]
+    }
+}
+
+#[test]
+fn patch_touching_a_harness_owned_field_is_rejected() {
+    let skill = HarnessOwnedSkill;
+    let cur = committed(0, vec![]);
+    let content = r#"{"patch":{"value":1,"recent_summary":"tampered"},"action":{"type":"tool","name":"echo","args":{}},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("a patch that writes a harness-owned field must be rejected");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        other => panic!("expected RuleViolation, got {other:?}"),
+    };
+    assert!(msg.contains("`recent_summary`"), "{msg}");
+    assert!(msg.contains("harness-owned"), "{msg}");
+}
+
+#[test]
+fn patch_leaving_harness_owned_fields_alone_validates() {
+    let skill = HarnessOwnedSkill;
+    let cur = committed(0, vec![]);
+    let content =
+        r#"{"patch":{"value":1},"action":{"type":"tool","name":"echo","args":{}},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    skill
+        .validate(&cur, parsed)
+        .expect("a patch that leaves harness-owned fields alone should validate");
+}
+
+/// `ReplaceStrategy` sends the whole workspace on every patch, so the raw
+/// patch object always carries the harness-owned key. The check must be
+/// value-based (compare committed vs. post-patch), not presence-based, or
+/// this would always be rejected -- this is the scenario the previous
+/// fixture hack (`skip_serializing_if` on `recent_summary`) was papering
+/// over instead of fixing.
+#[test]
+fn replace_patch_echoing_owned_field_unchanged_validates() {
+    let skill = HarnessOwnedSkill;
+    let mut cur = committed(0, vec![]);
+    cur.agent.recent_summary = "written by the maintainer".to_string();
+    let content = r#"{"patch":{"value":1,"recent_summary":"written by the maintainer"},"action":{"type":"tool","name":"echo","args":{}},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    skill.validate(&cur, parsed).expect(
+        "a replace-strategy patch that carries the owned field's committed value unchanged \
+         should validate",
+    );
+}
+
+/// Same replace-strategy setup, but this time the model actually changes
+/// the owned field's value: must still be rejected, with the same message.
+#[test]
+fn replace_patch_changing_owned_field_is_rejected() {
+    let skill = HarnessOwnedSkill;
+    let mut cur = committed(0, vec![]);
+    cur.agent.recent_summary = "written by the maintainer".to_string();
+    let content = r#"{"patch":{"value":1,"recent_summary":"tampered"},"action":{"type":"tool","name":"echo","args":{}},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<ReplaceStrategy>(raw).unwrap();
+    let err = skill
+        .validate(&cur, parsed)
+        .expect_err("a replace-strategy patch that changes the owned field must be rejected");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        other => panic!("expected RuleViolation, got {other:?}"),
+    };
+    assert!(msg.contains("`recent_summary`"), "{msg}");
+    assert!(msg.contains("harness-owned"), "{msg}");
+}
+
+// ---------------------------------------------------------------------
+// A JSON-merge-patch-style strategy (only the keys present in the patch
+// are applied; a `null` deletes/resets a field), used to exercise the
+// harness-owned check against a strategy where "untouched" and "present
+// in the raw patch object" genuinely differ, unlike `ReplaceStrategy`.
+// ---------------------------------------------------------------------
+
+/// Distinguishes an absent `recent_summary` key (outer `None`: leave
+/// unchanged) from a key present with value `null` (`Some(None)`: clear
+/// it) -- serde's default `Option<T>` deserialization collapses both to
+/// `None` unless told otherwise.
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// A patch that may omit either field (leaving it unchanged) or set
+/// `recent_summary` explicitly to `null` (reset to empty, modeling a
+/// merge-patch-style deletion).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MergeWorkspacePatch {
+    #[serde(default)]
+    pub value: Option<i64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_option"
+    )]
+    pub recent_summary: Option<Option<String>>,
+}
+
+pub struct MergeStrategy;
+
+impl PatchStrategy<Workspace> for MergeStrategy {
+    type Patch = MergeWorkspacePatch;
+
+    fn name() -> &'static str {
+        "merge"
+    }
+
+    fn describe() -> &'static str {
+        "Only keys present in the patch are applied; `recent_summary: null` clears it."
+    }
+
+    fn apply(cur: &Workspace, patch: &MergeWorkspacePatch) -> Result<Workspace, PatchError> {
+        let mut next = cur.clone();
+        if let Some(value) = patch.value {
+            next.value = value;
+        }
+        if let Some(recent_summary) = &patch.recent_summary {
+            next.recent_summary = recent_summary.clone().unwrap_or_default();
+        }
+        Ok(next)
+    }
+}
+
+/// A merge patch that sets the owned field to `null` (deletion) is
+/// rejected, even though a merge strategy only ever sends the keys it
+/// actually means to touch. Calls `validate_default` directly (rather than
+/// `skill.validate`) with `MergeStrategy` as the patch strategy, since
+/// `HarnessOwnedSkill::Patch` is fixed to `ReplaceStrategy`.
+#[test]
+fn merge_patch_deleting_owned_field_is_rejected() {
+    let skill = HarnessOwnedSkill;
+    let mut cur = committed(0, vec![]);
+    cur.agent.recent_summary = "written by the maintainer".to_string();
+    let content = r#"{"patch":{"recent_summary":null},"action":{"type":"tool","name":"echo","args":{}},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<MergeStrategy>(raw).unwrap();
+    let err = validate_default::<Workspace, MergeStrategy>(&skill, &cur, parsed)
+        .expect_err("a merge patch that deletes (nulls out) the owned field must be rejected");
+    let msg = match &err {
+        PatchError::RuleViolation(m) => m.clone(),
+        other => panic!("expected RuleViolation, got {other:?}"),
+    };
+    assert!(msg.contains("`recent_summary`"), "{msg}");
+    assert!(msg.contains("harness-owned"), "{msg}");
+}
+
+/// A merge patch that sets the owned field to its current value is
+/// tolerated: a no-op touch is not the same as a change, so the
+/// value-based check lets it through.
+#[test]
+fn merge_patch_setting_owned_field_to_current_value_validates() {
+    let skill = HarnessOwnedSkill;
+    let mut cur = committed(0, vec![]);
+    cur.agent.recent_summary = "written by the maintainer".to_string();
+    let content = r#"{"patch":{"recent_summary":"written by the maintainer"},"action":{"type":"tool","name":"echo","args":{}},"ack_inbox":[]}"#;
+    let raw = raw_output(Version(0), content);
+    let parsed = ParsedOutput::<Workspace>::parse::<MergeStrategy>(raw).unwrap();
+    validate_default::<Workspace, MergeStrategy>(&skill, &cur, parsed).expect(
+        "a merge patch that sets the owned field to its current value (a no-op touch) should \
+         validate",
+    );
+}
+
+// ---------------------------------------------------------------------
+// A minimal in-memory `StateStore<W>` and unused `Model`, local to this
+// test file (core cannot depend on `statie-store`/`statie-models`), used
+// only by `operator_patch_touching_harness_owned_field_is_accepted` below
+// to drive `Active::apply_user_patch` -- the operator/maintainer path,
+// which does not run the harness-owned-field check that gates model
+// patches.
+// ---------------------------------------------------------------------
+
+struct Inner<W> {
+    initial: CommittedState<W>,
+    current: CommittedState<W>,
+    version: Version,
+    log: Vec<LoggedPatch>,
+}
+
+struct TestStore<W> {
+    inner: std::sync::Mutex<Option<Inner<W>>>,
+}
+
+impl<W> TestStore<W> {
+    fn new() -> Self {
+        TestStore {
+            inner: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl<W> StateStore<W> for TestStore<W>
+where
+    W: Clone + Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    async fn load(&self) -> Result<Option<(CommittedState<W>, Version)>, StoreError> {
+        let guard = self.inner.lock().unwrap();
+        Ok(guard
+            .as_ref()
+            .map(|inner| (inner.current.clone(), inner.version)))
+    }
+
+    async fn init(&self, initial: CommittedState<W>) -> Result<Version, StoreError> {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.is_some() {
+            return Err(StoreError::Backend("already initialized".to_string()));
+        }
+        let version = Version(0);
+        *guard = Some(Inner {
+            initial: initial.clone(),
+            current: initial,
+            version,
+            log: Vec::new(),
+        });
+        Ok(version)
+    }
+
+    async fn commit(
+        &self,
+        patch: statie_core::ValidatedPatch<W>,
+        harness: HarnessState,
+        action: &Action,
+        expect: Version,
+    ) -> Result<Version, StoreError> {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| StoreError::Backend("not initialized".to_string()))?;
+        if patch.version() != expect || expect != inner.version {
+            return Err(StoreError::VersionMismatch {
+                expected: patch.version(),
+                actual: inner.version,
+            });
+        }
+        let (raw, next, _v) = patch.into_parts();
+        let new_version = Version(inner.version.0 + 1);
+        inner.current.agent = next;
+        inner.current.harness = harness.clone();
+        inner.version = new_version;
+        inner.log.push(LoggedPatch {
+            version: new_version,
+            patch: raw,
+            action: action.clone(),
+            harness,
+        });
+        Ok(new_version)
+    }
+
+    async fn patch_log(&self) -> Result<Vec<LoggedPatch>, StoreError> {
+        let guard = self.inner.lock().unwrap();
+        Ok(guard
+            .as_ref()
+            .ok_or_else(|| StoreError::Backend("not initialized".to_string()))?
+            .log
+            .clone())
+    }
+
+    async fn replay(
+        &self,
+        to: Version,
+        apply: ApplyFn<'_, W>,
+    ) -> Result<CommittedState<W>, StoreError> {
+        let guard = self.inner.lock().unwrap();
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| StoreError::Backend("not initialized".to_string()))?;
+        let mut agent = inner.initial.agent.clone();
+        let mut harness = inner.initial.harness.clone();
+        for entry in &inner.log {
+            if entry.version > to {
+                break;
+            }
+            agent = apply(&agent, &entry.patch).map_err(|e| StoreError::Backend(e.to_string()))?;
+            harness = entry.harness.clone();
+        }
+        Ok(CommittedState { harness, agent })
+    }
+
+    async fn set_harness(&self, harness: HarnessState) -> Result<(), StoreError> {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| StoreError::Backend("not initialized".to_string()))?;
+        inner.current.harness = harness;
+        Ok(())
+    }
+}
+
+struct UnusedModel;
+
+#[async_trait]
+impl Model for UnusedModel {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            native_thinking: false,
+            schema_constrained: false,
+            prefix_cache: false,
+        }
+    }
+
+    async fn step(
+        &self,
+        _prompt: statie_core::BoundedPrompt,
+        _schema: &Schema,
+        _sink: &mut dyn StepSink,
+        _cancel: CancellationToken,
+    ) -> Result<RawOutput, ModelError> {
+        Err(ModelError::Backend(
+            "UnusedModel should never be called".to_string(),
+        ))
+    }
+}
+
+/// An operator patch (`/patch`, `Active::apply_user_patch`) touching a
+/// harness-owned field is accepted: the harness-owned-field check in
+/// `validate_default` only gates model-authored patches
+/// (`Skill::validate`); the operator (and, per statie-spec.md "9. Context
+/// maintenance", the maintainer) is a trusted writer of those fields.
+#[tokio::test]
+async fn operator_patch_touching_harness_owned_field_is_accepted() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::new(UnusedModel) as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        SessionConfig {
+            budgets: Default::default(),
+            retries: 3,
+            root: statie_core::SandboxRoot::new(root.path()).unwrap(),
+        },
+    );
+
+    let skill = Arc::new(HarnessOwnedSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let new_version = active
+        .apply_user_patch(serde_json::json!({"value": 0, "recent_summary": "operator wrote this"}))
+        .await
+        .expect("an operator patch touching a harness-owned field should be accepted");
+    assert_eq!(new_version, Version(1));
+
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.agent.recent_summary, "operator wrote this");
 }

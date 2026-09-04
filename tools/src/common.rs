@@ -4,10 +4,59 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use statie_core::ToolError;
+use serde_json::Value;
+use statie_core::{SandboxRoot, ToolError};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+
+/// Normalizes string-typed tool arguments before deserialization: for each
+/// field name in `fields` that is present in the top-level `args` object and
+/// holds a JSON array of strings, replaces it with a single string joining
+/// the elements with `"\n"` (so a one-element array becomes that element,
+/// unchanged). This exists because schema-constrained models occasionally
+/// wrap a single-string anchor/argument in a one-element array; the model
+/// clearly means the string.
+///
+/// A field that is not present, is not an array, or is an array containing
+/// any non-string element is left completely untouched — in the
+/// non-string-element case specifically so the real serde "invalid type"
+/// error still surfaces rather than being silently papered over.
+///
+/// Like the existing `#[serde(alias = ...)]` argument aliases, this
+/// normalization is silent: it does not add a note to the tool output.
+pub(crate) fn join_string_array_args(args: &mut Value, fields: &[&str]) {
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+    for &field in fields {
+        let Some(value) = obj.get_mut(field) else {
+            continue;
+        };
+        let Some(arr) = value.as_array() else {
+            continue;
+        };
+        let mut joined = String::new();
+        let mut all_strings = true;
+        for (i, elem) in arr.iter().enumerate() {
+            match elem.as_str() {
+                Some(s) => {
+                    if i > 0 {
+                        joined.push('\n');
+                    }
+                    joined.push_str(s);
+                }
+                None => {
+                    all_strings = false;
+                    break;
+                }
+            }
+        }
+        if all_strings {
+            *value = Value::String(joined);
+        }
+    }
+}
 
 /// Writes `content` to `path` atomically: writes to a sibling temp file
 /// (named after the target with a pid/nanos suffix) then renames it into
@@ -33,6 +82,78 @@ pub(crate) fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ToolError>
     Ok(())
 }
 
+/// Suffix appended to a backup path to mark that, before this session's
+/// first edit, `<rel_path>` did not exist. An empty file at
+/// `<root>/.statie/orig/<rel_path>.absent` records this; `revert_file` sees
+/// the marker and deletes the (session-created) file rather than trying to
+/// restore missing bytes.
+const ABSENT_MARKER_SUFFIX: &str = ".absent";
+
+/// The path, under `<root>/.statie/orig/`, that holds the pre-edit backup of
+/// `rel_path` (its content, if it existed) or, with `ABSENT_MARKER_SUFFIX`
+/// appended, the empty marker recording that it did not exist yet.
+pub(crate) fn backup_content_path(root: &SandboxRoot, rel_path: &str) -> std::path::PathBuf {
+    root.path().join(".statie").join("orig").join(rel_path)
+}
+
+/// The absent-marker sibling of `backup_content_path`'s result: its
+/// existence means `rel_path` did not exist before this session's first
+/// edit of it (see `ABSENT_MARKER_SUFFIX`).
+pub(crate) fn absent_marker_path(root: &SandboxRoot, rel_path: &str) -> std::path::PathBuf {
+    path_with_appended_suffix(&backup_content_path(root, rel_path), ABSENT_MARKER_SUFFIX)
+}
+
+/// Records a pre-edit backup of `rel_path` under `<root>/.statie/orig/`, but
+/// only the first time this is called for a given path: if a backup (or its
+/// absent-marker) already exists, this is a no-op, so the backup always
+/// holds the content from before the session's *first* modification of that
+/// path, never a later intermediate state.
+///
+/// If `rel_path` currently exists, its bytes are copied verbatim to
+/// `<root>/.statie/orig/<rel_path>`. If it does not exist yet (this call is
+/// about to `write_file` it into existence), an empty marker file is
+/// written instead at `<root>/.statie/orig/<rel_path>.absent` — see
+/// `ABSENT_MARKER_SUFFIX`.
+///
+/// Callers (`write_file`, `edit_file`) invoke this right before their
+/// `write_atomic`, only once the edit has otherwise been validated and is
+/// about to succeed: a refused edit must never create a backup, since the
+/// backup is meant to capture the state a *successful* first edit started
+/// from.
+pub(crate) fn backup_before_edit(root: &SandboxRoot, rel_path: &str) -> Result<(), ToolError> {
+    let backup_path = backup_content_path(root, rel_path);
+    let marker_path = absent_marker_path(root, rel_path);
+
+    if backup_path.exists() || marker_path.exists() {
+        return Ok(());
+    }
+
+    let Some(parent) = backup_path.parent() else {
+        return Err(ToolError::ExecutionFailed(
+            "backup path has no parent directory".to_string(),
+        ));
+    };
+    std::fs::create_dir_all(parent).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+    let source = root.path().join(rel_path);
+    if source.is_file() {
+        let bytes =
+            std::fs::read(&source).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        write_atomic(&backup_path, &bytes)?;
+    } else {
+        write_atomic(&marker_path, &[])?;
+    }
+    Ok(())
+}
+
+/// Appends `suffix` to `path`'s file name (not its extension), returning the
+/// resulting sibling path.
+fn path_with_appended_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
 /// Cap `s` at `max_bytes`, cutting on a char boundary, appending a trailer
 /// noting how many bytes the cap was (the *original* byte length).
 pub fn cap_output(s: String, max_bytes: usize) -> String {
@@ -48,10 +169,67 @@ pub fn cap_output(s: String, max_bytes: usize) -> String {
     out
 }
 
+/// If `cmd` contains an in-place editor invocation (`sed -i ...` or
+/// `perl -i`/`-pi`/`-ni ...`), returns the offending tool label (`"sed -i"`
+/// or `"perl -i"`) so the caller can refuse the command. A small model that
+/// edits files with `sed -i '174,182d' file` — deleting a line range it
+/// remembered from an earlier read — routinely breaks the file when the
+/// content has since shifted; `edit_file`'s old/new (or after/before + new)
+/// anchoring is safe against that, so in-place stream editing is refused
+/// entirely rather than risked.
+///
+/// Detection is a heuristic over whitespace/`|`/`;`/`&`-separated tokens,
+/// not a full shell parser: it looks for a `sed` or `perl` token anywhere in
+/// the command, followed later in the same pipeline segment by a flag token
+/// that indicates in-place editing (`-i`, `-i''`, `-i.bak`, or, for `perl`,
+/// also `-pi...`/`-ni...`). Plain `sed`/`perl` without such a flag (e.g.
+/// `sed -n '1p' f`, `perl -e '...'`) is left alone, as is any other command
+/// (`grep -i`, `cat`, ...).
+fn detect_in_place_editor(cmd: &str) -> Option<&'static str> {
+    // Split into pipeline/command segments on common shell separators so a
+    // `-i` flag belonging to one command in a chain (`cmd; sed -i ...`)
+    // isn't attributed to a different one.
+    for segment in cmd.split(['|', ';', '\n']).flat_map(|s| s.split("&&")) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+
+        for (idx, tok) in tokens.iter().enumerate() {
+            let is_sed = *tok == "sed" || tok.ends_with("/sed");
+            let is_perl = *tok == "perl" || tok.ends_with("/perl");
+
+            if !is_sed && !is_perl {
+                continue;
+            }
+
+            for later in &tokens[idx + 1..] {
+                // Strip a single leading `&` in case `&&` wasn't preceded
+                // by whitespace (e.g. `cmd&&sed -i ...` isn't split above
+                // since `split_whitespace` already separated on the space
+                // before `sed`, but be defensive for a bare `&` split too).
+                let later = later.trim_start_matches('&');
+                if is_sed && later.starts_with("-i") {
+                    return Some("sed -i");
+                }
+                if is_perl
+                    && (later.starts_with("-i")
+                        || later.starts_with("-pi")
+                        || later.starts_with("-ni"))
+                {
+                    return Some("perl -i");
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Run `cmd` via a shell (`sh -c` on unix, `cmd /C` on windows) inside
 /// `cwd`, racing completion against cancellation and a timeout. Returns the
 /// formatted `"exit: {code}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"`
 /// text. A non-zero exit is not an error.
+///
+/// Before doing anything else, refuses commands that look like an in-place
+/// editor invocation (`sed -i` / `perl -i`/`-pi`/`-ni`) — see
+/// `detect_in_place_editor`.
 ///
 /// On unix, the shell is spawned as the leader of its own process group, so
 /// on timeout/cancel (or when a backgrounded grandchild outlives the shell)
@@ -68,6 +246,12 @@ pub async fn run_shell(
     timeout_secs: u64,
     cancel: &CancellationToken,
 ) -> Result<String, ToolError> {
+    if let Some(tool) = detect_in_place_editor(cmd) {
+        return Err(ToolError::ExecutionFailed(format!(
+            "refused: `{tool}` edits a file in place from remembered line numbers. Use edit_file (old/new, or after/before + new) so the change is anchored on the file's current text."
+        )));
+    }
+
     let mut command = shell_command(cmd);
     command
         .current_dir(cwd)
@@ -254,5 +438,92 @@ mod tests {
         let s = "a".repeat(49) + "€€€€€"; // € is 3 bytes
         let capped = cap_output(s, 50);
         assert!(capped.is_char_boundary(capped.find('\n').unwrap()));
+    }
+
+    #[test]
+    fn detects_sed_i_deleting_a_line_range() {
+        assert_eq!(
+            detect_in_place_editor("sed -i '174,182d' file"),
+            Some("sed -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("sed -i '181,183d' file"),
+            Some("sed -i")
+        );
+    }
+
+    #[test]
+    fn detects_sed_i_variants() {
+        assert_eq!(
+            detect_in_place_editor("sed -i 's/a/b/' f.txt"),
+            Some("sed -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("sed -i'' -e 's/a/b/' f.txt"),
+            Some("sed -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("sed -i.bak 's/a/b/' f.txt"),
+            Some("sed -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("sed -i '' 's/a/b/' f.txt"),
+            Some("sed -i")
+        );
+        // other flags before -i are fine
+        assert_eq!(
+            detect_in_place_editor("sed -E -i 's/a/b/' f.txt"),
+            Some("sed -i")
+        );
+    }
+
+    #[test]
+    fn detects_sed_i_inside_pipelines_and_chains() {
+        assert_eq!(
+            detect_in_place_editor("echo hi && sed -i 's/a/b/' f.txt"),
+            Some("sed -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("true; sed -i 's/a/b/' f.txt"),
+            Some("sed -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("cat f.txt | sed -i 's/a/b/' f.txt"),
+            Some("sed -i")
+        );
+    }
+
+    #[test]
+    fn detects_perl_i_variants() {
+        assert_eq!(
+            detect_in_place_editor("perl -i -pe 's/a/b/' f.txt"),
+            Some("perl -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("perl -i.bak -pe 's/a/b/' f.txt"),
+            Some("perl -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("perl -pi -e 's/a/b/' f.txt"),
+            Some("perl -i")
+        );
+        assert_eq!(
+            detect_in_place_editor("perl -ni -e 'print' f.txt"),
+            Some("perl -i")
+        );
+    }
+
+    #[test]
+    fn allows_sed_without_i_flag() {
+        assert_eq!(detect_in_place_editor("sed -n '1,5p' f"), None);
+        assert_eq!(detect_in_place_editor("sed -n '1p' f.txt"), None);
+    }
+
+    #[test]
+    fn allows_unrelated_commands() {
+        assert_eq!(detect_in_place_editor("grep -i x f"), None);
+        assert_eq!(detect_in_place_editor("cat f.txt"), None);
+        assert_eq!(detect_in_place_editor("perl -e 'print 1'"), None);
+        assert_eq!(detect_in_place_editor("echo 'sed -i is dangerous'"), None);
     }
 }

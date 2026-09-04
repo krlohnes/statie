@@ -303,11 +303,10 @@ mod tests {
         let action = value
             .pointer("/properties/action")
             .expect("action property should exist");
-        // core's plain `schemars::schema_for!` (used by `Schema::of`, which
-        // we don't control) refs shared subschemas into `$defs` rather than
-        // inlining them, so `action` here is a `$ref`; resolve it before
-        // checking that its own required/oneOf survived (only the `patch`
-        // subtree had `required` stripped).
+        // `Action` advertises one flat object (`required: ["type"]`, no
+        // `oneOf`); resolve a `$ref` if the generator ever emits one, then
+        // check that `required` survived (only the `patch` subtree had it
+        // stripped) and that no union keyword crept back in.
         let resolved = if let Some(reference) = action.get("$ref").and_then(Value::as_str) {
             let pointer = reference.trim_start_matches('#');
             value
@@ -318,8 +317,14 @@ mod tests {
         };
         let action_text = serde_json::to_string(resolved).unwrap();
         assert!(
-            action_text.contains("required") || action_text.contains("oneOf"),
-            "action schema should keep its own required/oneOf: {action_text}"
+            action_text.contains(
+                "\"required\":[\"type\",\"name\",\"args\",\"message\",\"skill\",\"task\"]"
+            ),
+            "action schema should keep its own required: {action_text}"
+        );
+        assert!(
+            !action_text.contains("oneOf") && !action_text.contains("anyOf"),
+            "action schema must stay flat (no oneOf/anyOf): {action_text}"
         );
     }
 

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use statie_core::{Model, ModelError, NullSink, Usage, Version};
@@ -22,6 +24,8 @@ fn cfg_for(addr: std::net::SocketAddr) -> OllamaConfig {
         timeout_secs: 30,
         format: OllamaFormat::Schema,
         schema_constrained: None,
+        retries_on_5xx: 2,
+        retry_delay_secs: 0,
     }
 }
 
@@ -165,7 +169,11 @@ async fn non_2xx_status_returns_backend_error() {
         write_status_response(&mut stream, "500 Internal Server Error", "boom").await;
     });
 
-    let model = OllamaModel::new(cfg_for(addr)).expect("build model");
+    // No retries configured: the server above only accepts one connection,
+    // so this asserts the single-attempt behavior untouched by retry logic.
+    let mut cfg = cfg_for(addr);
+    cfg.retries_on_5xx = 0;
+    let model = OllamaModel::new(cfg).expect("build model");
     let schema = schema();
 
     let err = model
@@ -369,4 +377,178 @@ async fn json_format_mode_sends_plain_json_and_reports_unconstrained() {
     assert_eq!(out.content, r#"{"patch":{},"action":{"type":"done"}}"#);
     let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
     assert_eq!(body["format"], serde_json::json!("json"));
+}
+
+/// A 500 followed by a valid response: `step` should retry and succeed,
+/// having made exactly two requests.
+#[tokio::test]
+async fn retries_once_after_500_then_succeeds() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_server = request_count.clone();
+
+    tokio::spawn(async move {
+        for i in 0..2 {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let _ = read_request_body(&mut stream).await;
+            request_count_server.fetch_add(1, Ordering::SeqCst);
+            if i == 0 {
+                write_status_response(&mut stream, "500 Internal Server Error", "boom").await;
+            } else {
+                write_ndjson_response(
+                    &mut stream,
+                    &[
+                        r#"{"message":{"content":"{\"patch\":{},\"action\":{\"type\":\"done\"}}"},"done":false}"#,
+                        r#"{"message":{"content":""},"done":true}"#,
+                    ],
+                )
+                .await;
+            }
+        }
+    });
+
+    let mut cfg = cfg_for(addr);
+    cfg.retries_on_5xx = 2;
+    cfg.retry_delay_secs = 0;
+    let model = OllamaModel::new(cfg).expect("build model");
+    let schema = schema();
+
+    let out = model
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("step should succeed after one retry");
+
+    assert_eq!(out.content, r#"{"patch":{},"action":{"type":"done"}}"#);
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+}
+
+/// Three consecutive 500s with `retries_on_5xx: 2` exhaust the retry budget:
+/// `step` returns `ModelError::Backend` containing "500", having made
+/// exactly three requests (the original attempt plus two retries).
+#[tokio::test]
+async fn exhausts_retries_and_returns_backend_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_server = request_count.clone();
+
+    tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let _ = read_request_body(&mut stream).await;
+            request_count_server.fetch_add(1, Ordering::SeqCst);
+            write_status_response(&mut stream, "500 Internal Server Error", "boom").await;
+        }
+    });
+
+    let mut cfg = cfg_for(addr);
+    cfg.retries_on_5xx = 2;
+    cfg.retry_delay_secs = 0;
+    let model = OllamaModel::new(cfg).expect("build model");
+    let schema = schema();
+
+    let err = model
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("expected backend error after exhausting retries");
+
+    match err {
+        ModelError::Backend(msg) => assert!(msg.contains("500"), "msg = {msg}"),
+        other => panic!("expected Backend error, got {other:?}"),
+    }
+    assert_eq!(request_count.load(Ordering::SeqCst), 3);
+}
+
+/// A 404 must not be retried: `step` fails immediately with a single
+/// request made.
+#[tokio::test]
+async fn does_not_retry_4xx() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_server = request_count.clone();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request_body(&mut stream).await;
+        request_count_server.fetch_add(1, Ordering::SeqCst);
+        write_status_response(&mut stream, "404 Not Found", "nope").await;
+    });
+
+    let mut cfg = cfg_for(addr);
+    cfg.retries_on_5xx = 2;
+    cfg.retry_delay_secs = 0;
+    let model = OllamaModel::new(cfg).expect("build model");
+    let schema = schema();
+
+    let err = model
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("expected backend error");
+
+    assert!(matches!(err, ModelError::Backend(_)));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+}
+
+/// Cancellation during the retry delay returns promptly with the
+/// cancellation error, and no second request is made.
+#[tokio::test]
+async fn cancellation_during_retry_delay_returns_promptly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_server = request_count.clone();
+
+    tokio::spawn(async move {
+        // Only ever accept one connection: a second request would indicate
+        // the retry delay wasn't actually cancelled.
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request_body(&mut stream).await;
+        request_count_server.fetch_add(1, Ordering::SeqCst);
+        write_status_response(&mut stream, "500 Internal Server Error", "boom").await;
+    });
+
+    let mut cfg = cfg_for(addr);
+    cfg.retries_on_5xx = 2;
+    cfg.retry_delay_secs = 5;
+    let model = OllamaModel::new(cfg).expect("build model");
+    let schema = schema();
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_clone.cancel();
+    });
+
+    let start = std::time::Instant::now();
+    let result = model
+        .step(build_prompt(Version(0)), &schema, &mut NullSink, cancel)
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(result, Err(ModelError::Cancelled)),
+        "result = {result:?}"
+    );
+    assert!(elapsed < Duration::from_secs(1), "elapsed = {elapsed:?}");
+    // Give the server task a moment to notice a stray second connection, if
+    // any, before asserting the count.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
 }

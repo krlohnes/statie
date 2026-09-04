@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use statie_skills::{CodingWorkspace, coding_skills};
+use statie_core::Guards;
+use statie_skills::{CodingWorkspace, coding_skills, coding_skills_configured};
 use statie_tui::{DynSkill, SkillRegistry};
 
 /// A `SkillRegistry` over `statie_skills::coding_skills()`: `router`,
@@ -16,6 +17,15 @@ impl CodingRegistry {
     pub fn new() -> Self {
         CodingRegistry {
             skills: coding_skills(),
+        }
+    }
+
+    /// The four coding skills with the rule-audit switches applied
+    /// (`guards.done_stays_done`; statie-spec.md "10. After it works: the
+    /// rule audit"). `Guards::default()` gives exactly [`CodingRegistry::new`].
+    pub fn with_guards(guards: Guards) -> Self {
+        CodingRegistry {
+            skills: coding_skills_configured(vec![], guards.done_stays_done),
         }
     }
 }

@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use statie_core::{
-    AgentState, Augmentation, Budgets, Capabilities, HarnessState, HarnessView, HeuristicTokenizer,
-    InboxItem, OverBudget, PromptBuilder, Promptable, SkillSpec, SystemPrompt, ToolSet, Version,
+    AgentState, Augmentation, Budgets, Capabilities, Commitment, HarnessState, HarnessView,
+    HeuristicTokenizer, InboxItem, LogEntry, LogKind, MemoryLog, OverBudget, Pinned, PromptBuilder,
+    Promptable, SessionLog, SkillSpec, SystemPrompt, ToolSet, Version, WorkingSet,
+    WorkingSetConfig,
 };
 
 fn budgets() -> Budgets {
@@ -10,6 +12,8 @@ fn budgets() -> Budgets {
         total: 1_000_000,
         observation: 50,
         augmentation: 50,
+        notes: 400,
+        working_set: 1_000_000,
     }
 }
 
@@ -23,6 +27,7 @@ fn system_prompt() -> SystemPrompt {
         "json-merge-patch (RFC 7386)",
         "merge patch semantics",
         None,
+        &[],
     )
 }
 
@@ -34,6 +39,11 @@ fn harness_state() -> HarnessState {
         activation: "toy".to_string(),
         step: 0,
         last_overflow: None,
+        pinned: None,
+        green_step: None,
+        green_filtered: false,
+        tool_calls: 0,
+        last_test_cmd: None,
     }
 }
 
@@ -48,6 +58,8 @@ fn total_over_budget_reports_a_section() {
         total: 5,
         observation: 1_000_000,
         augmentation: 1_000_000,
+        notes: 1_000_000,
+        working_set: 1_000_000,
     };
     let sys = system_prompt();
     let spec = Arc::new(SkillSpec::new("toy", "instructions"));
@@ -184,5 +196,168 @@ fn harness_view_omits_last_observation_when_none() {
     assert!(
         !rendered.contains("last_observation:"),
         "expected no last_observation line, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn harness_view_renders_pinned_when_set() {
+    let mut harness = harness_state();
+    harness.step = 4;
+    harness.pinned = Some(Pinned {
+        name: "ui-review".to_string(),
+        expires_at_step: 10,
+    });
+    let view = HarnessView::new(&harness);
+    let rendered = view.render();
+    assert!(
+        rendered.contains("pinned: ui-review (6 steps left)"),
+        "expected a pinned line, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn harness_view_omits_pinned_when_none() {
+    let harness = harness_state();
+    assert!(harness.pinned.is_none());
+    let view = HarnessView::new(&harness);
+    let rendered = view.render();
+    assert!(
+        !rendered.contains("pinned:"),
+        "expected no pinned line, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn harness_view_renders_commitment_with_reads_left() {
+    let harness = harness_state();
+    let commitment = Commitment {
+        tool: "edit_file".to_string(),
+        path: Some("a.rs".to_string()),
+        what: "replace `old` with `new`".to_string(),
+    };
+    let view = HarnessView::new(&harness).with_commitment(Some((commitment, 2)));
+    let rendered = view.render();
+    assert!(
+        rendered.contains(
+            "next: edit_file a.rs — replace `old` with `new` (2 reads left before you must act)"
+        ),
+        "expected a next: line with reads-left, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn harness_view_omits_next_line_when_no_commitment() {
+    let harness = harness_state();
+    let view = HarnessView::new(&harness).with_commitment(None);
+    let rendered = view.render();
+    assert!(
+        !rendered.contains("next:"),
+        "expected no next: line, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn for_harness_omits_delegate_text_when_no_delegates() {
+    let sys = system_prompt();
+    let rendered = sys.render();
+    assert!(!rendered.contains("\"type\": \"delegate\""));
+    assert!(!rendered.contains("delegate`"));
+}
+
+#[test]
+fn for_harness_includes_delegate_text_when_delegates_given() {
+    let sys = SystemPrompt::for_harness(
+        &Capabilities {
+            native_thinking: true,
+            schema_constrained: true,
+            prefix_cache: true,
+        },
+        "json-merge-patch (RFC 7386)",
+        "merge patch semantics",
+        None,
+        &["ui-review".to_string()],
+    );
+    let rendered = sys.render();
+    assert!(rendered.contains("\"type\": \"delegate\""));
+    assert!(rendered.contains("ui-review"));
+}
+
+#[test]
+fn working_set_section_renders_between_harness_view_and_augmentation() {
+    let tok = HeuristicTokenizer;
+    let b = budgets();
+    let sys = system_prompt();
+    let spec = Arc::new(SkillSpec::new("toy", "instructions"));
+    let tools = ToolSet::new().list_for(&[]);
+    let agent = serde_json::json!({"x": 1});
+    let agent_state = AgentState::new(&agent);
+    let harness = harness_state();
+    let harness_view = HarnessView::new(&harness);
+    let augmentation = Augmentation::default();
+
+    let log = MemoryLog::new();
+    log.append(LogEntry {
+        step: 1,
+        kind: LogKind::Action,
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        payload: serde_json::json!({"type": "tool", "name": "read_file", "args": {"path": "a.rs"}}),
+        agent: None,
+    })
+    .unwrap();
+    log.append(LogEntry {
+        step: 1,
+        kind: LogKind::ToolOutput,
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        payload: serde_json::json!({"name": "read_file", "output": "1: fn a() {}", "truncated": false}),
+        agent: None,
+    })
+    .unwrap();
+    log.append(LogEntry {
+        step: 2,
+        kind: LogKind::Action,
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        payload: serde_json::json!({"type": "tool", "name": "search", "args": {"pattern": "fn"}}),
+        agent: None,
+    })
+    .unwrap();
+    log.append(LogEntry {
+        step: 2,
+        kind: LogKind::ToolOutput,
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        payload: serde_json::json!({"name": "search", "output": "a.rs:1: fn a() {}", "truncated": false}),
+        agent: None,
+    })
+    .unwrap();
+
+    let cfg = WorkingSetConfig::default();
+    let ws =
+        WorkingSet::from_log(&log, &tok, b.working_set, &cfg, 3).expect("expected a working set");
+
+    let prompt = PromptBuilder::new(&tok, b, Version(0))
+        .system(&sys)
+        .spec(&spec)
+        .tools(&tools)
+        .agent(&agent_state)
+        .harness(&harness_view)
+        .working_set(Some(&ws))
+        .augmentation(&augmentation)
+        .build()
+        .expect("within budget");
+
+    let user_text = prompt.user();
+    let harness_idx = user_text
+        .find("## Harness View")
+        .expect("Harness View heading");
+    let ws_idx = user_text
+        .find("## working set")
+        .expect("working set heading");
+    let aug_idx = user_text
+        .find("## Augmentation")
+        .expect("Augmentation heading");
+    assert!(harness_idx < ws_idx);
+    assert!(ws_idx < aug_idx);
+    assert!(
+        user_text
+            .contains("working set (what you read recently; derived from the log, not state):")
     );
 }

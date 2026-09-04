@@ -324,6 +324,30 @@ impl Promptable for Observation {
     }
 }
 
+/// The harness-maintained notes text (statie-spec.md "9. Context
+/// maintenance"): distilled from a step's reasoning by a `Maintainer` call.
+/// No public constructor: only the maintainer path (`Session`, via
+/// `Skill::notes`) ever produces one.
+#[derive(Clone, Debug, Serialize)]
+pub struct Notes(String);
+
+impl Notes {
+    pub(crate) fn new(s: String) -> Self {
+        Notes(s)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl sealed::Sealed for Notes {}
+impl Promptable for Notes {
+    fn render(&self) -> String {
+        self.0.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

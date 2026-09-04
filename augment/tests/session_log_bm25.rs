@@ -19,6 +19,7 @@ fn entry(step: u64, kind: LogKind, payload: serde_json::Value) -> LogEntry {
         kind,
         ts: "2026-09-01T00:00:00Z".to_string(),
         payload,
+        agent: None,
     }
 }
 

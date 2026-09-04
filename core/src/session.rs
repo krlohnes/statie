@@ -1,30 +1,261 @@
 //! The session loop: `Session<W>`, activation typestate (`Active<'a, K>`),
 //! and the `step` algorithm (ARCHITECTURE.md "Loop, session, activation").
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::delegate::{
+    ChildRequest, ChildRunner, InboxItem as ChildInboxItem, changed_top_level_keys,
+};
 use crate::error::SessionError;
+use crate::guards::Guards;
 use crate::log::{LogEntry, LogKind, SessionLog, StepRecord};
 use crate::loop_types::{Event, Executable, Outcome, Park};
-use crate::model::{Action, Model, RawOutput, Schema, StepOutput, StepSink, Usage};
+use crate::maintainer::{MaintainInput, Maintainer};
+use crate::model::{
+    Action, Model, RawOutput, Schema, StepOutput, StepSink, Usage, restrict_action_types,
+};
 use crate::patch::PatchStrategy;
 use crate::prompt::{AgentState, Augmentation, HarnessView, PromptBuilder, Snippet, SystemPrompt};
-use crate::promptable::{Observation, Promptable};
+use crate::promptable::{Notes, Observation, Promptable};
+use crate::read_window::parse_read_header;
+use crate::report::ReportOutcome;
 use crate::sandbox::SandboxRoot;
-use crate::skill::{ParsedOutput, Skill, ValidatedStep, validate_user_patch};
+use crate::skill::{Commitment, ParsedOutput, Skill, ValidatedStep, validate_user_patch};
 use crate::store::{LoggedPatch, StateStore, apply_fn};
 use crate::tokenizer::{Budgets, TokenBudget, Tokenizer};
 use crate::tool::ToolSet;
 use crate::version::{CommittedState, HarnessState, InboxItem, Version};
+use crate::working_set::{WorkingSet, WorkingSetConfig};
 
 /// How many recent committed tool calls the loop guard remembers when
 /// looking for repeated (name, args, output) triples, including
 /// alternating patterns (e.g. A/B/A/B), not just consecutive repeats.
 const TOOL_CALL_HISTORY: usize = 8;
+
+/// Read-only tools tracked by the read-without-edit guard: any of these
+/// naming a path in `args.path` counts toward that path's consecutive-read
+/// streak. `search` and `recall` calls that name no path are ignored (there
+/// is nothing to key the counter on).
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "search",
+    "filter_last_tool_call",
+    "list_files",
+    "recall",
+];
+
+/// Tools that mutate the workspace or run arbitrary code. Any of these
+/// resets every path's read-streak counter outright, not just the path (if
+/// any) it names: `write_file`/`edit_file` could reset only their own
+/// path, but `shell`/`test` may have changed anything, so all four reset
+/// everything for a single, simple rule.
+const MUTATING_TOOLS: &[&str] = &["write_file", "edit_file", "revert_file", "shell", "test"];
+
+/// From `4`, a consecutive-read note fires on every further read of that
+/// path until an edit resets it.
+const READ_GUARD_THRESHOLD: u32 = 4;
+
+/// How many consecutive `Action::Continue` steps may produce the SAME note
+/// before the session parks instead of continuing (see `Session::
+/// last_continue_note`/`continue_repeat_count` and `Active::execute`'s
+/// `Action::Continue` arm). A skill's `validate` override converts a
+/// doomed-to-repeat step (e.g. review approving with no tool call) into
+/// `Action::Continue` rather than rejecting it, which is the right call the
+/// first couple of times -- but a live run sent the identical approval 35
+/// times in a row before the retry cap (which never applies to a committed
+/// `Continue` step) ever intervened. At the third identical note in a row,
+/// the harness commits the patch as usual but parks on `Park::AskUser`
+/// instead of returning `Outcome::Continue`, so a human (or the TUI/headless
+/// driver) breaks the loop instead of the model repeating itself forever.
+const CONTINUE_REPEAT_CAP: u32 = 3;
+
+/// Large enough window to find any `ToolOutput` entry from the current
+/// activation when looking up a previous `read_file` call's header for
+/// 7.8's read-paging special case (mirrors `working_set.rs`'s
+/// `LOG_SCAN_LIMIT`, which core cannot import since it's private to that
+/// module).
+const READ_HEADER_LOOKUP_LIMIT: usize = 1_000_000;
+
+/// While a commitment (`Skill::commitment`) is set, at most this many reads
+/// of the committed path are allowed before the commitment-slot rule starts
+/// rejecting further reads and insists on the committed call (or a changed
+/// `next`).
+const COMMITMENT_READ_CAP: u32 = 2;
+
+/// Result of `Active::apply_trusted_patch`: the new version, the harness
+/// step it committed at, and the sorted top-level workspace keys the patch
+/// actually changed.
+struct AppliedTrustedPatch {
+    version: Version,
+    step: u64,
+    keys: Vec<String>,
+}
+
+/// A verification command (`shell` or `test`) that ran to completion, kept
+/// so an exact repeat with nothing changed in between can be rejected (see
+/// `Session::last_verify` / the redundant-verification guard in
+/// `Active::step`).
+#[derive(Clone, Debug, PartialEq)]
+struct VerifyRun {
+    /// The command as normalized by `normalize_command`.
+    cmd: String,
+    /// Short human-readable summary of what the command returned, shown in
+    /// the rejection message.
+    summary: String,
+}
+
+/// The result of the 7.7 (redundant-verification) or 7.8
+/// (redundant-identical-read) guard recognizing this step's tool call as an
+/// exact repeat: the step still commits (patch + action + acks), but the
+/// call itself is not re-run in `Active::execute` -- see that guard's
+/// commentary in `Active::step` and the "do NOT run the tool" handling in
+/// `Active::execute`.
+struct SkippedCall {
+    /// The guard's rejection text, unchanged from what `reject` would have
+    /// sent -- used verbatim as (or as the first line of) the pending
+    /// observation.
+    reason: String,
+    /// The previous result to show the model in place of re-running the
+    /// call: 7.7's `last.summary` (what the command returned last time).
+    /// Empty for 7.8, whose guard reason already points at the log
+    /// (`"...that output is in the log"`), so there is nothing further to
+    /// show.
+    cached: String,
+}
+
+/// `read_file`'s own default `limit` (`tools/src/read_file.rs`'s
+/// `default_limit`), used when paging forward past a truncated window and
+/// the model's repeat named no `limit` of its own.
+const DEFAULT_READ_FILE_LIMIT: u64 = 100;
+
+/// 7.8's special case for `read_file`: an identical repeat whose previous
+/// window was truncated pages forward instead of being skipped (see
+/// `Active::step`'s 7.8 commentary). Carries what's needed to rewrite the
+/// call's args before it runs, and to render the "you repeated the read"
+/// note and the `paged_read` System entry afterward.
+struct PagedRead {
+    /// `args.path` of the repeated call, used in the `paged_read` log entry.
+    path: String,
+    /// The previous window's `(from, to)` line range, parsed from its
+    /// output header.
+    from: (u64, u64),
+    /// The model's original args for this call, unchanged -- logged
+    /// verbatim in the `paged_read` System entry "for the record" even
+    /// though the committed `Action` entry carries the rewritten args.
+    original_args: Value,
+    /// The offset the rewritten call will read from (`from.1 + 1`).
+    to_offset: u64,
+}
+
+/// Normalizes a shell/test command string for the redundant-verification
+/// guard: trims, cuts at the first `|` (so `echo hi` and `echo hi | cat` are
+/// treated the same), strips a trailing `2>&1`, collapses runs of
+/// whitespace to one space, and trims again.
+fn normalize_command(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    let cut = match trimmed.find('|') {
+        Some(idx) => &trimmed[..idx],
+        None => trimmed,
+    };
+    let cut = cut.trim();
+    let cut = cut.strip_suffix("2>&1").unwrap_or(cut);
+    let collapsed = cut.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.trim().to_string()
+}
+
+/// Canonical key for one read-only tool call, used by the
+/// redundant-identical-read guard (`Session::reads_since_mutation`):
+/// `"{name} {args}"`, where `args` is `args`'s compact JSON. `serde_json`'s
+/// `Value::Object` is a `BTreeMap` unless the `preserve_order` feature is
+/// enabled (it is not, workspace-wide -- see `Cargo.lock`), so `Value`'s
+/// `Display`/`to_string()` already serializes object keys in sorted order;
+/// no separate normalization step is needed for the args to be canonical.
+fn read_call_key(name: &str, args: &Value) -> String {
+    format!("{name} {args}")
+}
+
+/// True when `patch` is an empty JSON object (`{}`) -- the raw patch object
+/// has no keys, so this step's patch recorded nothing to the workspace.
+/// Anything else (a non-empty object, or a patch strategy that never sends
+/// an object at all) is not empty: it wrote, or attempted to write,
+/// something.
+fn is_empty_patch(patch: &Value) -> bool {
+    matches!(patch, Value::Object(map) if map.is_empty())
+}
+
+/// Extracts the command string for `shell`/`test` args: `args.cmd`, falling
+/// back to `args.command` (the alias the tools themselves accept), then
+/// normalizes it. `None` when neither key is a string.
+fn extract_command(args: &Value) -> Option<String> {
+    let raw = args
+        .get("cmd")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("command").and_then(Value::as_str))?;
+    Some(normalize_command(raw))
+}
+
+/// True for a line that is pure framing added by `run_shell`/the `test`
+/// tool around a command's real output (`exit: N`, `--- stdout ---`,
+/// `--- stderr ---`), not content the command itself returned.
+fn is_verify_framing_line(line: &str) -> bool {
+    line.starts_with("exit: ")
+        || line.starts_with("command: ")
+        || line == "--- stdout ---"
+        || line == "--- stderr ---"
+        || line == "--- failure summary ---"
+}
+
+/// First non-empty, non-framing line of `text` (skipping `run_shell`'s
+/// `exit:`/`--- stdout ---`/`--- stderr ---` markers, which describe the
+/// wrapper, not what the command returned), followed by up to three further
+/// lines that contain `FAILED`, `error[`, or `panicked`, joined by `; ` and
+/// truncated to 300 chars. Used as the `summary` of a `VerifyRun`.
+fn summarize_verify_output(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim);
+    let first = lines
+        .find(|l| !l.is_empty() && !is_verify_framing_line(l))
+        .unwrap_or("");
+    let mut parts: Vec<&str> = vec![first];
+    for line in lines {
+        if parts.len() >= 4 {
+            break;
+        }
+        if line.contains("FAILED") || line.contains("error[") || line.contains("panicked") {
+            parts.push(line);
+        }
+    }
+    let joined = parts.join("; ");
+    joined.chars().take(300).collect()
+}
+
+/// Normalizes a failing `test` tool output (`tools/src/test_tool.rs`'s
+/// `format_result`) down to just its failure summary, for the
+/// repeated-failure guard to compare consecutive fails by. When the
+/// `--- failure summary ---` marker is present, returns the (trimmed) text
+/// after it, up to the next line starting with `--- ` (typically
+/// `--- stdout ---`) or the end of the text. When the marker is absent
+/// (e.g. `result:` couldn't be parsed), falls back to everything after the
+/// first line (dropping the `command: ...` line), trimmed.
+fn normalize_failure_summary(output: &str) -> String {
+    const MARKER: &str = "--- failure summary ---\n";
+    if let Some(start) = output.find(MARKER) {
+        let rest = &output[start + MARKER.len()..];
+        let summary_lines: Vec<&str> = rest
+            .lines()
+            .take_while(|l| !l.starts_with("--- "))
+            .collect();
+        summary_lines.join("\n").trim().to_string()
+    } else {
+        match output.split_once('\n') {
+            Some((_, rest)) => rest.trim().to_string(),
+            None => output.trim().to_string(),
+        }
+    }
+}
 
 /// A cloneable, shareable handle that can cancel the in-flight `step()`
 /// call. A fresh `CancellationToken` is installed at the start of every
@@ -66,7 +297,7 @@ pub struct SessionConfig {
 pub struct Session<W> {
     pub(crate) store: Box<dyn StateStore<W>>,
     pub(crate) log: Arc<dyn SessionLog>,
-    pub(crate) model: Box<dyn Model>,
+    pub(crate) model: Arc<dyn Model>,
     pub(crate) augmenters: Vec<(Box<dyn crate::augmenter::Augmenter<W>>, TokenBudget)>,
     pub(crate) tools: ToolSet,
     pub(crate) tokenizer: Box<dyn Tokenizer>,
@@ -77,18 +308,138 @@ pub struct Session<W> {
     /// recurs identically, whether consecutively or in an alternating
     /// pattern (e.g. A/B/A/B).
     recent_tool_calls: VecDeque<(String, Value, String)>,
+    /// Per-path count of consecutive read-only tool calls targeting that
+    /// path since the last mutating call (to any path) or the last mutating
+    /// call naming that path. Read-without-edit guard: see `READ_ONLY_TOOLS`
+    /// / `MUTATING_TOOLS`.
+    read_streaks: HashMap<String, u32>,
+    /// Reads of the committed path (see `Commitment`) since the commitment
+    /// was set or last changed. Reset to 0 whenever `last_commitment`
+    /// changes (including going from `Some` to `None` or vice versa).
+    commitment_reads: u32,
+    /// The commitment as of the end of the previous step, used to detect a
+    /// change (which resets `commitment_reads`) and to note in the
+    /// observation when a mutating call doesn't match it.
+    last_commitment: Option<Commitment>,
+    /// The most recent `shell`/`test` call that completed successfully
+    /// (normalized command + output summary), used by the
+    /// redundant-verification guard to reject an exact repeat run with
+    /// nothing changed in between. Reset to `None` on `activate`/
+    /// `activate_forced`.
+    last_verify: Option<VerifyRun>,
+    /// Whether anything has mutated the workspace (an `edit_file`/
+    /// `write_file` call executed) since `last_verify` was last set. A
+    /// `shell`/`test` repeat is only rejected while this is `false`.
+    mutated_since_verify: bool,
+    /// Consecutive read-only calls (any tool in `READ_ONLY_TOOLS`) executed
+    /// with an EMPTY raw patch and no commitment set. A read whose patch
+    /// writes anything resets this to 0 instead of incrementing it -- only a
+    /// look that records nothing counts. Also reset to 0 after any executed
+    /// mutating call, on activation, and whenever the commitment changes
+    /// from `None` to `Some`. Gated by `Skill::silent_read_cap`.
+    silent_reads: u32,
+    /// Redundant-identical-read guard: every successfully executed read-only
+    /// call (any tool in `READ_ONLY_TOOLS` except `filter_last_tool_call`,
+    /// which by design re-reads a previous output) is keyed by
+    /// `read_call_key` (tool name + canonical JSON of its args) and recorded
+    /// here with the step it ran at. An identical call is rejected while its
+    /// key is still present -- nothing has changed, so it would return the
+    /// same output already in the log. Cleared on any successfully executed
+    /// mutating call (`MUTATING_TOOLS`) and on activation, since either may
+    /// have changed what a repeat of that call would return.
+    reads_since_mutation: HashMap<String, u64>,
     last_prompt_tokens: Option<usize>,
     last_usage: Option<Usage>,
     failures: u32,
+    /// The `reason` of the most recent rejection, kept so `reject` can tell
+    /// the model when it has repeated the exact same mistake. Cleared on
+    /// any successful commit (alongside `failures`).
+    last_rejection_reason: Option<String>,
     cancel: CancelHandle,
     last_activation: Option<(String, Vec<String>)>,
+    /// Configured child runner (milestone 9). `None` means this session
+    /// cannot delegate; `Action::Delegate` is then always rejected.
+    child_runner: Option<Arc<dyn ChildRunner>>,
+    /// Number of delegations issued so far, used to number agent paths
+    /// (`"<parent_skill>/<child>#<n>"`).
+    delegations: u64,
+    /// Context maintenance (statie-spec.md "9. Context maintenance"):
+    /// `None` (the default) means no behaviour change from before this
+    /// feature existed. When set, called after every committed `Tool` step
+    /// and after `AskUser`/`Yield` parks -- never on a rejection or after
+    /// `Done` -- to distil the step's dropped reasoning into the
+    /// harness-owned `notes` field.
+    maintainer: Option<Arc<dyn Maintainer>>,
+    /// Working-set config (statie-spec.md "10. Working set"). Defaults to
+    /// `WorkingSetConfig::default()` (on: 4 windows, 6 recent-call lines);
+    /// `max_windows: 0` (via `with_working_set`) disables the section and
+    /// restores pre-working-set behaviour.
+    working_set: WorkingSetConfig,
+    /// Rule-audit switches (statie-spec.md "10. After it works: the rule
+    /// audit", milestone 12). Defaults to `Guards::default()` (all `true`),
+    /// which is exactly today's behaviour.
+    guards: Guards,
+    /// Green checkpoint (statie-spec.md "10. Working set", "Green
+    /// checkpoint"): every file the activation had edited as of the last
+    /// step at which `test` reported `result: pass`, snapshotted from the
+    /// sandbox. `None` until the first pass. Kept in memory only (C2:
+    /// never persisted to the store) and deliberately carried across a
+    /// `Handoff` within the same `Session` (e.g. implement -> review may
+    /// hand back to implement) rather than cleared on activation -- a
+    /// fresh activation starting mid-session still has a green state worth
+    /// protecting until a new one replaces it.
+    green_checkpoint: Option<crate::green::GreenCheckpoint>,
+    /// Whether the most recently completed `test` tool call (own entries
+    /// only) reported `result: pass`. `None` before any `test` call has
+    /// run. Updated once, right when the `test` ToolOutput is produced, so
+    /// the park-time check (`Session::checkpoint_is_stale`) never rescans
+    /// the log.
+    last_test_result: Option<bool>,
+    /// Repeated-failure guard: the normalized failure summary (see
+    /// `normalize_failure_summary`) of the most recent FAILING `test` call.
+    /// `None` before any failing `test` call has run since activation, and
+    /// cleared back to `None` whenever a `test` call passes -- a pass means
+    /// there is nothing to compare the next failure against. Reset to
+    /// `None` on `activate`/`activate_forced`.
+    last_test_failure: Option<String>,
+    /// How many consecutive failing `test` calls (including the current
+    /// one) have shared `last_test_failure`'s summary. 0 when
+    /// `last_test_failure` is `None` (including right after a pass); always
+    /// at least 1 whenever `last_test_failure` is `Some`. Reset alongside
+    /// `last_test_failure`.
+    repeated_failure_count: u32,
+    /// Whether an `edit_file`/`write_file` call has executed successfully
+    /// since the most recent `test` call (of either verdict). Set `true` by
+    /// the same call site that sets `mutated_since_verify = true`; set back
+    /// to `false` on every `test` call (pass or fail), mirroring
+    /// `mutated_since_verify`'s reset on a `shell`/`test` call -- but kept
+    /// as a separate flag because `mutated_since_verify` is already cleared
+    /// by the time `note_test_result` runs (see that call site's comment).
+    /// Reset to `false` on `activate`/`activate_forced`.
+    mutated_since_test: bool,
+    /// Repeated-`Continue`-note guard: the note text of the most recent
+    /// `Action::Continue` step (see `Active::execute`'s handling of that
+    /// variant), kept so the next `Continue` step can tell whether it
+    /// produced the SAME note again. `None` initially, on activation, and
+    /// after any step whose outcome is not `Outcome::Continue` produced by
+    /// `Action::Continue` -- i.e. any other outcome breaks the streak, the
+    /// same as a different note would.
+    last_continue_note: Option<String>,
+    /// How many consecutive steps have produced `last_continue_note`
+    /// (including the one that set it, so this is always >= 1 whenever
+    /// `last_continue_note` is `Some`). Reset to 0 alongside
+    /// `last_continue_note` -- see that field's doc. At
+    /// `CONTINUE_REPEAT_CAP`, the step that would make the note recur a
+    /// third time parks instead of continuing (`Active::execute`'s
+    /// `Action::Continue` arm).
+    continue_repeat_count: u32,
 }
 
 impl<W> Session<W> {
     pub fn new(
         store: Box<dyn StateStore<W>>,
         log: Arc<dyn SessionLog>,
-        model: Box<dyn Model>,
+        model: Arc<dyn Model>,
         tools: ToolSet,
         tokenizer: Box<dyn Tokenizer>,
         config: SessionConfig,
@@ -103,12 +454,57 @@ impl<W> Session<W> {
             config,
             pending_observation: None,
             recent_tool_calls: VecDeque::new(),
+            read_streaks: HashMap::new(),
+            commitment_reads: 0,
+            last_commitment: None,
+            last_verify: None,
+            mutated_since_verify: false,
+            silent_reads: 0,
+            reads_since_mutation: HashMap::new(),
             last_prompt_tokens: None,
             last_usage: None,
             failures: 0,
+            last_rejection_reason: None,
             cancel: CancelHandle::new(),
             last_activation: None,
+            child_runner: None,
+            delegations: 0,
+            maintainer: None,
+            working_set: WorkingSetConfig::default(),
+            guards: Guards::default(),
+            green_checkpoint: None,
+            last_test_result: None,
+            last_test_failure: None,
+            repeated_failure_count: 0,
+            mutated_since_test: false,
+            last_continue_note: None,
+            continue_repeat_count: 0,
         }
+    }
+
+    /// Attaches a context-maintenance backend (statie-spec.md "9. Context
+    /// maintenance"). Without one, `notes` is never written and the step
+    /// loop behaves exactly as it did before this feature existed.
+    pub fn with_maintainer(mut self, m: Arc<dyn Maintainer>) -> Self {
+        self.maintainer = Some(m);
+        self
+    }
+
+    /// Configures the working set (statie-spec.md "10. Working set").
+    /// Without a call, the session runs with `WorkingSetConfig::default()`
+    /// (on). Pass `WorkingSetConfig { max_windows: 0, recent_calls: 0 }` to
+    /// disable the section and restore pre-working-set behaviour.
+    pub fn with_working_set(mut self, cfg: WorkingSetConfig) -> Self {
+        self.working_set = cfg;
+        self
+    }
+
+    /// Configures the rule-audit switches (statie-spec.md "10. After it
+    /// works: the rule audit", milestone 12). Without a call, the session
+    /// runs with `Guards::default()` (all rules on -- today's behaviour).
+    pub fn with_guards(mut self, guards: Guards) -> Self {
+        self.guards = guards;
+        self
     }
 
     pub fn with_augmenter(
@@ -117,6 +513,14 @@ impl<W> Session<W> {
         budget: TokenBudget,
     ) -> Self {
         self.augmenters.push((augmenter, budget));
+        self
+    }
+
+    /// Attaches the runner used to execute `Action::Delegate`. Without one,
+    /// every delegation is rejected with an observation naming the (empty)
+    /// set of configured children.
+    pub fn with_child_runner(mut self, runner: Arc<dyn ChildRunner>) -> Self {
+        self.child_runner = Some(runner);
         self
     }
 
@@ -177,6 +581,11 @@ impl<W> Session<W> {
                         inbox: Vec::new(),
                         step: 0,
                         last_overflow: None,
+                        pinned: None,
+                        green_step: None,
+                        green_filtered: false,
+                        tool_calls: 0,
+                        last_test_cmd: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -188,22 +597,52 @@ impl<W> Session<W> {
                 harness.active_tools = skill.tools();
                 // The config file, not the persisted snapshot, owns budgets.
                 harness.budgets = self.config.budgets;
+                // Reset per-activation: this activation has not yet run any
+                // tool call (see `HarnessState::tool_calls`'s doc).
+                harness.tool_calls = 0;
                 self.store.set_harness(harness).await?;
             }
         }
 
         self.last_activation = Some((name.clone(), skill.allowed_transitions()));
+        self.last_verify = None;
+        self.silent_reads = 0;
+        self.reads_since_mutation.clear();
+        self.last_test_failure = None;
+        self.repeated_failure_count = 0;
+        self.mutated_since_test = false;
+        self.last_continue_note = None;
+        self.continue_repeat_count = 0;
 
         let entry = LogEntry {
             step: self.log.last_step(),
             kind: LogKind::System,
             ts: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::json!({"event": "activate", "skill": name}),
+            agent: None,
         };
         self.log.append(entry)?;
 
         let spec = skill.spec();
-        let schema = Schema::of::<StepOutput<<K::Patch as PatchStrategy<W>>::Patch>>();
+        let mut schema = Schema::of::<StepOutput<<K::Patch as PatchStrategy<W>>::Patch>>();
+        // Narrow the advertised action.type enum (and, transitively, the
+        // "Exact shapes" examples SystemPrompt::for_harness prints from it)
+        // to exactly what this skill's rules will accept, so a
+        // grammar-constrained decoder can't be steered into producing an
+        // action that's doomed to be rejected (e.g. `yield` in a skill that
+        // forbids it).
+        let mut allowed_types: Vec<&str> = vec!["tool"];
+        if skill.allows_ask_user() {
+            allowed_types.push("ask_user");
+        }
+        if !skill.allowed_delegates().is_empty() {
+            allowed_types.push("delegate");
+        }
+        allowed_types.push("done");
+        if skill.allows_yield() {
+            allowed_types.push("yield");
+        }
+        restrict_action_types(&mut schema, &allowed_types);
 
         Ok(Active {
             session: self,
@@ -234,6 +673,7 @@ impl<W> Session<W> {
             kind: LogKind::User,
             ts: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::json!({"id": next_id, "text": text}),
+            agent: None,
         };
         self.log.append(entry)?;
         Ok(())
@@ -264,6 +704,189 @@ impl<W> Session<W> {
     pub fn config(&self) -> &SessionConfig {
         &self.config
     }
+
+    /// Read-without-edit guard: updates the per-path consecutive-read
+    /// streak for one completed tool call (`name`/`args`, taking the path
+    /// from `args.path` when present), and returns the new count for that
+    /// path when a read-guard note should fire (count >= threshold).
+    ///
+    /// A mutating tool (`write_file`, `edit_file`, `shell`, `test`) resets
+    /// every path's counter, since a `shell` run may have changed the
+    /// world; a mutating call naming a specific path is a special case of
+    /// this (the whole map is cleared, which also clears that path). A
+    /// read-only tool with no path in `args` (bare `search`, or `recall`,
+    /// which has no `path` field at all) is ignored: there is nothing to
+    /// key the counter on.
+    fn note_tool_call_for_read_guard(&mut self, name: &str, args: &Value) -> Option<(String, u32)> {
+        if MUTATING_TOOLS.contains(&name) {
+            self.read_streaks.clear();
+            return None;
+        }
+        if !READ_ONLY_TOOLS.contains(&name) {
+            return None;
+        }
+        let path = args.get("path").and_then(Value::as_str)?;
+        let count = self.read_streaks.entry(path.to_string()).or_insert(0);
+        *count += 1;
+        let count = *count;
+        if count >= READ_GUARD_THRESHOLD {
+            Some((path.to_string(), count))
+        } else {
+            None
+        }
+    }
+
+    /// Increments the committed `HarnessState::tool_calls` counter by one
+    /// and persists it via `set_harness`, the same out-of-band commit
+    /// pattern `execute`'s success path already uses for `green_step`/
+    /// `last_overflow`. Called for every `Action::Tool` that actually
+    /// executed -- the skipped-redundant path, the success path, and the
+    /// tool-error path -- never for a step `reject`ed before it committed,
+    /// and never for the "not active"/"unknown tool" guard rejections
+    /// (nothing ran).
+    async fn record_tool_call(&mut self) -> Result<(), SessionError> {
+        let (cur, _version) = self.state().await?;
+        let mut harness = cur.harness;
+        harness.tool_calls += 1;
+        self.store.set_harness(harness).await?;
+        Ok(())
+    }
+
+    /// Green checkpoint (statie-spec.md "10. Working set", "Green
+    /// checkpoint"): called right after a `test` ToolOutput is logged, with
+    /// its output text. Updates `last_test_result`; on a pass, snapshots
+    /// every path this activation has successfully `edit_file`/
+    /// `write_file`'d so far (from the log, same derivation
+    /// `working_set.rs` uses), replacing any earlier checkpoint, and
+    /// returns the `green_checkpoint` System entry plus the observation
+    /// prefix to prepend -- both `None` when the run was not a pass (the
+    /// caller still gets `last_test_result` updated).
+    fn note_test_result(&mut self, step: u64, output: &str) -> Option<(LogEntry, String)> {
+        let pass = crate::green::is_pass(output);
+        self.last_test_result = Some(pass);
+        let mutated = self.mutated_since_test;
+        self.mutated_since_test = false;
+
+        if !pass {
+            let summary = normalize_failure_summary(output);
+            if self.last_test_failure.as_deref() == Some(summary.as_str()) {
+                self.repeated_failure_count += 1;
+            } else {
+                self.last_test_failure = Some(summary);
+                self.repeated_failure_count = 1;
+            }
+
+            if self.repeated_failure_count < 2 {
+                return None;
+            }
+
+            let count = self.repeated_failure_count;
+            let payload = serde_json::json!({
+                "step": step,
+                "count": count,
+                "mutated_since_previous": mutated,
+            });
+            let entry = system_entry(step, "repeated_failure", payload);
+            let prefix = if mutated {
+                format!(
+                    "note: this failure is identical to the previous test run's ({count} runs \
+                     in a row); your edit(s) since did not change it. Before editing again, \
+                     read the exact lines the error points to and fix that, not something \
+                     else.\n\n"
+                )
+            } else {
+                format!(
+                    "note: this failure is identical to the previous test run's ({count} runs \
+                     in a row) and nothing was edited in between. Read the exact lines the \
+                     error points to, then fix that.\n\n"
+                )
+            };
+            return Some((entry, prefix));
+        }
+
+        self.last_test_failure = None;
+        self.repeated_failure_count = 0;
+
+        let paths = crate::green::edited_paths(self.log.as_ref());
+        let snap = crate::green::snapshot(&self.config.root, step, &paths);
+        let all_paths: Vec<&str> = snap
+            .checkpoint
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        let mut payload = serde_json::json!({"step": step, "paths": all_paths});
+        if !snap.skipped.is_empty()
+            && let Value::Object(map) = &mut payload
+        {
+            map.insert(
+                "skipped".to_string(),
+                serde_json::to_value(&snap.skipped).unwrap_or(Value::Null),
+            );
+        }
+        let entry = system_entry(step, "green_checkpoint", payload);
+        self.green_checkpoint = Some(snap.checkpoint);
+
+        let prefix = format!(
+            "verification passed at step {step}; the files you edited are checkpointed. \
+             Finish the plan's bookkeeping and hand off (`done` with `next_skill: review`); \
+             cleanup beyond the task is review's call.\n\n"
+        );
+        Some((entry, prefix))
+    }
+
+    /// Green checkpoint: called wherever `Active::step`/`Active::execute`
+    /// is about to return a parking outcome (`Park::Failure`/
+    /// `Park::AskUser`/`Park::Yield`), a handoff, or `Done`. Restores the
+    /// checkpointed files to the sandbox when a checkpoint exists AND the
+    /// most recent `test` result is not a pass (a fail, or no `test` since
+    /// activation -- anything other than `Some(true)`); a park while the
+    /// checkpoint's own pass is still the most recent result needs no
+    /// restore (disk already matches it). Returns the `restored_green`
+    /// System entry and the sentence to append to the park/handoff message
+    /// when a restore happened, `None` otherwise. Never restores on
+    /// `Outcome::Continue` -- callers only invoke this at the sites listed
+    /// above.
+    fn maybe_restore_green(&mut self, step: u64) -> Option<(LogEntry, String)> {
+        if self.last_test_result == Some(true) {
+            return None;
+        }
+        let checkpoint = self.green_checkpoint.as_ref()?;
+
+        // A path `edit_file`/`write_file`'d for the first time AFTER the
+        // checkpoint (so it never appears in `checkpoint.files` at all --
+        // it didn't exist yet when the snapshot was taken) needs to be
+        // deleted on restore too, the same as a path that WAS present at
+        // checkpoint time but has since been removed from disk
+        // (`content: None` in the checkpoint already covers that case).
+        // Re-derive the full set of paths this activation has ever edited
+        // and add an absent entry for any that the checkpoint doesn't
+        // already know about.
+        let checkpointed: std::collections::HashSet<&str> =
+            checkpoint.files.iter().map(|f| f.path.as_str()).collect();
+        let mut effective = checkpoint.clone();
+        for path in crate::green::edited_paths(self.log.as_ref()) {
+            if !checkpointed.contains(path.as_str()) {
+                effective.files.push(crate::green::CheckpointFile {
+                    path,
+                    content: None,
+                });
+            }
+        }
+
+        let restored_paths = crate::green::restore(&self.config.root, &effective);
+        let from_step = checkpoint.step;
+        let entry = system_entry(
+            step,
+            "restored_green",
+            serde_json::json!({"from_step": from_step, "paths": restored_paths}),
+        );
+        let sentence = format!(
+            "Restored the files to the state where the test passed at step {from_step}; the \
+             edits since are in the log."
+        );
+        Some((entry, sentence))
+    }
 }
 
 /// An active skill activation: the sole way to call `step`. Only
@@ -279,6 +902,101 @@ impl<'a, K: Skill + ?Sized> Active<'a, K>
 where
     K::Workspace: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
+    /// Looks up the `read_file` `ToolOutput` logged at `step` (as recorded
+    /// in `Session::reads_since_mutation`) and parses its header, for 7.8's
+    /// read-paging special case. `None` when no matching entry is found
+    /// (should not happen in practice -- `reads_since_mutation` only ever
+    /// points at a step whose call actually ran and logged a `ToolOutput`)
+    /// or its header doesn't parse.
+    fn previous_read_file_header(&self, step: u64) -> Option<crate::read_window::ReadWindowHeader> {
+        let entries = self
+            .session
+            .log
+            .entries(Some(LogKind::ToolOutput), READ_HEADER_LOOKUP_LIMIT);
+        let entry = entries
+            .iter()
+            .rev()
+            .find(|e| e.agent.is_none() && e.step == step)?;
+        let output = entry.payload.get("output").and_then(Value::as_str)?;
+        parse_read_header(output)
+    }
+
+    /// Green checkpoint (statie-spec.md "10. Working set", "Green
+    /// checkpoint"): called at every site about to return a parking
+    /// outcome, `Outcome::Done`, or `Outcome::Handoff` that carries no
+    /// message of its own to append the restore sentence to (`Yield`,
+    /// `Done`, `Handoff`). Restores the checkpoint into the sandbox and
+    /// pushes the `restored_green` entry into `entries` when a restore was
+    /// needed (checkpoint exists and the last `test` result is not a
+    /// pass); appends the sentence to `pending_observation` instead of
+    /// returning it, since none of these outcomes carry a string the
+    /// caller could hand back. No-op (nothing pushed, nothing appended)
+    /// when no restore was needed.
+    fn restore_green_on_park(&mut self, step: u64, entries: &mut Vec<LogEntry>) {
+        let Some((entry, sentence)) = self.session.maybe_restore_green(step) else {
+            return;
+        };
+        entries.push(entry);
+        let base = self
+            .session
+            .pending_observation
+            .take()
+            .map(|o| o.as_str().to_string())
+            .unwrap_or_default();
+        let text = if base.is_empty() {
+            sentence
+        } else {
+            format!("{base}\n\n{sentence}")
+        };
+        let (obs, _overflow) = Observation::truncate_with_report(
+            &crate::promptable::ToolOutputFull::new(text),
+            self.session.config.budgets.observation,
+            self.session.tokenizer.as_ref(),
+        );
+        self.session.pending_observation = Some(obs);
+    }
+
+    /// Same restore as `restore_green_on_park`, for an outcome that DOES
+    /// carry its own message string (`Park::AskUser`, `Park::Failure`):
+    /// restores the checkpoint and pushes the `restored_green` entry the
+    /// same way, then returns `message` with the sentence appended (or
+    /// `message` unchanged when no restore was needed).
+    fn restore_green_and_append(
+        &mut self,
+        step: u64,
+        entries: &mut Vec<LogEntry>,
+        message: String,
+    ) -> String {
+        let Some((entry, sentence)) = self.session.maybe_restore_green(step) else {
+            return message;
+        };
+        entries.push(entry);
+        format!("{message} {sentence}")
+    }
+
+    /// Green checkpoint, for callers that park outside `Active::step` (the
+    /// driver's autonomous step cap in `tui/src/driver.rs`: hitting the cap
+    /// while `Outcome::Continue` keeps coming back is itself a park the
+    /// driver manufactures, not one `step`/`execute` ever sees, so none of
+    /// `restore_green_on_park`/`restore_green_and_append` run for it).
+    /// Restores the checkpoint into the sandbox exactly as
+    /// `restore_green_and_append` does (checkpoint exists and the last
+    /// `test` result is not a pass), appends the `restored_green` System
+    /// entry directly to the session log the same way `apply_user_patch`
+    /// appends its own out-of-step entries (there is no `StepRecord` for
+    /// this call to return one inside), and returns the restore sentence.
+    /// `Ok(None)` when no restore was needed (no checkpoint, or the last
+    /// `test` already passed).
+    pub async fn restore_green_if_stale(&mut self) -> Result<Option<String>, SessionError> {
+        let (cur, _version) = self.session.state().await?;
+        let step = cur.harness.step;
+        let Some((entry, sentence)) = self.session.maybe_restore_green(step) else {
+            return Ok(None);
+        };
+        self.session.log.append(entry)?;
+        Ok(Some(sentence))
+    }
+
     pub async fn step(
         &mut self,
         ev: Event,
@@ -311,14 +1029,6 @@ where
         let (cur, version) = self.session.state().await?;
         let step_at_start = cur.harness.step;
 
-        if let Some(target) = self.skill.handoff(&cur.agent) {
-            entries.push(system_entry(
-                step_at_start,
-                "handoff",
-                serde_json::json!({"to": target}),
-            ));
-            return Ok(StepRecord::new(entries, Outcome::Handoff(target)));
-        }
         if self.skill.is_terminal(&cur.agent) {
             entries.push(system_entry(step_at_start, "done", serde_json::json!({})));
             return Ok(StepRecord::new(entries, Outcome::Done));
@@ -355,16 +1065,35 @@ where
 
         // 4. Build the bounded prompt.
         let caps = self.session.model.capabilities();
+        let delegates = self.skill.allowed_delegates();
         let system_prompt = SystemPrompt::for_harness(
             &caps,
             <K::Patch as PatchStrategy<K::Workspace>>::name(),
             <K::Patch as PatchStrategy<K::Workspace>>::describe(),
             Some(&self.schema),
+            &delegates,
         );
         let tool_list = self.session.tools.list_for(&cur.harness.active_tools);
         let agent_state = AgentState::new(&cur.agent);
-        let harness_view = HarnessView::new(&cur.harness);
+        let current_commitment = self.skill.commitment(&cur.agent).map(|c| {
+            let reads_left = COMMITMENT_READ_CAP.saturating_sub(self.session.commitment_reads);
+            (c, reads_left)
+        });
+        let harness_view = HarnessView::new(&cur.harness).with_commitment(current_commitment);
 
+        // Working set (statie-spec.md "10. Working set"): derived fresh
+        // from the log every step (C2: derived, never persisted), so it
+        // always reflects what's actually in the log, not the working set
+        // computed on some earlier step.
+        let working_set = WorkingSet::from_log(
+            self.session.log.as_ref(),
+            self.session.tokenizer.as_ref(),
+            cur.harness.budgets.working_set,
+            &self.session.working_set,
+            step_at_start,
+        );
+
+        let notes = self.skill.notes(&cur.agent).map(Notes::new);
         let mut builder = PromptBuilder::new(
             self.session.tokenizer.as_ref(),
             cur.harness.budgets,
@@ -374,7 +1103,9 @@ where
         .spec(&self.spec)
         .tools(&tool_list)
         .agent(&agent_state)
-        .harness(&harness_view);
+        .notes(notes.as_ref())
+        .harness(&harness_view)
+        .working_set(working_set.as_ref());
         if let Some(aug) = &augmentation {
             builder = builder.augmentation(aug);
         }
@@ -429,6 +1160,7 @@ where
                 kind: LogKind::Reasoning,
                 ts: chrono::Utc::now().to_rfc3339(),
                 payload: serde_json::json!({"text": reasoning.as_ref()}),
+                agent: None,
             });
         }
 
@@ -466,8 +1198,275 @@ where
             }
         };
 
+        // 7.5. A patch that changes the handoff target must be paired with
+        // action `done` in the same step: the skill instructions say "set
+        // next_skill and send done", but a tool call alongside a changed
+        // next_skill would otherwise silently hand off on the *next* step
+        // (before the model even sees the tool's result), looping forever
+        // in the wrong skill. Reject so the model gets a corrective
+        // observation and the retry cap applies.
+        let cur_target = self.skill.handoff(&cur.agent);
+        let next_target = self.skill.handoff(validated.patch().next());
+        if !matches!(validated.action(), Action::Done) && next_target != cur_target {
+            return Ok(self.reject(
+                entries,
+                step_at_start,
+                format!(
+                    "changing `next_skill` (to {next_target:?}) requires action `done`; keep \
+                     working with a tool call, or send `done` together with `next_skill` to \
+                     hand off"
+                ),
+                &raw_content,
+                None,
+            ));
+        }
+
+        // 7.6. Commitment slot: a decision made in one step binds the next.
+        // Evaluated against the *post-patch* workspace so a patch that
+        // changes `next` in the same step it reads takes effect
+        // immediately (the read below is then judged against the new
+        // commitment, not the stale one). No commitment set -> no rule
+        // (today's behaviour); `done`/`ask_user`/`yield`/`delegate` are
+        // unaffected -- only `Action::Tool` is gated.
+        let commitment = self.skill.commitment(validated.patch().next());
+        if commitment != self.session.last_commitment {
+            self.session.commitment_reads = 0;
+            if self.session.last_commitment.is_none() && commitment.is_some() {
+                self.session.silent_reads = 0;
+            }
+            self.session.last_commitment = commitment.clone();
+        }
+        // Set when this step's tool call is a mutating call matching the
+        // commitment: after commit+execute, the commitment is spent (the
+        // observation gets a "commitment fulfilled" prefix, and if the
+        // model's own patch didn't already clear `next`, the harness clears
+        // it with an extra commit). Set to the note text when this step's
+        // tool call is a mutating call that does *not* match: the
+        // observation gets a "note:" suffix reminding the model `next` is
+        // stale, but `next` is left alone.
+        let mut commitment_fulfilled: Option<Commitment> = None;
+        let mut commitment_mismatch_note: Option<String> = None;
+        // Set (guards.commitment_read_cap = false only) when this step's
+        // tool call is a read while a commitment is set: appended to the
+        // observation below instead of the cap rejecting/clearing it.
+        let mut commitment_pending_note: Option<String> = None;
+        if let (Action::Tool { name, args }, Some(c)) = (validated.action(), &commitment) {
+            let is_read_only = READ_ONLY_TOOLS.contains(&name.as_str());
+            let is_mutating = MUTATING_TOOLS.contains(&name.as_str());
+            if is_read_only {
+                let targets_committed_path = match name.as_str() {
+                    "filter_last_tool_call" => true,
+                    "read_file" | "search" | "list_files" => {
+                        c.path.is_some()
+                            && args.get("path").and_then(Value::as_str) == c.path.as_deref()
+                    }
+                    _ => false,
+                };
+                if !self.session.guards.commitment_read_cap {
+                    // Off: reads against the committed path neither count
+                    // toward the cap nor clear the commitment. A short
+                    // factual note is appended to this step's observation
+                    // (below, once the tool has actually run) instead of a
+                    // rejection.
+                    commitment_pending_note = Some(format!(
+                        "note: `next` is still pending -- `{}` {} ({}).",
+                        c.tool,
+                        c.path.as_deref().unwrap_or("(no path)"),
+                        c.what
+                    ));
+                } else if targets_committed_path
+                    && self.session.commitment_reads < COMMITMENT_READ_CAP
+                {
+                    self.session.commitment_reads += 1;
+                } else {
+                    let path_desc = c.path.as_deref().unwrap_or("(no path)");
+                    return Ok(self.reject(
+                        entries,
+                        step_at_start,
+                        format!(
+                            "you committed to `{} {}` ({}); make that call now, or change \
+                             `next` (and say why in `recent_summary`) -- you have used {} of \
+                             {COMMITMENT_READ_CAP} reads on {}",
+                            c.tool, path_desc, c.what, self.session.commitment_reads, path_desc
+                        ),
+                        &raw_content,
+                        None,
+                    ));
+                }
+            } else if is_mutating {
+                // `shell`/`test` commitments match on the tool name alone:
+                // a shell command has no `path` argument, so comparing
+                // `args.path` against `c.path` for these two tools recorded
+                // the call that honoured the commitment as a mismatch
+                // whenever the model had also written a `path` onto the
+                // commitment (e.g. copied from a `grep`/`search` call that
+                // itself carried no `path`). `edit_file`/`write_file` keep
+                // the path comparison: those calls do touch one named file,
+                // and the commitment is only fulfilled by the one it named.
+                let matches_commitment = name == &c.tool
+                    && (c.tool == "shell"
+                        || c.tool == "test"
+                        || c.path.is_none()
+                        || args.get("path").and_then(Value::as_str) == c.path.as_deref());
+                if matches_commitment {
+                    commitment_fulfilled = Some(c.clone());
+                } else {
+                    let path_desc = c.path.as_deref().unwrap_or("(no path)");
+                    commitment_mismatch_note = Some(format!(
+                        "note: `next` still says {} {} ({}); update it if that is no longer \
+                         the plan.",
+                        c.tool, path_desc, c.what
+                    ));
+                }
+            }
+        } else if let (Action::Tool { name, .. }, None) = (validated.action(), &commitment)
+            && self.session.guards.silent_reads
+            && READ_ONLY_TOOLS.contains(&name.as_str())
+            && is_empty_patch(validated.patch().raw())
+            && let Some(cap) = self.skill.silent_read_cap()
+            && self.session.silent_reads >= cap
+        {
+            // Guard 2: reads require a commitment (skill-driven). Only
+            // applies when no commitment is set -- the commitment-slot rule
+            // above already gates reads while one is -- and only to a read
+            // whose patch is empty: a read that records something (a file
+            // note, a plan step, `recent_summary`) is never counted.
+            let k = self.session.silent_reads;
+            return Ok(self.reject(
+                entries,
+                step_at_start,
+                format!(
+                    "{k} read(s) in a row that wrote nothing to the workspace. Write what you \
+                     learned in this patch (a file note, a plan step, `recent_summary`) or the \
+                     edit you will make (`next` = \
+                     {{\"tool\":\"edit_file\",\"path\":\"<file>\",\"what\":\"<one line>\"}}; \
+                     `next.tool` is never read_file), then read on. To find the exact spot, \
+                     `search` (pattern + path) beats paging"
+                ),
+                &raw_content,
+                None,
+            ));
+        }
+
+        // 7.7. Redundant-verification guard: an exact repeat of the most
+        // recently run `shell`/`test` command, with nothing mutated since,
+        // gives the same result. Rather than rejecting the whole step (and
+        // discarding a patch that may carry real progress alongside the
+        // redundant call), the step commits normally and the call itself is
+        // skipped at execution time -- see `SkippedCall` and the "do NOT
+        // run the tool" handling in `execute`.
+        let mut skip: Option<SkippedCall> = None;
+        if self.session.guards.redundant_verify
+            && let Action::Tool { name, args } = validated.action()
+            && (name == "shell" || name == "test")
+            && let Some(cmd) = extract_command(args)
+            && let Some(last) = &self.session.last_verify
+            && last.cmd == cmd
+            && !self.session.mutated_since_verify
+        {
+            skip = Some(SkippedCall {
+                reason: format!(
+                    "nothing has changed since you last ran `{cmd}` (it returned: {}); \
+                     running it again gives the same result. Make the change first with \
+                     edit_file or write_file, or run a different command",
+                    last.summary
+                ),
+                cached: last.summary.clone(),
+            });
+        }
+
+        // 7.8. Redundant-identical-read guard: an exact repeat of a
+        // read-only call already executed since the last mutation gives the
+        // same output already in the log. Same treatment as 7.7: commit the
+        // step and skip the call, don't reject it. Runs for every skill,
+        // before the commit, regardless of whether a commitment is set
+        // (that is a separate, narrower rule above). `filter_last_tool_call`
+        // is exempt: it re-reads a previous output by design, so an
+        // identical call to it is not redundant.
+        //
+        // Special case for `read_file` only: if the previous identical
+        // call's output header shows a truncated window (`showing a-b` with
+        // `b < total`), the model almost certainly wanted the rest of the
+        // file, not to be told its call was redundant -- a live run asked
+        // for the same default (untruncated-looking) window twelve times in
+        // a row and never once passed `offset`. Rather than skip, page
+        // forward: rewrite the call's `offset` to `b + 1` (keeping the
+        // model's own `limit`, or the tool default if it gave none) and let
+        // it run normally (see `PagedRead` and its use after the commit
+        // below, and the "do NOT skip" handling in `execute`). A window
+        // that already reached the end of the file (`b == total`), or whose
+        // header can't be parsed, falls through to the ordinary skip.
+        let mut paged: Option<PagedRead> = None;
+        if skip.is_none()
+            && self.session.guards.redundant_reads
+            && let Action::Tool { name, args } = validated.action()
+            && name != "filter_last_tool_call"
+            && READ_ONLY_TOOLS.contains(&name.as_str())
+        {
+            let key = read_call_key(name, args);
+            if let Some(&at_step) = self.session.reads_since_mutation.get(&key) {
+                if name == "read_file"
+                    && let Some(header) = self.previous_read_file_header(at_step)
+                    && !header.at_end()
+                {
+                    let to_offset = header.to + 1;
+                    let path = args
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    paged = Some(PagedRead {
+                        path,
+                        from: (header.from, header.to),
+                        original_args: args.clone(),
+                        to_offset,
+                    });
+                } else {
+                    // With the working set enabled (10. Working set), a window
+                    // for this exact call is likely still visible above, so
+                    // point there instead of "the log" (which the model can't
+                    // see without `recall`).
+                    let where_clause = if self.session.working_set.max_windows > 0 {
+                        "that window is in your working set above"
+                    } else {
+                        "that output is in the log"
+                    };
+                    skip = Some(SkippedCall {
+                        reason: format!(
+                            "you already ran `{name} {args}` at step {at_step} and nothing has \
+                             changed since; {where_clause}. Read a different range (pass \
+                             offset/limit), search for what you need, or make the change you \
+                             committed to"
+                        ),
+                        cached: String::new(),
+                    });
+                }
+            }
+        }
+
         // 8. Commit (B1 stale-version check first).
-        let (patch, action, acks) = validated.into_parts();
+        let validation_notes = validated.notes().to_vec();
+        let (patch, mut action, acks) = validated.into_parts();
+        // 7.8's read-paging special case: rewrite the committed call's args
+        // to the offset actually served, so everything downstream (the
+        // logged Action entry, the store's patch log, the tool call itself,
+        // and 7.8's own `reads_since_mutation` bookkeeping after execution)
+        // keys on the range that was really run, not the model's repeated
+        // request.
+        if let (Some(p), Action::Tool { args, .. }) = (&paged, &mut action)
+            && let Value::Object(map) = args
+        {
+            map.insert(
+                "offset".to_string(),
+                serde_json::Value::Number(p.to_offset.into()),
+            );
+            if !map.contains_key("limit") || map.get("limit") == Some(&Value::Null) {
+                map.insert(
+                    "limit".to_string(),
+                    serde_json::Value::Number(DEFAULT_READ_FILE_LIMIT.into()),
+                );
+            }
+        }
         if patch.version() != version {
             return Ok(self.reject(
                 entries,
@@ -495,6 +1494,7 @@ where
             .commit(patch, next_harness.clone(), &action, version)
             .await?;
         self.session.failures = 0;
+        self.session.last_rejection_reason = None;
 
         let mut patch_payload = serde_json::json!({"version": new_version, "patch": patch_raw});
         if let Some(usage) = self.session.last_usage
@@ -510,30 +1510,264 @@ where
             kind: LogKind::Patch,
             ts: chrono::Utc::now().to_rfc3339(),
             payload: patch_payload,
+            agent: None,
         });
         entries.push(LogEntry {
             step: next_harness.step,
             kind: LogKind::Action,
             ts: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::to_value(&action).unwrap_or(serde_json::Value::Null),
+            agent: None,
         });
+        if let Some(p) = &paged {
+            // The model's original (un-rewritten) args are kept here "for
+            // the record" -- the Action entry just above already carries
+            // the rewritten args that actually ran.
+            entries.push(system_entry(
+                next_harness.step,
+                "paged_read",
+                serde_json::json!({
+                    "path": p.path,
+                    "from": [p.from.0, p.from.1],
+                    "to_offset": p.to_offset,
+                    "args": p.original_args,
+                }),
+            ));
+        }
 
+        // Kept for the context-maintenance call after `execute` (11, below);
+        // `Executable::new` takes ownership of the original.
+        let action_for_maintainer = action.clone();
         let executable = Executable::new(action);
+        let patch_empty = is_empty_patch(&patch_raw);
 
         // 9. Execute.
         let outcome = self
-            .execute(executable, next_harness.step, &mut entries, token)
+            .execute(
+                executable,
+                next_harness.step,
+                &mut entries,
+                token,
+                sink,
+                skip,
+                patch_empty,
+                paged,
+            )
             .await?;
+
+        // 10. Commitment slot follow-up, after the tool actually ran (so the
+        // "commitment fulfilled"/"commitment discharged" note sits in front
+        // of the tool's own output, and the harness-authored clear commits
+        // on top of whatever state the tool call's execution left, e.g. it
+        // never races the model's own patch).
+        // A committed call that failed (tool error) does not spend the
+        // commitment: the edit did not happen, so `next` must stay set.
+        //
+        // A call 7.7/7.8 skipped (`shell`/`test` is in `MUTATING_TOOLS`, so
+        // a skipped repeat can still match a `next` commitment even though
+        // it never ran) is different: 7.7/7.8 only skip a call whose result
+        // is already known (an exact repeat of the last verification, or of
+        // an already-executed read since the last mutation), so if the
+        // skipped call matches the commitment there is nothing left to wait
+        // for -- the model committed to a call whose outcome is already in
+        // the log. Leaving `next` set here deadlocked run 21 steps 19-27:
+        // every following call got rejected with "you committed to ..."
+        // because the one call that could fulfil it was never going to run
+        // again. So a matching skipped call discharges the commitment the
+        // same way a real fulfilment does (harness clears `next`, resets
+        // `commitment_reads`), just with a different observation prefix
+        // ("commitment discharged: ..." instead of "commitment fulfilled:
+        // ...") since the call's own result never re-ran this step.
+        let tool_errored = entries.iter().any(|e| {
+            e.kind == LogKind::System
+                && e.payload.get("event").and_then(Value::as_str) == Some("tool_error")
+        });
+        let tool_skipped = entries.iter().any(|e| {
+            e.kind == LogKind::System
+                && e.payload.get("event").and_then(Value::as_str) == Some("skipped_redundant")
+        });
+        if tool_errored {
+            commitment_fulfilled = None;
+        }
+        let commitment_discharged_only = tool_skipped && commitment_fulfilled.is_some();
+        if let Some(c) = commitment_fulfilled {
+            if let Some(obs) = self.session.pending_observation.take() {
+                let prefix = if commitment_discharged_only {
+                    format!(
+                        "commitment discharged: {} {} was already run and nothing has changed \
+                         since (its result is above). Set `next` to a different change, or \
+                         leave it empty.\n\n",
+                        c.tool,
+                        c.path.as_deref().unwrap_or("(no path)")
+                    )
+                } else {
+                    format!(
+                        "commitment fulfilled: {} {}. Set `next` to the following change, or \
+                         leave it empty and run `test`.\n\n",
+                        c.tool,
+                        c.path.as_deref().unwrap_or("(no path)")
+                    )
+                };
+                let text = format!("{prefix}{}", obs.as_str());
+                let (new_obs, _overflow) = Observation::truncate_with_report(
+                    &crate::promptable::ToolOutputFull::new(text),
+                    self.session.config.budgets.observation,
+                    self.session.tokenizer.as_ref(),
+                );
+                self.session.pending_observation = Some(new_obs);
+            }
+
+            let (cur_after, version_after) = self.session.state().await?;
+            if self.skill.commitment(&cur_after.agent).is_some() {
+                // The model's own patch left `next` set (it did not clear
+                // it itself): the harness clears it with a small
+                // harness-authored patch, the same way a delegate-absorb
+                // patch commits (source: "harness", one extra version,
+                // harness.step + 1).
+                let clear_value = serde_json::json!({"next": null});
+                let clear_patch: <K::Patch as PatchStrategy<K::Workspace>>::Patch =
+                    serde_json::from_value(clear_value.clone()).map_err(|e| {
+                        SessionError::Patch(crate::error::PatchError::Malformed(e.to_string()))
+                    })?;
+                let cleared_next = <K::Patch as PatchStrategy<K::Workspace>>::apply(
+                    &cur_after.agent,
+                    &clear_patch,
+                )
+                .map_err(SessionError::Patch)?;
+                let checked =
+                    crate::patch::CheckedPatch::new(clear_value, cleared_next, version_after);
+                let validated_clear = crate::patch::ValidatedPatch::from_checked(checked);
+
+                let mut harness_next = cur_after.harness.clone();
+                harness_next.step += 1;
+
+                let raw_for_log = validated_clear.raw().clone();
+                let new_version = self
+                    .session
+                    .store
+                    .commit(
+                        validated_clear,
+                        harness_next.clone(),
+                        &Action::Yield,
+                        version_after,
+                    )
+                    .await?;
+
+                entries.push(LogEntry {
+                    step: harness_next.step,
+                    kind: LogKind::Patch,
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    payload: serde_json::json!({
+                        "version": new_version,
+                        "patch": raw_for_log,
+                        "source": "harness",
+                    }),
+                    agent: None,
+                });
+                self.session.last_commitment = None;
+                self.session.commitment_reads = 0;
+            }
+        } else if let Some(note) = commitment_mismatch_note
+            && let Some(obs) = self.session.pending_observation.take()
+        {
+            let text = format!("{}\n\n{note}", obs.as_str());
+            let (new_obs, _overflow) = Observation::truncate_with_report(
+                &crate::promptable::ToolOutputFull::new(text),
+                self.session.config.budgets.observation,
+                self.session.tokenizer.as_ref(),
+            );
+            self.session.pending_observation = Some(new_obs);
+        } else if let Some(note) = commitment_pending_note
+            && let Some(obs) = self.session.pending_observation.take()
+        {
+            // `guards.commitment_read_cap = false`: the read ran normally
+            // (no cap, no clear); append a short factual note rather than
+            // rejecting.
+            let text = format!("{}\n\n{note}", obs.as_str());
+            let (new_obs, _overflow) = Observation::truncate_with_report(
+                &crate::promptable::ToolOutputFull::new(text),
+                self.session.config.budgets.observation,
+                self.session.tokenizer.as_ref(),
+            );
+            self.session.pending_observation = Some(new_obs);
+        }
+
+        // 10b. Validation notes: a skill's `validate` override (e.g. the
+        // coding skills' `strip_malformed_next`, which drops a malformed
+        // `next` from the raw patch rather than rejecting the whole step)
+        // may record one or more harness-facing notes on the
+        // `ValidatedStep` instead of an observation it has no access to.
+        // Append each, in order, to the step's observation exactly the way
+        // `commitment_mismatch_note` is above. When the action is not a
+        // tool call (e.g. `ask_user`), `execute` never sets
+        // `pending_observation`, so a note here would otherwise be lost --
+        // log it as a `System` entry (`event: "note"`) instead.
+        for note in validation_notes {
+            if let Some(obs) = self.session.pending_observation.take() {
+                let text = format!("{}\n\n{note}", obs.as_str());
+                let (new_obs, _overflow) = Observation::truncate_with_report(
+                    &crate::promptable::ToolOutputFull::new(text),
+                    self.session.config.budgets.observation,
+                    self.session.tokenizer.as_ref(),
+                );
+                self.session.pending_observation = Some(new_obs);
+            } else {
+                entries.push(system_entry(
+                    next_harness.step,
+                    "note",
+                    serde_json::json!({"text": note}),
+                ));
+            }
+        }
+
+        // 11. Context maintenance (statie-spec.md "9. Context
+        // maintenance"): after every committed `Tool` step (`Continue`,
+        // whether the tool succeeded or errored -- both are committed
+        // steps) and after `AskUser`/`Yield` parks. Never on a rejection
+        // (handled by the early returns above, which never reach here) or
+        // after `Done`/a handoff/a cancellation/the retry-cap `Failure`
+        // park (none of those represent "a committed step whose next
+        // observation is ready").
+        let run_maintainer = matches!(
+            outcome,
+            Outcome::Continue | Outcome::Parked(Park::AskUser(_)) | Outcome::Parked(Park::Yield)
+        );
+        if run_maintainer {
+            let reasoning_text = entries.iter().find_map(|e| {
+                (e.kind == LogKind::Reasoning)
+                    .then(|| e.payload.get("text").and_then(Value::as_str))
+                    .flatten()
+            });
+            self.run_maintainer(reasoning_text, &patch_raw, &action_for_maintainer, sink)
+                .await;
+        }
+
+        // Repeated-`Continue`-note guard (`CONTINUE_REPEAT_CAP`): any step
+        // whose committed action was NOT `Action::Continue` breaks the
+        // streak, the same as a `Continue` step with a different note does
+        // (handled inline in `execute`'s `Action::Continue` arm). The
+        // park-and-reset the cap itself triggers also clears the streak
+        // (see that arm), so this only ever fires for an ordinary,
+        // non-`Continue` step in between.
+        if !matches!(action_for_maintainer, Action::Continue { .. }) {
+            self.session.last_continue_note = None;
+            self.session.continue_repeat_count = 0;
+        }
 
         Ok(StepRecord::new(entries, outcome))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &mut self,
         executable: Executable<Action>,
         step: u64,
         entries: &mut Vec<LogEntry>,
         token: CancellationToken,
+        sink: &mut dyn StepSink,
+        skip: Option<SkippedCall>,
+        patch_empty: bool,
+        paged: Option<PagedRead>,
     ) -> Result<Outcome, SessionError> {
         match executable.into_inner() {
             Action::Tool { name, args } => {
@@ -543,6 +1777,90 @@ where
                 } else {
                     args
                 };
+
+                // 7.7/7.8 recognized this exact call as a redundant repeat:
+                // the step already committed (patch + action + acks) above,
+                // but the call itself is not re-run -- it would return
+                // exactly what's already in the log. Log a `skipped_redundant`
+                // System entry, build the observation from the guard's
+                // reason (plus the cached prior result for 7.7), and run it
+                // through the same loop-guard bookkeeping/note a real repeat
+                // would get, so a third identical attempt still gets that
+                // note. No `tool_output` entry, no tool call, and none of
+                // the other execution-path bookkeeping below (read_streaks,
+                // silent_reads, reads_since_mutation, last_verify) is
+                // touched -- the guard's own state must not learn anything
+                // new from a call that never ran.
+                if let Some(SkippedCall { reason, cached }) = skip {
+                    entries.push(system_entry(
+                        step,
+                        "skipped_redundant",
+                        serde_json::json!({"name": name, "reason": reason}),
+                    ));
+                    let mut text = if cached.is_empty() {
+                        reason.clone()
+                    } else {
+                        format!(
+                            "{reason}\n\n(call not re-run; this is the earlier result) {cached}"
+                        )
+                    };
+
+                    // Loop guard: same recurrence check as a real tool call,
+                    // keyed on (name, args, text) -- see the success path
+                    // below for the un-skipped version of this logic.
+                    let current = (name.clone(), args.clone(), text.clone());
+                    let prior_occurrences = self
+                        .session
+                        .recent_tool_calls
+                        .iter()
+                        .filter(|entry| **entry == current)
+                        .count();
+                    if prior_occurrences >= 2 {
+                        let occurrence = prior_occurrences + 1;
+                        text = format!(
+                            "[harness] This is occurrence #{occurrence} of `{name}` with \
+                             identical arguments and identical output within the last \
+                             {TOOL_CALL_HISTORY} tool calls; nothing has changed. Record what \
+                             you learned in the workspace and take a different action (if the \
+                             work is finished, hand off with `next_skill` or set the terminal \
+                             field).\n\n{text}"
+                        );
+                    }
+                    self.session.recent_tool_calls.push_back(current);
+                    if self.session.recent_tool_calls.len() > TOOL_CALL_HISTORY {
+                        self.session.recent_tool_calls.pop_front();
+                    }
+
+                    let (obs, _overflow) = Observation::truncate_with_report(
+                        &crate::promptable::ToolOutputFull::new(text),
+                        self.session.config.budgets.observation,
+                        self.session.tokenizer.as_ref(),
+                    );
+                    self.session.pending_observation = Some(obs);
+                    self.session.record_tool_call().await?;
+                    return Ok(Outcome::Continue);
+                }
+
+                // Enforce the active tool set (the same list the prompt
+                // showed the model via `self.skill.tools()`): a tool that is
+                // registered in the full `ToolSet` but not active for this
+                // skill must still be rejected, not silently run.
+                let active = self.skill.tools();
+                if !active.iter().any(|a| a == &name) {
+                    entries.push(system_entry(
+                        step,
+                        "tool_rejected",
+                        serde_json::json!({"name": name, "reason": "not active"}),
+                    ));
+                    self.session.pending_observation = Some(Observation::rejection(&format!(
+                        "tool `{name}` is not available in skill `{}`; available tools: {:?}. \
+                         If the job needs it, hand off to a skill that has it.",
+                        self.skill.name(),
+                        active
+                    )));
+                    return Ok(Outcome::Continue);
+                }
+
                 let Some(tool) = self.session.tools.get(&name) else {
                     entries.push(system_entry(
                         step,
@@ -585,6 +1903,7 @@ where
                                 "output": full.as_ref(),
                                 "truncated": false,
                             }),
+                            agent: None,
                         });
                         // Empty output is still information; say so explicitly.
                         let mut text = if full.as_ref().trim().is_empty() {
@@ -592,6 +1911,29 @@ where
                         } else {
                             full.as_ref().to_string()
                         };
+
+                        // 7.8's read-paging special case: prefix the note
+                        // naming the previous (repeated) window and the new
+                        // one actually served. The new window's own range is
+                        // read back from this call's own output header when
+                        // it parses (the tool may have cut the window
+                        // earlier than `to_offset + limit - 1`, e.g. its
+                        // byte cap); falls back to the rewritten
+                        // offset/limit when the header can't be parsed.
+                        if let Some(p) = &paged {
+                            let (c, d) = parse_read_header(full.as_ref())
+                                .map(|h| (h.from, h.to))
+                                .unwrap_or((
+                                    p.to_offset,
+                                    p.to_offset + DEFAULT_READ_FILE_LIMIT - 1,
+                                ));
+                            text = format!(
+                                "note: you repeated the read of lines {}-{}; showing the next \
+                                 window instead (lines {c}-{d}).\n\n{text}",
+                                p.from.0, p.from.1
+                            );
+                        }
+
                         // Loop guard: identical (name, args, output) triple recurring within
                         // the recent-history window, whether consecutively or alternating
                         // (e.g. A/B/A/B).
@@ -604,19 +1946,145 @@ where
                             .count();
                         if prior_occurrences >= 2 {
                             let occurrence = prior_occurrences + 1;
-                            text.push_str(&format!(
-                                "\n\n[harness] This is occurrence #{occurrence} of `{name}` with \
+                            // Prepended, not appended: `truncate_with_report` clamps the
+                            // observation to the budget and would otherwise cut this note
+                            // off entirely for a long output (e.g. a 100-line `read_file`),
+                            // leaving the model never seeing it.
+                            text = format!(
+                                "[harness] This is occurrence #{occurrence} of `{name}` with \
                                  identical arguments and identical output within the last \
                                  {TOOL_CALL_HISTORY} tool calls; nothing has changed. Record what \
                                  you learned in the workspace and take a different action (if the \
                                  work is finished, hand off with `next_skill` or set the terminal \
-                                 field)."
-                            ));
+                                 field).\n\n{text}"
+                            );
                         }
                         self.session.recent_tool_calls.push_back(current);
                         if self.session.recent_tool_calls.len() > TOOL_CALL_HISTORY {
                             self.session.recent_tool_calls.pop_front();
                         }
+
+                        // Redundant-verification guard bookkeeping: a
+                        // successful `shell`/`test` call records what it
+                        // ran (for comparison against the next call) and
+                        // clears the mutated flag; a successful
+                        // `write_file`/`edit_file` call sets the mutated
+                        // flag so a subsequent repeat of the last verify
+                        // command is no longer considered redundant.
+                        if name == "shell" || name == "test" {
+                            if let Some(cmd) = extract_command(&args) {
+                                self.session.last_verify = Some(VerifyRun {
+                                    cmd,
+                                    summary: summarize_verify_output(full.as_ref()),
+                                });
+                                self.session.mutated_since_verify = false;
+                            }
+                        } else if name == "write_file" || name == "edit_file" {
+                            self.session.mutated_since_verify = true;
+                            self.session.mutated_since_test = true;
+                        }
+
+                        // Green checkpoint (statie-spec.md "10. Working
+                        // set", "Green checkpoint"): a `test` call updates
+                        // `last_test_result`, and on a pass snapshots this
+                        // activation's edited files, logs
+                        // `green_checkpoint`, and prefixes the observation.
+                        // On a fail, the same call also runs the
+                        // repeated-failure guard, logging a
+                        // `repeated_failure` entry and prefixing the
+                        // observation once the same failure summary has
+                        // recurred. Either prefix is prepended last (after
+                        // the loop-guard/paging notes above) so it lands at
+                        // the very front, exactly as the spec's prefix text
+                        // requires.
+                        if name == "test"
+                            && let Some((entry, prefix)) =
+                                self.session.note_test_result(step, full.as_ref())
+                        {
+                            entries.push(entry);
+                            text = format!("{prefix}{text}");
+                        }
+
+                        // Guard 2 bookkeeping: a successfully executed
+                        // read-only call with an empty patch increments the
+                        // silent-read streak; the same call with a
+                        // non-empty patch (it recorded something) resets it
+                        // instead; any mutating call also resets it (mirrors
+                        // the read-without-edit guard's reset rule).
+                        if READ_ONLY_TOOLS.contains(&name.as_str()) {
+                            if patch_empty {
+                                self.session.silent_reads += 1;
+                            } else {
+                                self.session.silent_reads = 0;
+                            }
+                        } else if MUTATING_TOOLS.contains(&name.as_str()) {
+                            self.session.silent_reads = 0;
+                        }
+
+                        // Redundant-identical-read guard bookkeeping: a
+                        // successfully executed read-only call (except
+                        // `filter_last_tool_call`, exempt by design) is
+                        // recorded under its canonical key so an identical
+                        // repeat can be rejected before it re-runs; any
+                        // successfully executed mutating call clears the map
+                        // outright, since a `shell`/`test` run may have
+                        // changed anything a prior read saw.
+                        if MUTATING_TOOLS.contains(&name.as_str()) {
+                            self.session.reads_since_mutation.clear();
+                        } else if READ_ONLY_TOOLS.contains(&name.as_str())
+                            && name != "filter_last_tool_call"
+                        {
+                            self.session
+                                .reads_since_mutation
+                                .insert(read_call_key(&name, &args), step);
+                            if let Some(p) = &paged {
+                                // The call actually ran under the rewritten
+                                // (paged) args, recorded under that key just
+                                // above -- but the model's ORIGINAL
+                                // (un-rewritten) request is the one it will
+                                // send again on a further repeat (it has no
+                                // reason to start guessing offsets itself).
+                                // Point that key at this step too, so the
+                                // next bare repeat's header lookup
+                                // (`previous_read_file_header`) reads back
+                                // the window this call actually served, not
+                                // the stale one from before it was ever
+                                // paged (e.g. the very first, un-paged read
+                                // of this file).
+                                let original_key = read_call_key(&name, &p.original_args);
+                                self.session.reads_since_mutation.insert(original_key, step);
+                            }
+                        }
+
+                        // Read-without-edit guard: a read-only tool call
+                        // that brings a path's consecutive-read streak to
+                        // the threshold gets a note prepended (after the
+                        // loop-guard note above, if both fire); a mutating
+                        // tool call resets every path's streak instead.
+                        // `guards.read_guard = false` disables the rule
+                        // outright: no note, no rejection.
+                        if let Some((path, count)) = self
+                            .session
+                            .guards
+                            .read_guard
+                            .then(|| self.session.note_tool_call_for_read_guard(&name, &args))
+                            .flatten()
+                        {
+                            entries.push(system_entry(
+                                step,
+                                "read_guard",
+                                serde_json::json!({"path": path, "count": count}),
+                            ));
+                            text = format!(
+                                "[harness] This is read #{count} of `{path}` with no edit in \
+                                 between. Reading is not progress: make the change now with the \
+                                 lines in front of you (edit_file anchored on one line you can \
+                                 see), or write what you learned — the line numbers and the \
+                                 exact anchor line — into the workspace so you stop \
+                                 re-reading.\n\n{text}"
+                            );
+                        }
+
                         let (obs, overflow) = Observation::truncate_with_report(
                             &crate::promptable::ToolOutputFull::new(text),
                             self.session.config.budgets.observation,
@@ -642,6 +2110,46 @@ where
                         let (cur, _version) = self.session.state().await?;
                         let mut harness = cur.harness;
                         harness.last_overflow = note;
+                        // Green checkpoint (statie-spec.md "10. Working
+                        // set", "Green checkpoint"): commit `green_step`
+                        // alongside `last_overflow` so it's visible to
+                        // `validate`/`rules` on the next step and survives a
+                        // handoff, mirroring `self.session.last_test_result`
+                        // (set by `note_test_result` above, unconditionally,
+                        // for every `test` call): `Some(step)` on a pass,
+                        // `None` on a fail. Left untouched for every other
+                        // tool.
+                        if name == "test" {
+                            harness.green_step = if self.session.last_test_result == Some(true) {
+                                Some(step)
+                            } else {
+                                None
+                            };
+                            // Mirrors `green_step`: recorded from the same
+                            // `test` output (`full`, still in scope from
+                            // `note_test_result`'s call above) so a filtered
+                            // pass is visible to `review`'s `validate`
+                            // (`skills/src/coding/mod.rs`) even though the
+                            // filtered-out note only lives in the tool
+                            // output text, not in `last_test_result`.
+                            harness.green_filtered = self.session.last_test_result == Some(true)
+                                && full
+                                    .as_ref()
+                                    .contains("test(s) were filtered out by this command");
+                            // Mirrors `green_step`/`green_filtered`: the
+                            // `cmd` this `test` call ran, as given in its
+                            // args, or `None` when auto-detected. Read by
+                            // the `review` skill's `validate` to rerun the
+                            // same command on a blind approval rather than
+                            // an auto-detected one.
+                            harness.last_test_cmd = extract_command(&args);
+                        }
+                        // This call actually executed -- see
+                        // `HarnessState::tool_calls`'s doc. Folded into this
+                        // same `set_harness` commit rather than a separate
+                        // `record_tool_call` call, avoiding a second
+                        // round-trip.
+                        harness.tool_calls += 1;
                         self.session.store.set_harness(harness).await?;
 
                         Ok(Outcome::Continue)
@@ -652,21 +2160,333 @@ where
                             "tool_error",
                             serde_json::json!({"name": name, "reason": e.to_string()}),
                         ));
-                        self.session.pending_observation = Some(Observation::rejection(&format!(
-                            "tool `{name}` failed: {e}"
-                        )));
+                        let mut message =
+                            if let crate::error::ToolError::InvalidArgs(ref detail) = e {
+                                let schema_str = render_schema_compact(&tool.args_schema());
+                                format!(
+                                    "tool `{name}` rejected its arguments: {detail}. Expected \
+                                     arguments (JSON schema): {schema_str}. Fix the arguments and \
+                                     call `{name}` again."
+                                )
+                            } else {
+                                format!("tool `{name}` failed: {e}")
+                            };
+
+                        // Loop guard, same as the success path: identical
+                        // (name, args, error) recurring within the
+                        // recent-history window. Errors were previously
+                        // exempt, so a model retrying the same bad call
+                        // never saw the "nothing has changed" note.
+                        let current = (name.clone(), args.clone(), e.to_string());
+                        let prior_occurrences = self
+                            .session
+                            .recent_tool_calls
+                            .iter()
+                            .filter(|entry| **entry == current)
+                            .count();
+                        if prior_occurrences >= 2 {
+                            let occurrence = prior_occurrences + 1;
+                            message = format!(
+                                "[harness] This is occurrence #{occurrence} of `{name}` with \
+                                 identical arguments and identical output within the last \
+                                 {TOOL_CALL_HISTORY} tool calls; nothing has changed. Record what \
+                                 you learned in the workspace and take a different action (if the \
+                                 work is finished, hand off with `next_skill` or set the terminal \
+                                 field).\n\n{message}"
+                            );
+                        }
+                        self.session.recent_tool_calls.push_back(current);
+                        if self.session.recent_tool_calls.len() > TOOL_CALL_HISTORY {
+                            self.session.recent_tool_calls.pop_front();
+                        }
+
+                        // Built the same way as a successful tool output
+                        // (not `Observation::rejection`, which prepends
+                        // "output rejected: "), so the loop-guard note stays
+                        // at the very front of the observation, and so the
+                        // message is clamped to the observation budget the
+                        // same way a large tool output would be.
+                        let (obs, _overflow) = Observation::truncate_with_report(
+                            &crate::promptable::ToolOutputFull::new(message),
+                            self.session.config.budgets.observation,
+                            self.session.tokenizer.as_ref(),
+                        );
+                        self.session.pending_observation = Some(obs);
+                        self.session.record_tool_call().await?;
                         Ok(Outcome::Continue)
                     }
                 }
             }
-            Action::AskUser { message } => Ok(Outcome::Parked(Park::AskUser(message))),
-            Action::Yield => Ok(Outcome::Parked(Park::Yield)),
+            Action::AskUser { message } => {
+                let message = self.restore_green_and_append(step, entries, message);
+                Ok(Outcome::Parked(Park::AskUser(message)))
+            }
+            Action::Yield => {
+                self.restore_green_on_park(step, entries);
+                Ok(Outcome::Parked(Park::Yield))
+            }
+            Action::Continue { note } => {
+                // Harness-internal: a `Skill::validate` override committed
+                // the model's patch but replaced its action with `Continue`
+                // (e.g. a premature `done`/empty `ask_user` in the coding
+                // skills) rather than rejecting the whole step. No tool
+                // runs, no commitment is spent (the commitment-slot/guard
+                // bookkeeping above is all gated on `Action::Tool`, so none
+                // of it ran for this step), and the patch is already
+                // committed by the time `execute` is called. Log a
+                // `continued` System entry with the note, and set it as the
+                // next observation through the same truncation helper the
+                // rest of the harness's own notes use.
+                entries.push(system_entry(
+                    step,
+                    "continued",
+                    serde_json::json!({"note": note}),
+                ));
+
+                // Repeated-note guard (`CONTINUE_REPEAT_CAP`): a skill's
+                // `validate` override converting a doomed-to-repeat step
+                // into `Continue` is the right call the first couple of
+                // times, but nothing else bounds how many times in a row it
+                // can fire -- the retry cap only applies to a rejected step,
+                // never a committed `Continue` one. Track consecutive
+                // occurrences of the SAME note text; a different note (or
+                // any other outcome) resets the count.
+                if self.session.last_continue_note.as_deref() == Some(note.as_str()) {
+                    self.session.continue_repeat_count += 1;
+                } else {
+                    self.session.last_continue_note = Some(note.clone());
+                    self.session.continue_repeat_count = 1;
+                }
+
+                let (obs, _overflow) = Observation::truncate_with_report(
+                    &crate::promptable::ToolOutputFull::new(note.clone()),
+                    self.session.config.budgets.observation,
+                    self.session.tokenizer.as_ref(),
+                );
+                self.session.pending_observation = Some(obs);
+
+                if self.session.continue_repeat_count >= CONTINUE_REPEAT_CAP {
+                    // Reset so a resumed session (the park is answered with
+                    // a user message, then stepped again) starts this
+                    // streak fresh rather than parking again on the very
+                    // next step even if the model's reply happens to repeat
+                    // the same note once more.
+                    self.session.last_continue_note = None;
+                    self.session.continue_repeat_count = 0;
+
+                    let message = format!(
+                        "{note}\n\nThe model has sent the same non-progress step \
+                         {CONTINUE_REPEAT_CAP} times in a row. Reply with what it should do \
+                         next (for review: 'approve' or the findings to send back)."
+                    );
+                    let message = self.restore_green_and_append(step, entries, message);
+                    return Ok(Outcome::Parked(Park::AskUser(message)));
+                }
+
+                Ok(Outcome::Continue)
+            }
             Action::Done => {
                 let (cur, _version) = self.session.state().await?;
+                self.restore_green_on_park(step, entries);
                 match self.skill.handoff(&cur.agent) {
                     Some(target) => Ok(Outcome::Handoff(target)),
                     None => Ok(Outcome::Done),
                 }
+            }
+            Action::Delegate { skill: child, task } => {
+                let Some(runner) = self.session.child_runner.clone() else {
+                    entries.push(system_entry(
+                        step,
+                        "delegate_rejected",
+                        serde_json::json!({"skill": child, "task": task}),
+                    ));
+                    self.session.pending_observation = Some(Observation::rejection(&format!(
+                        "delegation to `{child}` is not available: configured children are []"
+                    )));
+                    return Ok(Outcome::Continue);
+                };
+                let known = runner.children();
+                if !known.contains(&child) {
+                    entries.push(system_entry(
+                        step,
+                        "delegate_rejected",
+                        serde_json::json!({"skill": child, "task": task}),
+                    ));
+                    self.session.pending_observation = Some(Observation::rejection(&format!(
+                        "delegation to `{child}` is not available: configured children are {known:?}"
+                    )));
+                    return Ok(Outcome::Continue);
+                }
+
+                self.session.delegations += 1;
+                let n = self.session.delegations;
+                let agent_path = format!("{}/{child}#{n}", self.skill.name());
+
+                entries.push(system_entry(
+                    step,
+                    "delegate",
+                    serde_json::json!({"child": child, "task": task, "agent": agent_path}),
+                ));
+
+                let req = ChildRequest {
+                    child: child.clone(),
+                    task: task.clone(),
+                    agent_path: agent_path.clone(),
+                    parent_step: step,
+                    cancel: token.clone(),
+                    inbox_seed: vec![ChildInboxItem { text: task.clone() }],
+                };
+
+                sink.child_started(&agent_path, &task);
+                let report = runner.run(req, sink).await?;
+                sink.child_finished(&agent_path, &report);
+
+                // Absorb the report into the parent's workspace: harness-
+                // authored, never model-authored, but still runs `rules`
+                // and commits through the same RawPatch -> ... ->
+                // ValidatedPatch pipeline a model patch does.
+                let (cur, version) = self.session.state().await?;
+                let mut next = cur.agent.clone();
+                if let Err(e) = self.skill.absorb_report(&mut next, report.clone()) {
+                    entries.push(system_entry(
+                        step,
+                        "delegate_absorb_rejected",
+                        serde_json::json!({"child": child, "reason": e.to_string()}),
+                    ));
+                    self.session.pending_observation = Some(Observation::rejection(&format!(
+                        "subagent `{child}` finished but its report could not be absorbed: {e}"
+                    )));
+                    return Ok(Outcome::Continue);
+                }
+                if let Err(e) = self.skill.rules(&cur, &next) {
+                    entries.push(system_entry(
+                        step,
+                        "delegate_absorb_rejected",
+                        serde_json::json!({"child": child, "reason": e.to_string()}),
+                    ));
+                    self.session.pending_observation = Some(Observation::rejection(&format!(
+                        "subagent `{child}` finished but absorbing its report violated a rule: {e}"
+                    )));
+                    return Ok(Outcome::Continue);
+                }
+
+                let cur_value = serde_json::to_value(&cur.agent).unwrap_or(Value::Null);
+                let next_value = serde_json::to_value(&next).unwrap_or(Value::Null);
+                let patch_value = changed_top_level_keys(&cur_value, &next_value);
+
+                let checked_next: K::Workspace =
+                    match <K::Patch as PatchStrategy<K::Workspace>>::apply(
+                        &cur.agent,
+                        &serde_json::from_value(patch_value.clone()).map_err(|e| {
+                            SessionError::Patch(crate::error::PatchError::Malformed(e.to_string()))
+                        })?,
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            entries.push(system_entry(
+                                step,
+                                "delegate_absorb_rejected",
+                                serde_json::json!({"child": child, "reason": e.to_string()}),
+                            ));
+                            self.session.pending_observation = Some(Observation::rejection(
+                                &format!(
+                                    "subagent `{child}` finished but the absorb patch failed to apply: {e}"
+                                ),
+                            ));
+                            return Ok(Outcome::Continue);
+                        }
+                    };
+                let checked = crate::patch::CheckedPatch::new(patch_value, checked_next, version);
+                let validated = crate::patch::ValidatedPatch::from_checked(checked);
+
+                let mut next_harness = cur.harness.clone();
+                next_harness.step += 1;
+                next_harness.active_tools = self.skill.tools();
+                next_harness.activation = self.skill.name().to_string();
+
+                let raw_for_log = validated.raw().clone();
+                let new_version = self
+                    .session
+                    .store
+                    .commit(
+                        validated,
+                        next_harness.clone(),
+                        &Action::Delegate {
+                            skill: child.clone(),
+                            task: task.clone(),
+                        },
+                        version,
+                    )
+                    .await?;
+
+                entries.push(LogEntry {
+                    step: next_harness.step,
+                    kind: LogKind::Patch,
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    payload: serde_json::json!({
+                        "version": new_version,
+                        "patch": raw_for_log,
+                        "source": "subagent",
+                    }),
+                    agent: None,
+                });
+                entries.push(LogEntry {
+                    step: next_harness.step,
+                    kind: LogKind::Action,
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    payload: serde_json::json!({
+                        "type": "delegate",
+                        "skill": child,
+                        "task": task,
+                    }),
+                    agent: None,
+                });
+
+                let outcome_label = match report.outcome {
+                    ReportOutcome::Done => "done",
+                    ReportOutcome::Blocked => "blocked",
+                    ReportOutcome::Failed => "failed",
+                    ReportOutcome::Capped => "capped",
+                };
+                let data_keys: Vec<&str> = report.data.keys().map(String::as_str).collect();
+                let summary_text = format!(
+                    "subagent {child} finished ({outcome_label}, {} steps): {}. Merged into \
+                     reports[\"{child}\"]: findings ({}), files ({}), data keys {:?}.",
+                    report.stats.steps,
+                    report.summary,
+                    report.findings.len(),
+                    report.files.len(),
+                    data_keys
+                );
+                let (obs, overflow) = Observation::truncate_with_report(
+                    &crate::promptable::ToolOutputFull::new(summary_text),
+                    self.session.config.budgets.observation,
+                    self.session.tokenizer.as_ref(),
+                );
+                self.session.pending_observation = Some(obs);
+                let note = overflow.map(|o| {
+                    format!(
+                        "step {step}: subagent `{child}` summary overflowed ({} chars, ~{} \
+                         tokens > {} budget); only the head and tail were shown.",
+                        o.total_chars, o.total_tokens, self.session.config.budgets.observation
+                    )
+                });
+                if note.is_some() {
+                    let mut harness = next_harness.clone();
+                    harness.last_overflow = note;
+                    self.session.store.set_harness(harness).await?;
+                }
+
+                if matches!(report.outcome, ReportOutcome::Capped) && token.is_cancelled() {
+                    entries.push(system_entry(
+                        next_harness.step,
+                        "cancelled",
+                        serde_json::json!({"child": child}),
+                    ));
+                    return Ok(Outcome::Parked(Park::Cancelled));
+                }
+
+                Ok(Outcome::Continue)
             }
         }
     }
@@ -696,8 +2516,37 @@ where
             Some(other) if other != "stop" => format!("{reason} (done_reason={other})"),
             _ => reason,
         };
-        self.session.pending_observation = Some(Observation::rejection(&reason));
         self.session.failures += 1;
+
+        // Repeated-`Continue`-note guard (`CONTINUE_REPEAT_CAP`): a
+        // rejection is not a repeat of a `Continue` note -- it's a
+        // different kind of step entirely, and the step that triggered it
+        // never reached `Action::Continue`'s handling in `execute` at all
+        // (this function returns before that). Break the streak here too so
+        // a rejection sandwiched between two identical `Continue` notes
+        // doesn't let them count toward the cap as if they were consecutive.
+        self.session.last_continue_note = None;
+        self.session.continue_repeat_count = 0;
+
+        // Prefix the *observation* (never the logged/returned `reason`
+        // itself, which tests assert on verbatim) with the attempt count,
+        // and, from the second consecutive rejection with the same reason,
+        // an explicit nudge -- a low-temperature model can otherwise send
+        // byte-identical output every retry until it parks at the cap,
+        // never having been told the retry changed nothing.
+        let max_attempts = self.session.config.retries + 1;
+        let repeated = self.session.last_rejection_reason.as_deref() == Some(reason.as_str());
+        let mut observation_text = format!("attempt {} of {max_attempts}: ", self.session.failures);
+        if repeated {
+            observation_text.push_str(
+                "Your previous output was rejected for exactly this reason; send something \
+                 different. ",
+            );
+        }
+        observation_text.push_str(&reason);
+        self.session.pending_observation = Some(Observation::rejection(&observation_text));
+        self.session.last_rejection_reason = Some(reason.clone());
+
         let content: String = raw_content.chars().take(16000).collect();
         let mut rejected_payload = serde_json::json!({"reason": reason, "content": content});
         if let Some(usage) = self.session.last_usage
@@ -712,12 +2561,21 @@ where
 
         if self.session.failures > self.session.config.retries {
             self.session.failures = 0;
+            self.session.last_rejection_reason = None;
             entries.push(system_entry(
                 step,
                 "failure",
                 serde_json::json!({"reason": reason}),
             ));
-            StepRecord::new(entries, Outcome::Parked(Park::Failure(reason)))
+            // Green checkpoint: the retry-cap park is one of the parking
+            // outcomes that restores a stale checkpoint (statie-spec.md
+            // "Green checkpoint" -- "step cap, failure, or `done`"). The
+            // sentence is appended only to the *returned* `Park::Failure`
+            // message, never to the `"failure"`/`"rejected"` entries just
+            // logged above, whose `reason` field callers assert on
+            // verbatim.
+            let park_reason = self.restore_green_and_append(step, &mut entries, reason);
+            StepRecord::new(entries, Outcome::Parked(Park::Failure(park_reason)))
         } else {
             StepRecord::new(entries, Outcome::Continue)
         }
@@ -750,6 +2608,7 @@ where
             .commit(validated, next_harness.clone(), &action, version)
             .await?;
         self.session.failures = 0;
+        self.session.last_rejection_reason = None;
 
         let mut entries = Vec::new();
         entries.push(LogEntry {
@@ -761,14 +2620,328 @@ where
                 "patch": patch_raw,
                 "source": "user",
             }),
+            agent: None,
         });
         entries.push(LogEntry {
             step: next_harness.step,
             kind: LogKind::Action,
             ts: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::to_value(&action).unwrap_or(serde_json::Value::Null),
+            agent: None,
         });
         Ok(StepRecord::new(entries, Outcome::Parked(Park::Yield)))
+    }
+
+    /// Operator-authored patch (`/patch`): applied directly by the harness
+    /// on behalf of the user, without going through the model at all. Unlike
+    /// `user_patch` (`/edit`, which still flows through a `step`-shaped
+    /// `ValidatedStep`/`Outcome`), this exists so an operator can correct
+    /// harness state the model itself got wrong (e.g. a plan step marked
+    /// done that wasn't, or reset to pending) without arguing with the
+    /// model about it.
+    ///
+    /// Applies `raw` with the skill's `Patch` strategy, runs
+    /// `skill.rules(&cur, &next)` -- a violation is rejected the same way a
+    /// model-authored patch would be, so the user still can't break the
+    /// skill's invariants -- then commits with `harness.step + 1`. Logs a
+    /// `Patch` entry with `"source":"user"` and a `System` entry
+    /// `{"event":"user_patch"}`, and sets `pending_observation` to a plain
+    /// observation (`operator patched the workspace: keys [a, b]`) so the
+    /// model's next prompt sees what changed without reading it as a
+    /// rejection. Retry counters (`failures`, `last_rejection_reason`) are
+    /// left untouched -- this isn't a model turn.
+    pub async fn apply_user_patch(&mut self, raw: Value) -> Result<Version, SessionError> {
+        let applied = self.apply_trusted_patch(raw, "user").await?;
+
+        self.session.log.append(system_entry(
+            applied.step,
+            "user_patch",
+            serde_json::json!({"keys": applied.keys}),
+        ))?;
+
+        self.session.pending_observation = Some(Observation::user_message(&format!(
+            "operator patched the workspace: keys {:?}",
+            applied.keys
+        )));
+
+        Ok(applied.version)
+    }
+
+    /// Applies `raw` with the skill's `Patch` strategy and `rules`, exactly
+    /// as an operator patch (`/patch`) does, but without the `user_patch`
+    /// system entry or observation an operator patch produces -- those are
+    /// specific to `apply_user_patch`/the maintainer patch path in `step`,
+    /// which each build their own on top of this. Shared by
+    /// `apply_user_patch` (source `"user"`) and the context-maintenance
+    /// patch in `step` (source `"maintainer"`): both are harness-trusted
+    /// writers of harness-owned fields, so both skip the
+    /// `Skill::harness_owned_fields` check that gates model patches (that
+    /// check lives in `validate_default`, on the model path only;
+    /// `validate_user_patch`, which this calls, never runs it).
+    ///
+    /// Logs a `Patch` entry with `"source": source` and returns the new
+    /// version, the harness step it committed at, and the sorted top-level
+    /// keys the patch actually changed.
+    async fn apply_trusted_patch(
+        &mut self,
+        raw: Value,
+        source: &str,
+    ) -> Result<AppliedTrustedPatch, SessionError> {
+        let (cur, version) = self.session.state().await?;
+
+        let validated = validate_user_patch::<K::Workspace, K::Patch>(
+            self.skill.as_ref(),
+            &cur,
+            crate::patch::RawPatch(raw),
+            version,
+        )
+        .map_err(SessionError::Patch)?;
+
+        let mut next_harness = cur.harness.clone();
+        next_harness.step += 1;
+        next_harness.active_tools = self.skill.tools();
+        next_harness.activation = self.skill.name().to_string();
+
+        let cur_value = serde_json::to_value(&cur.agent).unwrap_or(Value::Null);
+        let next_value = serde_json::to_value(validated.next()).unwrap_or(Value::Null);
+        let changed = changed_top_level_keys(&cur_value, &next_value);
+        let mut keys: Vec<String> = changed
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+
+        let patch_raw = validated.raw().clone();
+        let new_version = self
+            .session
+            .store
+            .commit(validated, next_harness.clone(), &Action::Yield, version)
+            .await?;
+
+        self.session.log.append(LogEntry {
+            step: next_harness.step,
+            kind: LogKind::Patch,
+            ts: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "version": new_version,
+                "patch": patch_raw,
+                "source": source,
+            }),
+            agent: None,
+        })?;
+
+        Ok(AppliedTrustedPatch {
+            version: new_version,
+            step: next_harness.step,
+            keys,
+        })
+    }
+
+    /// Context maintenance (statie-spec.md "9. Context maintenance"): runs
+    /// after a committed step's action has been fully handled -- tool
+    /// executed and the next observation produced, or an `AskUser`/`Yield`
+    /// park -- and never on a rejection or after `Done`. Distils the
+    /// step's reasoning (which is otherwise dropped) into the
+    /// harness-owned `notes` field, and, when the workspace has no open
+    /// commitment, may propose one the model itself did not write.
+    ///
+    /// A maintainer error (backend down, over budget after one retry, or
+    /// its patch rejected twice) logs `maintainer_error`, keeps the
+    /// previous notes, and never changes the step outcome -- callers must
+    /// not propagate its `Result` into the step's own.
+    async fn run_maintainer(
+        &mut self,
+        reasoning: Option<&str>,
+        patch: &Value,
+        action: &Action,
+        sink: &mut dyn StepSink,
+    ) {
+        let Some(maintainer) = self.session.maintainer.clone() else {
+            return;
+        };
+
+        let (cur, _version) = match self.session.state().await {
+            Ok(s) => s,
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = self.session.log.append(system_entry(
+                    self.session.log.last_step(),
+                    "maintainer_error",
+                    serde_json::json!({"reason": reason}),
+                ));
+                sink.maintainer_failed(&reason);
+                return;
+            }
+        };
+        let step = cur.harness.step;
+
+        let observation_text = self
+            .session
+            .pending_observation
+            .as_ref()
+            .map(Observation::as_str)
+            .unwrap_or("");
+        let agent_value = serde_json::to_value(&cur.agent).unwrap_or(Value::Null);
+        let commitment = self.skill.commitment(&cur.agent);
+        let notes = self.skill.notes(&cur.agent).unwrap_or_default();
+        let budget = cur.harness.budgets.notes;
+        let active_tools = cur.harness.active_tools.clone();
+
+        let input = MaintainInput {
+            reasoning,
+            patch,
+            action,
+            observation: observation_text,
+            agent: &agent_value,
+            commitment: commitment.as_ref(),
+            notes: &notes,
+            budget: TokenBudget(budget),
+            active_tools: &active_tools,
+        };
+
+        let mut out = match maintainer.maintain(input).await {
+            Ok(out) => out,
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = self.session.log.append(system_entry(
+                    step,
+                    "maintainer_error",
+                    serde_json::json!({"reason": reason}),
+                ));
+                sink.maintainer_failed(&reason);
+                return;
+            }
+        };
+
+        let notes_tokens = self.session.tokenizer.count(&out.notes);
+        if notes_tokens > budget {
+            let reason = format!("notes over budget: {notes_tokens} > {budget}");
+            let _ = self.session.log.append(system_entry(
+                step,
+                "maintainer_error",
+                serde_json::json!({"reason": reason}),
+            ));
+            sink.maintainer_failed(&reason);
+            return;
+        }
+
+        // A proposed `next` whose tool isn't active for this activation is
+        // never a real commitment (statie-spec.md "9. Context
+        // maintenance"): the worker has no way to satisfy it. Drop it and
+        // log `maintainer_error`, but still apply the notes below.
+        if let Some(c) = &out.next
+            && !active_tools.iter().any(|t| t == &c.tool)
+        {
+            let reason = format!("proposed next uses inactive tool `{}`", c.tool);
+            let _ = self.session.log.append(system_entry(
+                step,
+                "maintainer_error",
+                serde_json::json!({"reason": reason}),
+            ));
+            out.next = None;
+        }
+
+        // A proposed `next` that is malformed in the same ways the coding
+        // skills' `strip_malformed_next` (skills/src/coding/mod.rs) checks
+        // a worker-written `next` is never a real commitment either: a
+        // commitment must be a mutating call (`MUTATING_TOOLS`), since the
+        // session's commitment read cap can only ever be cleared by one --
+        // capping reads against a commitment no call can fulfil (e.g.
+        // `next.tool = "read_file"`) rejects the model to the retry cap.
+        // Checked in the same order as `strip_malformed_next`, first match
+        // wins. Drop and log `maintainer_error`, but still apply the notes
+        // below.
+        if let Some(c) = &out.next {
+            let reason = if !MUTATING_TOOLS.contains(&c.tool.as_str()) {
+                Some(format!(
+                    "proposed next is not a mutating call: `{}`",
+                    c.tool
+                ))
+            } else if c.what.trim().is_empty() {
+                Some("proposed next has an empty `what`".to_string())
+            } else if matches!(c.tool.as_str(), "edit_file" | "write_file")
+                && c.path.as_deref().map(str::trim).unwrap_or("").is_empty()
+            {
+                Some(format!("proposed next `{}` has no `path`", c.tool))
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
+                let _ = self.session.log.append(system_entry(
+                    step,
+                    "maintainer_error",
+                    serde_json::json!({"reason": reason}),
+                ));
+                out.next = None;
+            }
+        }
+
+        // `next` is applied only when the workspace's own commitment is
+        // still `None`: a maintainer-proposed commitment never overrides
+        // one the worker wrote itself.
+        let propose_next = commitment.is_none() && out.next.is_some();
+
+        let mut patch_value = serde_json::json!({"notes": out.notes});
+        if propose_next && let Value::Object(map) = &mut patch_value {
+            map.insert(
+                "next".to_string(),
+                serde_json::to_value(&out.next).unwrap_or(Value::Null),
+            );
+        }
+
+        match self
+            .apply_trusted_patch(patch_value.clone(), "maintainer")
+            .await
+        {
+            Ok(applied) => {
+                let _ = self.session.log.append(system_entry(
+                    applied.step,
+                    "maintainer",
+                    serde_json::json!({"notes_tokens": notes_tokens, "next_set": propose_next}),
+                ));
+                sink.maintainer_done(notes_tokens, propose_next);
+            }
+            Err(e) if propose_next => {
+                // Retry once with `next` omitted: a bad `next` shouldn't
+                // cost the notes update.
+                let reason = e.to_string();
+                let _ = self.session.log.append(system_entry(
+                    step,
+                    "maintainer_error",
+                    serde_json::json!({"reason": reason}),
+                ));
+                let retry_value = serde_json::json!({"notes": out.notes});
+                match self.apply_trusted_patch(retry_value, "maintainer").await {
+                    Ok(applied) => {
+                        let _ = self.session.log.append(system_entry(
+                            applied.step,
+                            "maintainer",
+                            serde_json::json!({"notes_tokens": notes_tokens, "next_set": false}),
+                        ));
+                        sink.maintainer_done(notes_tokens, false);
+                    }
+                    Err(e) => {
+                        let reason = e.to_string();
+                        let _ = self.session.log.append(system_entry(
+                            step,
+                            "maintainer_error",
+                            serde_json::json!({"reason": reason}),
+                        ));
+                        sink.maintainer_failed(&reason);
+                    }
+                }
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = self.session.log.append(system_entry(
+                    step,
+                    "maintainer_error",
+                    serde_json::json!({"reason": reason}),
+                ));
+                sink.maintainer_failed(&reason);
+            }
+        }
     }
 
     /// Replays the patch log up to `to` using this skill's patch strategy.
@@ -807,5 +2980,164 @@ fn system_entry(step: u64, event: &str, mut payload: Value) -> LogEntry {
         kind: LogKind::System,
         ts: chrono::Utc::now().to_rfc3339(),
         payload,
+        agent: None,
+    }
+}
+
+/// Compact-JSON rendering of a tool's args schema for a rejection message.
+/// Above 1200 chars, falls back to just the `properties` keys and the
+/// `required` list, so a large schema doesn't blow out the observation
+/// with detail the model doesn't need to fix a rejected call.
+fn render_schema_compact(schema: &Schema) -> String {
+    let full = serde_json::to_string(schema.as_value()).unwrap_or_else(|_| "{}".to_string());
+    if full.len() <= 1200 {
+        return full;
+    }
+    let obj = schema.as_value().as_object();
+    let properties: Vec<&String> = obj
+        .and_then(|o| o.get("properties"))
+        .and_then(Value::as_object)
+        .map(|p| p.keys().collect())
+        .unwrap_or_default();
+    let required: Vec<&Value> = obj
+        .and_then(|o| o.get("required"))
+        .and_then(Value::as_array)
+        .map(|r| r.iter().collect())
+        .unwrap_or_default();
+    serde_json::json!({"properties": properties, "required": required}).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_command, normalize_failure_summary, read_call_key, summarize_verify_output,
+    };
+
+    #[test]
+    fn trims_leading_and_trailing_whitespace() {
+        assert_eq!(normalize_command("  echo hi  "), "echo hi");
+    }
+
+    #[test]
+    fn cuts_at_first_pipe() {
+        assert_eq!(normalize_command("echo hi | cat"), "echo hi");
+        assert_eq!(normalize_command("echo hi|cat|grep x"), "echo hi");
+    }
+
+    #[test]
+    fn strips_trailing_redirect() {
+        assert_eq!(normalize_command("cargo test 2>&1"), "cargo test");
+    }
+
+    #[test]
+    fn collapses_internal_whitespace() {
+        assert_eq!(normalize_command("echo   hi\tthere"), "echo hi there");
+    }
+
+    #[test]
+    fn combines_all_normalizations() {
+        assert_eq!(
+            normalize_command("  cargo   test  -p  foo   2>&1  | tee out.log  "),
+            "cargo test -p foo"
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_normalize_to_empty() {
+        assert_eq!(normalize_command(""), "");
+        assert_eq!(normalize_command("   "), "");
+    }
+
+    #[test]
+    fn different_commands_are_not_equal_after_normalization() {
+        assert_ne!(normalize_command("echo hi"), normalize_command("echo bye"));
+    }
+
+    #[test]
+    fn summarize_skips_shell_framing_lines() {
+        let out = "exit: 0\n--- stdout ---\nhi\n--- stderr ---\n";
+        assert_eq!(summarize_verify_output(out), "hi");
+    }
+
+    #[test]
+    fn summarize_includes_failure_lines() {
+        let out = "command: cargo test\nresult: fail (exit 1)\n--- failure summary ---\ntest \
+                    foo::bar ... FAILED\nerror[E0382]: use of moved value\nthread 'main' \
+                    panicked at src/main.rs";
+        let summary = summarize_verify_output(out);
+        // The `command:` line repeats what the rejection already quotes;
+        // the summary starts at the result line instead.
+        assert!(!summary.contains("command: cargo test"), "{summary}");
+        assert!(summary.starts_with("result: fail (exit 1)"), "{summary}");
+        assert!(summary.contains("FAILED"));
+        assert!(summary.contains("error[E0382]"));
+        assert!(summary.contains("panicked"));
+    }
+
+    #[test]
+    fn summarize_truncates_to_300_chars() {
+        let long_line = "x".repeat(500);
+        let summary = summarize_verify_output(&long_line);
+        assert_eq!(summary.chars().count(), 300);
+    }
+
+    #[test]
+    fn normalize_failure_summary_stops_at_the_next_marker_section() {
+        let output = "command: cargo test\nresult: fail (exit 1)\n--- failure summary ---\n\
+                       unexpected closing delimiter: `}`\nsrc/lib.rs:42\n--- stderr ---\n\
+                       noisy raw compiler output here\n";
+        assert_eq!(
+            normalize_failure_summary(output),
+            "unexpected closing delimiter: `}`\nsrc/lib.rs:42"
+        );
+    }
+
+    #[test]
+    fn normalize_failure_summary_without_marker_drops_the_command_line() {
+        let output = "command: cargo test\nresult: fail (exit 1)\nsome raw output with no \
+                       failure-summary marker\nmore output";
+        assert_eq!(
+            normalize_failure_summary(output),
+            "result: fail (exit 1)\nsome raw output with no failure-summary marker\nmore output"
+        );
+    }
+
+    #[test]
+    fn read_call_key_is_stable_for_identical_calls() {
+        let a = serde_json::json!({"path": "a.rs", "offset": 1, "limit": 5});
+        let b = serde_json::json!({"path": "a.rs", "offset": 1, "limit": 5});
+        assert_eq!(
+            read_call_key("read_file", &a),
+            read_call_key("read_file", &b)
+        );
+    }
+
+    #[test]
+    fn read_call_key_ignores_object_key_order() {
+        let a = serde_json::json!({"path": "a.rs", "offset": 1, "limit": 5});
+        let b = serde_json::json!({"limit": 5, "offset": 1, "path": "a.rs"});
+        assert_eq!(
+            read_call_key("read_file", &a),
+            read_call_key("read_file", &b)
+        );
+    }
+
+    #[test]
+    fn read_call_key_differs_on_different_args() {
+        let a = serde_json::json!({"path": "a.rs", "offset": 1, "limit": 5});
+        let b = serde_json::json!({"path": "a.rs", "offset": 2, "limit": 5});
+        assert_ne!(
+            read_call_key("read_file", &a),
+            read_call_key("read_file", &b)
+        );
+    }
+
+    #[test]
+    fn read_call_key_differs_on_different_tool_name() {
+        let args = serde_json::json!({"path": "a.rs"});
+        assert_ne!(
+            read_call_key("read_file", &args),
+            read_call_key("search", &args)
+        );
     }
 }

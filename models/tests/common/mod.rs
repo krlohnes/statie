@@ -15,6 +15,8 @@ pub fn budgets() -> Budgets {
         total: 1_000_000,
         observation: 1_000_000,
         augmentation: 1_000_000,
+        notes: 1_000_000,
+        working_set: 6000,
     }
 }
 
@@ -31,7 +33,13 @@ pub fn build_prompt(version: Version) -> BoundedPrompt {
         schema_constrained: true,
         prefix_cache: true,
     };
-    let sys = SystemPrompt::for_harness(&caps, "json-merge-patch (RFC 7386)", "merge patch", None);
+    let sys = SystemPrompt::for_harness(
+        &caps,
+        "json-merge-patch (RFC 7386)",
+        "merge patch",
+        None,
+        &[],
+    );
     let spec = Arc::new(SkillSpec::new("toy", "instructions"));
     let tools = ToolSet::new().list_for(&[]);
     let agent = serde_json::json!({"x": 1});
@@ -43,6 +51,11 @@ pub fn build_prompt(version: Version) -> BoundedPrompt {
         activation: "toy".to_string(),
         step: 0,
         last_overflow: None,
+        pinned: None,
+        green_step: None,
+        green_filtered: false,
+        tool_calls: 0,
+        last_test_cmd: None,
     };
     let harness_view = HarnessView::new(&harness);
 

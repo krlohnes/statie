@@ -103,8 +103,18 @@ fn eval_toy_json_shows_flat_statie_and_growing_baseline() {
     );
     let min = *statie_tokens.iter().min().unwrap();
     let max = *statie_tokens.iter().max().unwrap();
+    // The working set (statie-spec.md "10. Working set") is on by default
+    // (`Session::with_working_set` is called with the config's own
+    // `working_set` section, whose built-in default is "on": 4 windows, 6
+    // recent-call lines), and this eval only runs 3 model-calling steps --
+    // short of the 6-step plateau the working-set unit tests exercise --
+    // so its "recent calls:" block legitimately grows by one line per step
+    // for the whole run (observed: [751, 801, 820], a 69-token spread).
+    // 20 predates that growth; widen enough to absorb it while still
+    // catching the append-only-style growth (hundreds of tokens per step)
+    // this assertion exists to distinguish `statie` from `baseline` on.
     assert!(
-        max - min <= 20,
+        max - min <= 100,
         "statie prompt should stay flat: {statie_tokens:?}"
     );
 

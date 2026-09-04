@@ -3,15 +3,18 @@
 //! anywhere else: this module is the single source of truth, and every
 //! field has a serde default so a partial (or absent) file is valid.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use statie_core::{SessionLog, StateStore};
+use statie_core::{Guards, Maintainer, SessionLog, StateStore, TiktokenTokenizer};
 use statie_models::{
-    MockModel, MockTurn, OllamaConfig, OllamaFormat, OllamaModel, OpenAiCompatConfig,
-    OpenAiCompatModel,
+    MockModel, MockTurn, ModelMaintainer, OllamaConfig, OllamaFormat, OllamaModel,
+    OpenAiCompatConfig, OpenAiCompatModel,
 };
+use statie_skills::ChildSkillConfig;
 use statie_store::{InMemoryStore, JsonlLog, SqliteStore};
 use statie_tools::ToolConfig;
 
@@ -30,6 +33,26 @@ pub struct Config {
     pub augmenters: AugmentersConfig,
     pub tools: ToolConfig,
     pub max_autonomous_steps: usize,
+    /// Configured child skills (subagents), keyed by name (milestone 9,
+    /// ARCHITECTURE.md "Configured child skills"). A parent skill calls one
+    /// of these via the `delegate` action; each stanza is a complete child
+    /// definition (instructions, tools, optional guide and `data` schema,
+    /// budgets, a step cap) with no Rust code required.
+    pub subagents: BTreeMap<String, ChildSkillConfig>,
+    /// Context maintenance (statie-spec.md "9. Context maintenance").
+    /// Absent (the default) means no maintainer is attached and the loop
+    /// behaves exactly as it did before this feature existed.
+    pub maintainer: Option<MaintainerConfig>,
+    /// Working-set config (statie-spec.md "10. Working set"): recent tool
+    /// calls and read/search windows kept in front of the model.
+    /// `max_windows: 0` disables the section.
+    pub working_set: WorkingSetConfigEntry,
+    /// Rule-audit switches (statie-spec.md "10. After it works: the rule
+    /// audit", milestone 12): one bool per non-progress rule marked "peel"
+    /// in the audit table, all defaulting `true`. An absent `guards`
+    /// section (or a section missing individual fields) leaves every rule
+    /// on -- byte-for-byte today's behaviour.
+    pub guards: Guards,
 }
 
 impl Default for Config {
@@ -44,6 +67,60 @@ impl Default for Config {
             augmenters: AugmentersConfig::default(),
             tools: ToolConfig::default(),
             max_autonomous_steps: 200,
+            subagents: BTreeMap::new(),
+            maintainer: None,
+            working_set: WorkingSetConfigEntry::default(),
+            guards: Guards::default(),
+        }
+    }
+}
+
+/// Config-file mirror of `statie_core::WorkingSetConfig` (statie-spec.md
+/// "10. Working set"). `max_windows: 0` disables the section.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkingSetConfigEntry {
+    pub max_windows: usize,
+    pub recent_calls: usize,
+}
+
+impl Default for WorkingSetConfigEntry {
+    fn default() -> Self {
+        WorkingSetConfigEntry {
+            max_windows: 4,
+            recent_calls: 6,
+        }
+    }
+}
+
+impl From<WorkingSetConfigEntry> for statie_core::WorkingSetConfig {
+    fn from(w: WorkingSetConfigEntry) -> Self {
+        statie_core::WorkingSetConfig {
+            max_windows: w.max_windows,
+            recent_calls: w.recent_calls,
+        }
+    }
+}
+
+/// Context-maintenance config (statie-spec.md "9. Context maintenance").
+/// `model` defaults to the top-level `model` when omitted, so the worker's
+/// model runs the maintenance call too.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintainerConfig {
+    pub model: Option<ModelConfig>,
+    pub budget: usize,
+    pub timeout_secs: u64,
+    pub prompt_budget: usize,
+}
+
+impl Default for MaintainerConfig {
+    fn default() -> Self {
+        MaintainerConfig {
+            model: None,
+            budget: 400,
+            timeout_secs: 120,
+            prompt_budget: 4000,
         }
     }
 }
@@ -72,6 +149,12 @@ pub struct ModelConfig {
     /// Passed through verbatim: ollama `options` (minus `num_ctx`), openai extra body.
     pub options: serde_json::Value,
     pub timeout_secs: u64,
+    /// Ollama only: retries after a 5xx response or a transport-level
+    /// failure (connection reset/refused, or a mid-stream EOF that isn't
+    /// the configured timeout). See `statie_models::OllamaConfig`.
+    pub retries_on_5xx: u32,
+    /// Ollama only: delay between retries, in seconds.
+    pub retry_delay_secs: u64,
     /// Only used when `backend == "mock"`.
     pub mock_script: Vec<MockScriptTurn>,
 }
@@ -89,6 +172,8 @@ impl Default for ModelConfig {
             schema_constrained: None,
             options: serde_json::json!({}),
             timeout_secs: 600,
+            retries_on_5xx: 2,
+            retry_delay_secs: 15,
             mock_script: Vec::new(),
         }
     }
@@ -112,6 +197,12 @@ pub struct BudgetConfig {
     pub total: usize,
     pub observation: usize,
     pub augmentation: usize,
+    /// Cap on the harness-maintained `notes` section (statie-spec.md "9.
+    /// Context maintenance"). Overridden by `maintainer.budget` when a
+    /// `maintainer` section is present (see `Config::build_maintainer`).
+    pub notes: usize,
+    /// Cap on the working-set section (statie-spec.md "10. Working set").
+    pub working_set: usize,
 }
 
 impl Default for BudgetConfig {
@@ -120,6 +211,8 @@ impl Default for BudgetConfig {
             total: 24000,
             observation: 3000,
             augmentation: 2000,
+            notes: 400,
+            working_set: 6000,
         }
     }
 }
@@ -130,6 +223,8 @@ impl From<BudgetConfig> for statie_core::Budgets {
             total: b.total,
             observation: b.observation,
             augmentation: b.augmentation,
+            notes: b.notes,
+            working_set: b.working_set,
         }
     }
 }
@@ -334,70 +429,46 @@ impl Config {
         Ok(dir)
     }
 
-    pub fn ollama(&self) -> OllamaConfig {
-        OllamaConfig {
-            base_url: self.model.base_url.clone(),
-            model: self.model.model.clone(),
-            think: self.model.think,
-            num_ctx: self.model.num_ctx,
-            options: self.model.options.clone(),
-            timeout_secs: self.model.timeout_secs,
-            format: self.model.format,
-            schema_constrained: self.model.schema_constrained,
-        }
-    }
-
-    pub fn openai(&self) -> OpenAiCompatConfig {
-        let mut cfg = OpenAiCompatConfig {
-            base_url: self.model.base_url.clone(),
-            model: self.model.model.clone(),
-            api_key: self.model.api_key.clone(),
-            extra_body: self.model.options.clone(),
-            timeout_secs: self.model.timeout_secs,
-            ..OpenAiCompatConfig::default()
-        };
-        // Preserve the crate default for reasoning_field/use_json_schema_format
-        // unless a future config surface wants to override them explicitly.
-        cfg.reasoning_field = Some("reasoning_content".to_string());
-        cfg.use_json_schema_format = self.model.schema_constrained.unwrap_or(true);
-        cfg
-    }
-
     /// Builds the configured `Model` backend. Unknown `backend` values are a
     /// named error (never silently default to a backend).
     pub fn build_model(&self) -> anyhow::Result<Box<dyn statie_core::Model>> {
-        match self.model.backend.as_str() {
-            "ollama" => {
-                let model = OllamaModel::new(self.ollama())?;
-                Ok(Box::new(model))
-            }
-            "openai" => {
-                let model = OpenAiCompatModel::new(self.openai())?;
-                Ok(Box::new(model))
-            }
-            "mock" => {
-                let turns: Vec<MockTurn> = self
-                    .model
-                    .mock_script
-                    .iter()
-                    .map(|t| {
-                        let mut turn = MockTurn::new(t.content.clone());
-                        if let Some(r) = &t.reasoning {
-                            turn = turn.with_reasoning(r.clone());
-                        }
-                        if let (Some(p), Some(c)) = (t.prompt_tokens, t.completion_tokens) {
-                            turn = turn.with_usage(p, c);
-                        }
-                        turn
-                    })
-                    .collect();
-                let model = MockModel::new(turns).repeat_last(true);
-                Ok(Box::new(model))
-            }
-            other => anyhow::bail!(
-                "unknown model backend `{other}` (expected one of: ollama, openai, mock)"
-            ),
+        build_model_from(&self.model)
+    }
+
+    /// The `Budgets` a `Session` should be built with: `self.budget`,
+    /// except `notes` is overridden by `maintainer.budget` when a
+    /// `maintainer` section is present (statie-spec.md "9. Context
+    /// maintenance": "`budgets.notes` (default 400 tokens) caps the
+    /// field"). Absent a `maintainer` section, `budgets.notes` keeps its
+    /// own default/configured value.
+    pub fn effective_budgets(&self) -> statie_core::Budgets {
+        let mut budgets: statie_core::Budgets = self.budget.into();
+        if let Some(m) = &self.maintainer {
+            budgets.notes = m.budget;
         }
+        budgets
+    }
+
+    /// Builds the context-maintenance backend (statie-spec.md "9. Context
+    /// maintenance") from `self.maintainer`. `None` when the section is
+    /// absent -- the session then runs with no maintainer, exactly as
+    /// before this feature existed. `maintainer.model` is built when given,
+    /// else the top-level `model` is reused, so the worker's own model runs
+    /// the maintenance call by default.
+    pub fn build_maintainer(&self) -> anyhow::Result<Option<Arc<dyn Maintainer>>> {
+        let Some(m) = &self.maintainer else {
+            return Ok(None);
+        };
+        let model_cfg = m.model.as_ref().unwrap_or(&self.model);
+        let model: Arc<dyn statie_core::Model> = build_model_from(model_cfg)?.into();
+        let tokenizer: Arc<dyn statie_core::Tokenizer> = Arc::new(TiktokenTokenizer);
+        let maintainer = ModelMaintainer::new(
+            model,
+            tokenizer,
+            m.prompt_budget,
+            Duration::from_secs(m.timeout_secs),
+        );
+        Ok(Some(Arc::new(maintainer)))
     }
 
     /// Resolves `self.store.path` and `self.session_log` against the
@@ -421,9 +492,18 @@ impl Config {
     /// so a fresh `statie run` starts a clean session. Moves the store db
     /// (plus any `-wal`/`-shm` sidecars) and the JSONL log into
     /// `<sandbox_root>/.statie/archive/<YYYYmmdd-HHMMSS>/`, preserving file
-    /// names. Returns `Ok(None)` if there was nothing to archive (kind is
-    /// not `sqlite`, or neither file exists).
+    /// names. Also removes `<sandbox_root>/.statie/orig`, if present: those
+    /// are `revert_file`'s pre-edit backups from the previous session, and a
+    /// fresh session must not let `revert_file` restore content from a run
+    /// the user is no longer resuming. (A `--resume`d session never calls
+    /// this, so its backups are left alone.) Returns `Ok(None)` if there was
+    /// nothing to archive (kind is not `sqlite`, or neither the store nor
+    /// the log file exists) -- the `.statie/orig` removal still happens in
+    /// that case, since a fresh start clears backups independently of
+    /// whether there was a session to archive.
     pub fn archive_session(&self) -> anyhow::Result<Option<PathBuf>> {
+        self.remove_orig_backups()?;
+
         if self.store.kind != "sqlite" {
             return Ok(None);
         }
@@ -477,6 +557,20 @@ impl Config {
         Ok(Some(archive_dir))
     }
 
+    /// Removes `<sandbox_root>/.statie/orig` if present -- the pre-edit
+    /// backups `revert_file` reads (see `statie_tools::common::
+    /// backup_before_edit`). Called by `archive_session`, i.e. only on a
+    /// fresh (non-`--resume`) `statie run`. A no-op if the directory
+    /// doesn't exist.
+    fn remove_orig_backups(&self) -> anyhow::Result<()> {
+        let orig_dir = self.sandbox_root.join(".statie").join("orig");
+        if !orig_dir.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&orig_dir)
+            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", orig_dir.display()))
+    }
+
     /// Builds the configured `StateStore<W>`. Unknown `store.kind` values
     /// are a named error.
     pub fn build_store<W>(&self) -> anyhow::Result<Box<dyn StateStore<W>>>
@@ -524,6 +618,76 @@ fn resolve_under(root: &Path, p: &Path) -> PathBuf {
     }
 }
 
+fn ollama_config(model: &ModelConfig) -> OllamaConfig {
+    OllamaConfig {
+        base_url: model.base_url.clone(),
+        model: model.model.clone(),
+        think: model.think,
+        num_ctx: model.num_ctx,
+        options: model.options.clone(),
+        timeout_secs: model.timeout_secs,
+        format: model.format,
+        schema_constrained: model.schema_constrained,
+        retries_on_5xx: model.retries_on_5xx,
+        retry_delay_secs: model.retry_delay_secs,
+    }
+}
+
+fn openai_config(model: &ModelConfig) -> OpenAiCompatConfig {
+    let mut cfg = OpenAiCompatConfig {
+        base_url: model.base_url.clone(),
+        model: model.model.clone(),
+        api_key: model.api_key.clone(),
+        extra_body: model.options.clone(),
+        timeout_secs: model.timeout_secs,
+        ..OpenAiCompatConfig::default()
+    };
+    // Preserve the crate default for reasoning_field/use_json_schema_format
+    // unless a future config surface wants to override them explicitly.
+    cfg.reasoning_field = Some("reasoning_content".to_string());
+    cfg.use_json_schema_format = model.schema_constrained.unwrap_or(true);
+    cfg
+}
+
+/// Builds a `Model` backend from any `ModelConfig`, independent of a full
+/// `Config` -- used both by `Config::build_model` (the top-level `model`)
+/// and `Config::build_maintainer` (`maintainer.model`, when given). Unknown
+/// `backend` values are a named error (never silently default to a
+/// backend).
+fn build_model_from(model: &ModelConfig) -> anyhow::Result<Box<dyn statie_core::Model>> {
+    match model.backend.as_str() {
+        "ollama" => {
+            let m = OllamaModel::new(ollama_config(model))?;
+            Ok(Box::new(m))
+        }
+        "openai" => {
+            let m = OpenAiCompatModel::new(openai_config(model))?;
+            Ok(Box::new(m))
+        }
+        "mock" => {
+            let turns: Vec<MockTurn> = model
+                .mock_script
+                .iter()
+                .map(|t| {
+                    let mut turn = MockTurn::new(t.content.clone());
+                    if let Some(r) = &t.reasoning {
+                        turn = turn.with_reasoning(r.clone());
+                    }
+                    if let (Some(p), Some(c)) = (t.prompt_tokens, t.completion_tokens) {
+                        turn = turn.with_usage(p, c);
+                    }
+                    turn
+                })
+                .collect();
+            let m = MockModel::new(turns).repeat_last(true);
+            Ok(Box::new(m))
+        }
+        other => {
+            anyhow::bail!("unknown model backend `{other}` (expected one of: ollama, openai, mock)")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,12 +714,146 @@ mod tests {
         assert_eq!(cfg.model.model, "gemma4:26b");
         assert!(cfg.model.think);
         assert_eq!(cfg.model.timeout_secs, 600);
+        assert_eq!(cfg.model.retries_on_5xx, 2);
+        assert_eq!(cfg.model.retry_delay_secs, 15);
         assert_eq!(cfg.budget, BudgetConfig::default());
         assert_eq!(cfg.retries, 3);
         assert_eq!(cfg.store, StoreConfig::default());
         assert_eq!(cfg.session_log, PathBuf::from(".statie/session.jsonl"));
         assert_eq!(cfg.sandbox_root, PathBuf::from("."));
         assert_eq!(cfg.augmenters, AugmentersConfig::default());
+        assert!(
+            cfg.subagents.is_empty(),
+            "old config without subagents should still parse"
+        );
+    }
+
+    #[test]
+    fn working_set_round_trips_and_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.working_set, WorkingSetConfigEntry::default());
+        assert_eq!(cfg.working_set.max_windows, 4);
+        assert_eq!(cfg.working_set.recent_calls, 6);
+        assert_eq!(cfg.effective_budgets().working_set, 6000);
+
+        let text = serde_json::json!({
+            "working_set": {"max_windows": 2, "recent_calls": 3},
+            "budget": {"working_set": 8000},
+        })
+        .to_string();
+        let parsed: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.working_set.max_windows, 2);
+        assert_eq!(parsed.working_set.recent_calls, 3);
+        assert_eq!(parsed.effective_budgets().working_set, 8000);
+
+        // Round-trips through serialize -> deserialize unchanged.
+        let json = serde_json::to_string(&parsed).unwrap();
+        let round_tripped: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.working_set, parsed.working_set);
+        assert_eq!(round_tripped.budget, parsed.budget);
+    }
+
+    #[test]
+    fn unknown_key_inside_working_set_errors() {
+        let result: Result<Config, _> = serde_json::from_str(r#"{"working_set":{"max_widows":2}}"#);
+        assert!(
+            result.is_err(),
+            "expected an error for the unknown key `max_widows`"
+        );
+    }
+
+    #[test]
+    fn guards_default_when_section_absent() {
+        let cfg = Config::default();
+        assert_eq!(cfg.guards, Guards::default());
+
+        let parsed: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            parsed.guards,
+            Guards::default(),
+            "an absent guards section must leave every rule on"
+        );
+    }
+
+    #[test]
+    fn guards_partial_section_defaults_the_rest_to_true() {
+        let text = serde_json::json!({
+            "guards": {"silent_reads": false}
+        })
+        .to_string();
+        let parsed: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.guards,
+            Guards {
+                silent_reads: false,
+                ..Guards::default()
+            }
+        );
+        assert!(parsed.guards.redundant_reads);
+        assert!(parsed.guards.read_guard);
+        assert!(parsed.guards.redundant_verify);
+        assert!(parsed.guards.done_stays_done);
+        assert!(parsed.guards.commitment_read_cap);
+
+        // Round-trips through serialize -> deserialize unchanged.
+        let json = serde_json::to_string(&parsed).unwrap();
+        let round_tripped: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.guards, parsed.guards);
+    }
+
+    #[test]
+    fn unknown_key_inside_guards_errors() {
+        let result: Result<Config, _> =
+            serde_json::from_str(r#"{"guards":{"redundant_raeds":false}}"#);
+        assert!(
+            result.is_err(),
+            "expected an error for the unknown key `redundant_raeds`"
+        );
+    }
+
+    #[test]
+    fn subagents_stanza_from_architecture_example_deserializes() {
+        let text = serde_json::json!({
+            "subagents": {
+                "ui-review": {
+                    "instructions": "Build the app, take a screenshot, and report ...",
+                    "tools": ["shell", "read_file", "search", "screenshot", "filter_last_tool_call"],
+                    "guide": "ui-review",
+                    "data_schema": {
+                        "type": "object",
+                        "properties": {
+                            "renders": {"type": "boolean"},
+                            "issues": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["renders"]
+                    },
+                    "budgets": {"total": 12000, "observation": 2000, "augmentation": 800},
+                    "max_steps": 30
+                }
+            }
+        })
+        .to_string();
+
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let child = cfg.subagents.get("ui-review").expect("ui-review stanza");
+        assert_eq!(child.guide.as_deref(), Some("ui-review"));
+        assert_eq!(child.max_steps, 30);
+        assert!(child.data_schema.is_some());
+        assert_eq!(
+            child.tools,
+            vec![
+                "shell".to_string(),
+                "read_file".to_string(),
+                "search".to_string(),
+                "screenshot".to_string(),
+                "filter_last_tool_call".to_string(),
+            ]
+        );
+
+        // Round-trips through Default too, and an old config (no
+        // `subagents` key at all) still parses with an empty map.
+        let old: Config = serde_json::from_str(r#"{"model":{"backend":"mock"}}"#).unwrap();
+        assert!(old.subagents.is_empty());
     }
 
     #[test]
@@ -824,5 +1122,165 @@ mod tests {
         let ok: Config = serde_json::from_str(r#"{"model":{"num_ctx":8192}}"#).unwrap();
         assert!(ok.validate().is_ok());
         assert_eq!(ok.model.num_ctx, 8192);
+    }
+
+    #[test]
+    fn model_retries_on_5xx_and_retry_delay_default_when_absent() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.model.retries_on_5xx, 2);
+        assert_eq!(cfg.model.retry_delay_secs, 15);
+
+        let ollama_cfg = ollama_config(&cfg.model);
+        assert_eq!(ollama_cfg.retries_on_5xx, 2);
+        assert_eq!(ollama_cfg.retry_delay_secs, 15);
+    }
+
+    #[test]
+    fn model_retries_on_5xx_and_retry_delay_parse_explicit_values() {
+        let text = serde_json::json!({
+            "model": {"retries_on_5xx": 5, "retry_delay_secs": 30}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(cfg.model.retries_on_5xx, 5);
+        assert_eq!(cfg.model.retry_delay_secs, 30);
+
+        let ollama_cfg = ollama_config(&cfg.model);
+        assert_eq!(ollama_cfg.retries_on_5xx, 5);
+        assert_eq!(ollama_cfg.retry_delay_secs, 30);
+
+        // Round-trips through serialize -> deserialize unchanged.
+        let json = serde_json::to_string(&cfg).unwrap();
+        let round_tripped: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.model, cfg.model);
+    }
+
+    #[test]
+    fn maintainer_model_inherits_retries_fields_through_ollama_config() {
+        let text = serde_json::json!({
+            "model": {"backend": "ollama", "retries_on_5xx": 4, "retry_delay_secs": 7},
+            "maintainer": {"budget": 300, "timeout_secs": 30}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let m = cfg.maintainer.as_ref().expect("maintainer section");
+        let model_cfg = m.model.as_ref().unwrap_or(&cfg.model);
+        let ollama_cfg = ollama_config(model_cfg);
+        assert_eq!(ollama_cfg.retries_on_5xx, 4);
+        assert_eq!(ollama_cfg.retry_delay_secs, 7);
+    }
+
+    #[test]
+    fn maintainer_section_fills_in_defaults() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"maintainer":{"budget":300,"timeout_secs":30}}"#).unwrap();
+        let m = cfg.maintainer.expect("maintainer section should parse");
+        assert_eq!(m.budget, 300);
+        assert_eq!(m.timeout_secs, 30);
+        // Defaults filled in for fields not given.
+        assert_eq!(m.prompt_budget, MaintainerConfig::default().prompt_budget);
+        assert!(m.model.is_none());
+    }
+
+    #[test]
+    fn maintainer_model_overrides_top_level_model() {
+        let text = serde_json::json!({
+            "model": {"backend": "mock"},
+            "maintainer": {
+                "model": {"backend": "mock", "model": "maintainer-model"}
+            }
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let m = cfg.maintainer.expect("maintainer section should parse");
+        let model_cfg = m.model.expect("maintainer.model should parse");
+        assert_eq!(model_cfg.model, "maintainer-model");
+        assert_ne!(model_cfg.model, cfg.model.model);
+    }
+
+    #[test]
+    fn absent_maintainer_section_builds_none() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.maintainer.is_none());
+        let maintainer = cfg.build_maintainer().unwrap();
+        assert!(maintainer.is_none());
+    }
+
+    #[test]
+    fn present_maintainer_section_builds_some() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"model":{"backend":"mock"},"maintainer":{"budget":300,"timeout_secs":30}}"#,
+        )
+        .unwrap();
+        let maintainer = cfg.build_maintainer().unwrap();
+        assert!(maintainer.is_some());
+    }
+
+    #[test]
+    fn budgets_notes_follows_maintainer_budget_when_present() {
+        let cfg: Config = serde_json::from_str(r#"{"maintainer":{"budget":777}}"#).unwrap();
+        assert_eq!(cfg.effective_budgets().notes, 777);
+
+        let cfg_no_maintainer: Config = serde_json::from_str(r#"{"budget":{"notes":55}}"#).unwrap();
+        assert_eq!(cfg_no_maintainer.effective_budgets().notes, 55);
+
+        let cfg_default: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            cfg_default.effective_budgets().notes,
+            BudgetConfig::default().notes
+        );
+    }
+
+    #[test]
+    fn unknown_key_inside_maintainer_errors() {
+        let result: Result<Config, _> = serde_json::from_str(r#"{"maintainer":{"budgett":300}}"#);
+        assert!(
+            result.is_err(),
+            "expected an error for the unknown key `budgett` inside `maintainer`"
+        );
+    }
+
+    #[test]
+    fn archive_session_removes_orig_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let statie_dir = dir.path().join(".statie");
+        let orig_dir = statie_dir.join("orig");
+        std::fs::create_dir_all(&orig_dir).unwrap();
+        std::fs::write(orig_dir.join("a.txt"), b"original content").unwrap();
+
+        let cfg = Config {
+            sandbox_root: dir.path().to_path_buf(),
+            store: StoreConfig {
+                kind: "memory".to_string(),
+                ..StoreConfig::default()
+            },
+            ..Config::default()
+        };
+
+        // No sqlite store/log to archive (kind is "memory"), but the orig
+        // backups must still be removed: a fresh start clears them
+        // regardless of whether there was a session to archive.
+        let archived = cfg.archive_session().unwrap();
+        assert!(archived.is_none());
+        assert!(
+            !orig_dir.exists(),
+            ".statie/orig must be removed on a fresh start"
+        );
+    }
+
+    #[test]
+    fn archive_session_is_a_no_op_when_orig_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            sandbox_root: dir.path().to_path_buf(),
+            store: StoreConfig {
+                kind: "memory".to_string(),
+                ..StoreConfig::default()
+            },
+            ..Config::default()
+        };
+
+        // Must not error just because .statie/orig never existed.
+        assert!(cfg.archive_session().unwrap().is_none());
     }
 }

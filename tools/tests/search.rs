@@ -28,8 +28,14 @@ async fn matches_across_nested_files() {
 
     assert_eq!(lines[0], "2 match(es) for /foo/");
     assert!(lines.contains(&"a/one.rs:1: fn foo() {}"));
+    assert!(lines.contains(&"a/one.rs:2- let x = 1;"));
+    assert!(lines.contains(&"a/b/two.rs:1- // comment"));
     assert!(lines.contains(&"a/b/two.rs:2: fn foo_bar() {}"));
-    assert_eq!(lines.len(), 3);
+    // Last line of a/b/two.rs, so no line past EOF.
+    assert!(!text.contains("a/b/two.rs:3-"));
+    // Different files, so a `--` separator appears between their windows.
+    assert!(lines.contains(&"--"));
+    assert!(text.contains("to edit here: edit_file"));
 }
 
 #[tokio::test]
@@ -130,8 +136,11 @@ async fn max_results_caps_and_reports_trailer() {
 
     assert_eq!(lines[0], "1 match(es) for /needle/");
     assert_eq!(lines[1], "f.txt:1: needle 1");
-    assert_eq!(lines.len(), 3);
-    assert!(lines[2].starts_with("…(stopped at 1 results"));
+    assert_eq!(lines[2], "f.txt:2- needle 2");
+    assert_eq!(lines[3], "f.txt:3- needle 3");
+    assert!(lines[4].starts_with("…(stopped at 1 results"));
+    assert!(lines[5].starts_with("to edit here: edit_file"));
+    assert_eq!(lines.len(), 6);
 }
 
 #[tokio::test]
@@ -226,4 +235,341 @@ async fn subdirectory_search_reports_paths_relative_to_sandbox_root() {
         "got: {text}"
     );
     assert!(!text.contains("other.rs"), "got: {text}");
+}
+
+#[tokio::test]
+async fn match_shows_one_line_of_following_context() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), "l1\nl2\nneedle here\nl4\nl5\n").unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(text.contains("f.txt:3: needle here"), "got: {text}");
+    assert!(text.contains("f.txt:4- l4"), "got: {text}");
+}
+
+#[tokio::test]
+async fn match_on_last_line_has_no_continuation_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), "l1\nl2\nl3\nl4\nneedle here").unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(text.contains("f.txt:5: needle here"), "got: {text}");
+    assert!(!text.contains("f.txt:6-"), "got: {text}");
+}
+
+#[tokio::test]
+async fn trailer_names_clamped_offset_for_read_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // Match on line 3: offset should clamp to 1 (3 - 5 < 1).
+    std::fs::write(dir.path().join("f.txt"), "l1\nl2\nneedle\nl4\nl5\n").unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(
+        text.contains("to edit here: edit_file {\"path\": \"f.txt\", \"before\": \"needle\", \"new\": \"...\"} — or read_file {\"path\": \"f.txt\", \"offset\": 1, \"limit\": 40}"),
+        "got: {text}"
+    );
+
+    // Match on line 25: offset should be 25 - 5 = 20.
+    let mut content_25 = String::new();
+    for i in 1..=24 {
+        content_25.push_str(&format!("line{i}\n"));
+    }
+    content_25.push_str("needle\n");
+    std::fs::write(dir.path().join("g.txt"), content_25).unwrap();
+
+    let out = tool()
+        .call(json!({"pattern": "needle", "path": "g.txt"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(
+        text.contains("to edit here: edit_file {\"path\": \"g.txt\", \"before\": \"needle\", \"new\": \"...\"} — or read_file {\"path\": \"g.txt\", \"offset\": 20, \"limit\": 40}"),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn max_results_one_returns_exactly_one_match_plus_context() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("f.txt"),
+        "needle 1\nfollow 1\nneedle 2\nfollow 2\n",
+    )
+    .unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle", "max_results": 1}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+    let lines: Vec<&str> = text.lines().collect();
+
+    // max_results stopped counting at 1 match, so only one line uses the
+    // `:` match marker even though "needle 2" (an unmatched line, since
+    // scanning stopped) still appears as trailing context text.
+    assert_eq!(lines[0], "1 match(es) for /needle/");
+    assert_eq!(lines[1], "f.txt:1: needle 1");
+    assert_eq!(lines[2], "f.txt:2- follow 1");
+    assert_eq!(lines[3], "f.txt:3- needle 2");
+    assert_eq!(lines[4], "f.txt:4- follow 2");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("f.txt:") && l.contains(": needle"))
+            .count(),
+        1,
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn single_match_renders_two_before_six_after_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut content = String::new();
+    for i in 1..=20 {
+        if i == 10 {
+            content.push_str("needle here\n");
+        } else {
+            content.push_str(&format!("line{i}\n"));
+        }
+    }
+    std::fs::write(dir.path().join("f.txt"), content).unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+    let lines: Vec<&str> = text.lines().collect();
+
+    assert_eq!(lines[0], "1 match(es) for /needle/");
+    assert_eq!(lines[1], "f.txt:8- line8");
+    assert_eq!(lines[2], "f.txt:9- line9");
+    assert_eq!(lines[3], "f.txt:10: needle here");
+    assert_eq!(lines[4], "f.txt:11- line11");
+    assert_eq!(lines[5], "f.txt:12- line12");
+    assert_eq!(lines[6], "f.txt:13- line13");
+    assert_eq!(lines[7], "f.txt:14- line14");
+    assert_eq!(lines[8], "f.txt:15- line15");
+    assert_eq!(lines[9], "f.txt:16- line16");
+    assert!(!text.contains("f.txt:7-"), "got: {text}");
+    assert!(!text.contains("f.txt:17-"), "got: {text}");
+    assert!(text.contains("\"before\": \""), "got: {text}");
+}
+
+#[tokio::test]
+async fn match_on_first_line_has_no_negative_context_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), "needle here\nl2\nl3\n").unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+    let lines: Vec<&str> = text.lines().collect();
+
+    assert_eq!(lines[0], "1 match(es) for /needle/");
+    assert_eq!(lines[1], "f.txt:1: needle here");
+    assert!(!text.contains(":0-"), "got: {text}");
+    assert!(!text.contains(":-1"), "got: {text}");
+}
+
+#[tokio::test]
+async fn match_on_final_line_has_no_lines_past_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), "l1\nl2\nneedle here").unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+    let lines: Vec<&str> = text.lines().collect();
+
+    assert_eq!(lines[0], "1 match(es) for /needle/");
+    assert_eq!(lines[1], "f.txt:1- l1");
+    assert_eq!(lines[2], "f.txt:2- l2");
+    assert_eq!(lines[3], "f.txt:3: needle here");
+    assert!(!text.contains("f.txt:4"), "got: {text}");
+}
+
+#[tokio::test]
+async fn nearby_matches_merge_into_one_window_without_separator() {
+    let dir = tempfile::tempdir().unwrap();
+    // Matches on lines 5 and 8 (3 lines apart): windows [3,11] and [6,14]
+    // overlap and must merge into a single block with no `--` inside it.
+    let mut content = String::new();
+    for i in 1..=15 {
+        if i == 5 || i == 8 {
+            content.push_str("needle\n");
+        } else {
+            content.push_str(&format!("line{i}\n"));
+        }
+    }
+    std::fs::write(dir.path().join("f.txt"), content).unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(text.contains("2 match(es) for /needle/"), "got: {text}");
+    assert!(text.contains("f.txt:5: needle"), "got: {text}");
+    assert!(text.contains("f.txt:8: needle"), "got: {text}");
+    assert!(!text.contains("--"), "got: {text}");
+}
+
+#[tokio::test]
+async fn matches_in_different_files_get_separator() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "needle in a\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "needle in b\n").unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+    let lines: Vec<&str> = text.lines().collect();
+
+    assert!(text.contains("2 match(es) for /needle/"), "got: {text}");
+    assert!(lines.contains(&"--"), "got: {text}");
+}
+
+#[tokio::test]
+async fn more_than_five_matches_use_compact_rendering() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut content = String::new();
+    for i in 1..=6 {
+        content.push_str(&format!("needle {i}\nfollow {i}\n"));
+    }
+    std::fs::write(dir.path().join("f.txt"), content).unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"pattern": "needle"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+    let lines: Vec<&str> = text.lines().collect();
+
+    assert_eq!(lines[0], "6 match(es) for /needle/");
+    // Old compact rendering: match line + one `-` continuation line, no
+    // 2-line-before context (no line for the "follow" line preceding a
+    // match, since compact mode only shows the *following* line).
+    assert_eq!(lines[1], "f.txt:1: needle 1");
+    assert_eq!(lines[2], "f.txt:2- follow 1");
+    assert_eq!(lines[3], "f.txt:3: needle 2");
+    assert!(!text.contains("--"), "got: {text}");
+    assert!(text.contains("to edit here: edit_file"), "got: {text}");
+}
+
+#[tokio::test]
+async fn missing_pattern_with_file_path_falls_back_to_read_file_window() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("headless.rs"),
+        "line one\nline two\nline three\n",
+    )
+    .unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"path": "headless.rs"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(
+        text.starts_with(
+            "note: search needs a `pattern`; showed the start of headless.rs instead. To find a spot, send pattern + path."
+        ),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("headless.rs (3 lines, showing 1-3)"),
+        "got: {text}"
+    );
+    assert!(text.contains("    1 | line one"), "got: {text}");
+    assert!(text.contains("    2 | line two"), "got: {text}");
+    assert!(text.contains("    3 | line three"), "got: {text}");
+}
+
+#[tokio::test]
+async fn empty_pattern_with_file_path_falls_back_to_read_file_window() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), "hello\n").unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"path": "f.txt", "pattern": ""}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(
+        text.starts_with("note: search needs a `pattern`; showed the start of f.txt instead."),
+        "got: {text}"
+    );
+    assert!(text.contains("1 | hello"), "got: {text}");
+}
+
+#[tokio::test]
+async fn missing_pattern_with_dir_path_reports_what_is_needed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let err = tool().call(json!({"path": "sub"}), &ctx).await.unwrap_err();
+
+    match &err {
+        ToolError::InvalidArgs(msg) => assert_eq!(
+            msg,
+            "search needs `pattern` (a regex) and optionally `path`; to see a file, use read_file"
+        ),
+        other => panic!("expected InvalidArgs, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn missing_pattern_and_path_reports_what_is_needed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let err = tool().call(json!({}), &ctx).await.unwrap_err();
+
+    match &err {
+        ToolError::InvalidArgs(msg) => assert_eq!(
+            msg,
+            "search needs `pattern` (a regex) and optionally `path`; to see a file, use read_file"
+        ),
+        other => panic!("expected InvalidArgs, got: {other:?}"),
+    }
 }

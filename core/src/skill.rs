@@ -2,15 +2,37 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{ParseError, PatchError};
 use crate::model::{Action, RawOutput, StepOutput};
 use crate::patch::{CheckedPatch, InboxAcked, PatchStrategy, RawPatch, ValidatedPatch};
 use crate::promptable::{Promptable, sealed};
+use crate::report::Report;
 use crate::version::{CommittedState, HarnessState, Version};
+
+/// A binding decision: the mutating call the model has committed to making
+/// next, set in the workspace before it starts reading toward that call.
+/// While a commitment is set, the session's commitment-slot rule (see
+/// `Active::step` in `session.rs`) limits how many read-only calls on the
+/// committed path it may make before the harness expects the call itself.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Commitment {
+    /// The mutating tool you will call next: edit_file, write_file, shell, or test.
+    pub tool: String,
+    /// The file that call will touch, when it touches one.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// One line: exactly what the call will do (e.g. "delete the duplicated `if` at lines 742-744", "insert the owned-fields loop before the ask_user check").
+    /// Defaults to empty so a patch that omits it is caught by the skill's
+    /// commitment rule ("`next.what` must say ...") instead of a bare
+    /// "missing field" parse error.
+    #[serde(default)]
+    pub what: String,
+}
 
 /// Activation-specific instructions. Immutable per activation (C1): no
 /// `&mut` accessors.
@@ -90,6 +112,28 @@ impl<W> ParsedOutput<W> {
                 None => return Err(ParseError::InvalidJson(e.to_string())),
             },
         };
+        // `Action::Continue` is harness-internal (see its doc in
+        // `core/src/model.rs`): it is never offered to the model (absent
+        // from the flat `JsonSchema` enum), so a model output naming it is
+        // always a mistake or an attempted jailbreak, never a legitimate
+        // choice. Checked before `normalize_action` (which would otherwise
+        // treat the unrecognized-by-`normalize_action` tag "continue" as a
+        // tool name and rewrite it into a tool call) and before
+        // `StepOutput`'s own `serde` deserialization (whose tag would
+        // otherwise happily accept it, since `Action::Continue` carries the
+        // same `rename_all = "snake_case"` derive as every other variant),
+        // so it gets the same "unknown action type" rejection shape an
+        // actually-unknown `type` value gets from serde.
+        if value
+            .get("action")
+            .and_then(|a| a.get("type"))
+            .and_then(Value::as_str)
+            == Some("continue")
+        {
+            return Err(ParseError::InvalidJson(
+                "unknown action type \"continue\": not a valid Action".to_string(),
+            ));
+        }
         fixes.extend(normalize_action(&mut value));
         let parsed: StepOutput<P::Patch> =
             serde_json::from_value(value).map_err(classify_step_output_error)?;
@@ -111,8 +155,27 @@ impl<W> ParsedOutput<W> {
         &self.patch
     }
 
+    /// Mutable access to the raw merge patch, for a `Skill::validate`
+    /// override that needs to inject or fix up a key before calling
+    /// [`validate_default`] (e.g. `plan`'s bare-`done` recovery: injecting
+    /// `next_skill` when the model sent `done` with none set).
+    pub fn patch_mut(&mut self) -> &mut RawPatch {
+        &mut self.patch
+    }
+
     pub fn action(&self) -> &Action {
         &self.action
+    }
+
+    /// Replaces the parsed action, for a `Skill::validate` override that
+    /// converts what the model sent into the harness-internal
+    /// `Action::Continue` instead of rejecting the step outright (e.g. the
+    /// coding skills' premature-`done`/empty-`ask_user` conversions in
+    /// `skills/src/coding/mod.rs`). The replaced action is what
+    /// `validate_default` (or a fully custom `validate`) sees and acts on
+    /// from this point on.
+    pub fn set_action(&mut self, action: Action) {
+        self.action = action;
     }
 
     pub fn ack_inbox(&self) -> &[u64] {
@@ -144,7 +207,7 @@ fn normalize_action(value: &mut Value) -> Vec<String> {
         return fixes;
     };
 
-    const KNOWN_TYPES: [&str; 4] = ["tool", "ask_user", "yield", "done"];
+    const KNOWN_TYPES: [&str; 5] = ["tool", "ask_user", "yield", "done", "delegate"];
 
     if let Some(type_str) = action.get("type").and_then(Value::as_str)
         && !KNOWN_TYPES.contains(&type_str)
@@ -455,6 +518,14 @@ pub struct ValidatedStep<W> {
     patch: ValidatedPatch<W>,
     action: Action,
     acks: Vec<u64>,
+    /// Harness-facing notes recorded by a skill's `validate` override (e.g.
+    /// the coding skills' `strip_malformed_next` dropping a malformed `next`
+    /// rather than rejecting the step). Default empty; `validate_default`
+    /// never produces any. `Session::step` appends each to the step's
+    /// observation the same way `commitment_mismatch_note` is (or, if the
+    /// action is not a tool call and there is no pending observation to
+    /// append to, logs it as a `System` entry so it is not lost).
+    notes: Vec<String>,
 }
 
 impl<W: std::fmt::Debug> std::fmt::Debug for ValidatedStep<W> {
@@ -463,6 +534,7 @@ impl<W: std::fmt::Debug> std::fmt::Debug for ValidatedStep<W> {
             .field("patch", &self.patch)
             .field("action", &self.action)
             .field("acks", &self.acks)
+            .field("notes", &self.notes)
             .finish()
     }
 }
@@ -475,6 +547,23 @@ impl<W> ValidatedStep<W> {
             patch,
             action: Action::Tool { name, args },
             acks,
+            notes: Vec::new(),
+        }
+    }
+
+    /// Build a validated step whose action is the harness-internal
+    /// `Action::Continue { note }`: the patch commits, no tool runs, and
+    /// `note` becomes the model's next observation (see
+    /// `core/src/session.rs`'s handling of `Action::Continue`). No
+    /// inbox-ack witness required, the same as `tool` -- a harness-authored
+    /// `Continue` is not the model choosing to park, so the unacked-inbox
+    /// rule that gates `AskUser`/`Yield`/`Done` does not apply to it.
+    pub fn continue_(patch: ValidatedPatch<W>, acks: Vec<u64>, note: impl Into<String>) -> Self {
+        ValidatedStep {
+            patch,
+            action: Action::Continue { note: note.into() },
+            acks,
+            notes: Vec::new(),
         }
     }
 
@@ -491,10 +580,15 @@ impl<W> ValidatedStep<W> {
             !matches!(action, Action::Tool { .. }),
             "ValidatedStep::parking called with a Tool action; use ValidatedStep::tool instead"
         );
+        debug_assert!(
+            !matches!(action, Action::Continue { .. }),
+            "ValidatedStep::parking called with a Continue action; use ValidatedStep::continue_ instead"
+        );
         ValidatedStep {
             patch,
             action,
             acks,
+            notes: Vec::new(),
         }
     }
 
@@ -510,6 +604,24 @@ impl<W> ValidatedStep<W> {
         &self.acks
     }
 
+    /// Harness-facing notes recorded during validation (see the field
+    /// doc). Empty for the vast majority of steps.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// Appends one note, recorded during a skill's `validate` override.
+    /// See the `notes` field doc.
+    pub fn push_note(&mut self, note: impl Into<String>) {
+        self.notes.push(note.into());
+    }
+
+    /// Builder form of [`ValidatedStep::push_note`].
+    pub fn with_notes(mut self, notes: Vec<String>) -> Self {
+        self.notes = notes;
+        self
+    }
+
     pub fn into_parts(self) -> (ValidatedPatch<W>, Action, Vec<u64>) {
         (self.patch, self.action, self.acks)
     }
@@ -523,6 +635,7 @@ impl<W> ValidatedStep<W> {
             patch,
             action: Action::Yield,
             acks: Vec::new(),
+            notes: Vec::new(),
         }
     }
 }
@@ -612,6 +725,65 @@ pub trait Skill: Send + Sync + 'static {
         true
     }
 
+    /// Configured child skill names this skill may `delegate` to. Default
+    /// empty (no delegation). A skill that calls a configured subagent
+    /// overrides this to list the children it's allowed to call.
+    fn allowed_delegates(&self) -> Vec<String> {
+        vec![]
+    }
+
+    /// Whether action `ask_user` is allowed in this skill. Default `true`;
+    /// children (milestone 9) override this to `false` -- they cannot talk
+    /// to the user, only their parent.
+    fn allows_ask_user(&self) -> bool {
+        true
+    }
+
+    /// Absorbs a subagent's finished `Report` into this skill's workspace.
+    /// Called by the harness after a `delegate` action completes, never by
+    /// the model. Default rejects: only skills that declare
+    /// `allowed_delegates()` need to implement this.
+    fn absorb_report(&self, _ws: &mut Self::Workspace, _report: Report) -> Result<(), PatchError> {
+        Err(PatchError::RuleViolation(
+            "this skill does not accept subagent reports".to_string(),
+        ))
+    }
+
+    /// The workspace's current commitment, if the skill supports the
+    /// commitment slot: the mutating call the model has committed to
+    /// making next (see `Commitment`). Default `None` -- skills that don't
+    /// carry a `next: Option<Commitment>` field simply never trigger the
+    /// session's commitment-slot rule.
+    fn commitment(&self, _ws: &Self::Workspace) -> Option<Commitment> {
+        None
+    }
+
+    /// The number of consecutive read-only calls with an EMPTY patch (the
+    /// raw patch object has no keys) the model may make with no commitment
+    /// set before the next such call is rejected. A read whose patch writes
+    /// anything (a file note, a plan step, `recent_summary`, ...) is never
+    /// counted and resets the streak -- reading is not the problem; reading
+    /// that records nothing is. `None` (the default) disables the rule -- a
+    /// skill with no `next` field, or one that doesn't want reads gated at
+    /// all, never triggers it.
+    fn silent_read_cap(&self) -> Option<u32> {
+        None
+    }
+
+    /// Top-level workspace keys the harness writes and the model may never
+    /// patch (e.g. `notes`, maintained by a `Maintainer` call after each
+    /// step). Default empty -- a skill with no harness-owned fields never
+    /// triggers the check. See `validate_default`.
+    fn harness_owned_fields(&self) -> Vec<String> {
+        vec![]
+    }
+
+    /// The harness-maintained notes text, if this workspace carries one.
+    /// Default `None`. See `harness_owned_fields`.
+    fn notes(&self, _ws: &Self::Workspace) -> Option<String> {
+        None
+    }
+
     /// Full validation. Provided; skills override `rules`, not this.
     fn validate(
         &self,
@@ -631,12 +803,44 @@ pub fn validate_default<W, P>(
 ) -> Result<ValidatedStep<W>, PatchError>
 where
     P: PatchStrategy<W>,
+    W: Serialize,
 {
     let version = out.version();
     let patch: P::Patch = serde_json::from_value(out.patch().0.clone())
         .map_err(|e| PatchError::Malformed(e.to_string()))?;
     let next = P::apply(&cur.agent, &patch)?;
     let checked = CheckedPatch::new(out.patch().0.clone(), next, version);
+
+    // Harness-owned fields: for EVERY action (not just a subset), a patch
+    // that *changes* a key the harness itself writes (e.g. `notes`,
+    // maintained by a `Maintainer` call after each step) is rejected
+    // before any other check runs. Checked by comparing the committed
+    // value to the post-patch value for each owned key, not by checking
+    // whether the key is merely present in the raw patch object: a patch
+    // strategy that sends the whole workspace (e.g. `ReplaceStrategy`)
+    // always carries every key, so a presence check would fire on every
+    // patch regardless of content. Comparing values instead tolerates a
+    // patch that echoes the field back unchanged -- required for replace
+    // strategies to be usable at all -- while still catching a strategy
+    // (e.g. a JSON merge patch) that sets the field to a new value or to
+    // `null` to delete it; a key absent from either side compares as
+    // `Null`. `validate_user_patch` (operator patches) deliberately does
+    // not run this check: the operator and the maintainer are trusted
+    // writers of these fields.
+    let committed_value =
+        serde_json::to_value(&cur.agent).map_err(|e| PatchError::Malformed(e.to_string()))?;
+    let next_value =
+        serde_json::to_value(checked.next()).map_err(|e| PatchError::Malformed(e.to_string()))?;
+    for key in skill.owned_fields() {
+        let before = committed_value.get(&key).unwrap_or(&Value::Null);
+        let after = next_value.get(&key).unwrap_or(&Value::Null);
+        if before != after {
+            return Err(PatchError::RuleViolation(format!(
+                "field `{key}` is harness-owned in skill `{}` and cannot be patched",
+                skill.skill_name()
+            )));
+        }
+    }
 
     skill.check_rules(cur, checked.next())?;
 
@@ -650,6 +854,15 @@ where
             _ => unreachable!(),
         };
         Ok(ValidatedStep::tool(validated, acks, name, args))
+    } else if let Action::Continue { note } = action {
+        // Harness-internal: a `Skill::validate` override (`ParsedOutput::
+        // set_action`) already decided to commit this patch and tell the
+        // model `note` instead of running the terminal/handoff/ask_user
+        // checks below, which were written for what the *model* asked for,
+        // not for a harness-authored `Continue`. No inbox-ack witness is
+        // required, the same as a tool call -- see `ValidatedStep::
+        // continue_`'s doc.
+        Ok(ValidatedStep::continue_(validated, acks, note))
     } else {
         if matches!(action, Action::Done)
             && !skill.terminal(validated.next())
@@ -667,10 +880,16 @@ where
                 } else {
                     "`ask_user`"
                 };
+                let first_target = transitions
+                    .first()
+                    .expect("transitions is non-empty in this branch");
                 format!(
                     "action `done` is only valid when the workspace is terminal or hands off: \
                      set `next_skill` to one of {:?} (you are `{}`) and send `done` again, or \
-                     keep working with a tool, or use {pause}",
+                     keep working with a tool, or use {pause}\n\
+                     Exact shape: {{\"patch\": {{\"next_skill\": \"{first_target}\"}}, \
+                     \"action\": {{\"type\": \"done\", \"name\": \"\", \"args\": {{}}}}, \
+                     \"ack_inbox\": []}}",
                     transitions,
                     skill.skill_name()
                 )
@@ -696,6 +915,40 @@ where
             };
             return Err(PatchError::RuleViolation(message));
         }
+        if matches!(action, Action::AskUser { .. }) && !skill.ask_user_allowed() {
+            return Err(PatchError::RuleViolation(format!(
+                "action `ask_user` is not allowed in skill `{}`",
+                skill.skill_name()
+            )));
+        }
+        if let Action::AskUser { message } = &action
+            && message.trim().is_empty()
+        {
+            return Err(PatchError::RuleViolation(
+                "action `ask_user` requires a non-empty `message`: the question for the user"
+                    .to_string(),
+            ));
+        }
+        if let Action::Delegate {
+            skill: target,
+            task,
+        } = &action
+            && (target.trim().is_empty() || task.trim().is_empty())
+        {
+            return Err(PatchError::RuleViolation(
+                "action `delegate` requires non-empty `skill` and `task`".to_string(),
+            ));
+        }
+        if let Action::Delegate { skill: target, .. } = &action {
+            let delegates = skill.delegates_allowed();
+            if !delegates.contains(target) {
+                return Err(PatchError::RuleViolation(format!(
+                    "action `delegate` is not allowed in skill `{}`: allowed delegates are {:?}",
+                    skill.skill_name(),
+                    delegates
+                )));
+            }
+        }
         let witness = check_inbox(&cur.harness, &acks)?;
         Ok(ValidatedStep::parking(validated, acks, action, witness))
     }
@@ -713,6 +966,13 @@ pub trait SkillRules<W> {
     fn skill_name(&self) -> String;
     /// Whether action `yield` is allowed in this skill.
     fn yield_allowed(&self) -> bool;
+    /// Configured child skill names this skill may `delegate` to.
+    fn delegates_allowed(&self) -> Vec<String>;
+    /// Whether action `ask_user` is allowed in this skill.
+    fn ask_user_allowed(&self) -> bool;
+    /// Top-level workspace keys the harness writes and the model may never
+    /// patch.
+    fn owned_fields(&self) -> Vec<String>;
 }
 
 impl<K> SkillRules<K::Workspace> for K
@@ -743,7 +1003,19 @@ where
         self.name().to_string()
     }
 
+    fn delegates_allowed(&self) -> Vec<String> {
+        self.allowed_delegates()
+    }
+
+    fn ask_user_allowed(&self) -> bool {
+        self.allows_ask_user()
+    }
+
     fn yield_allowed(&self) -> bool {
         self.allows_yield()
+    }
+
+    fn owned_fields(&self) -> Vec<String> {
+        self.harness_owned_fields()
     }
 }

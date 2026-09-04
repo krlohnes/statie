@@ -22,8 +22,14 @@ use crate::registry::{RunOptions, SkillRegistry};
 pub enum DriverCmd {
     User(String),
     Cancel,
-    Switch { name: String, forced: bool },
+    Switch {
+        name: String,
+        forced: bool,
+    },
     Edit(Value),
+    /// Operator-authored patch (`/patch`), applied directly by the harness
+    /// via `Active::apply_user_patch` -- never routed through the model.
+    Patch(Value),
     Query(Query),
     Quit,
 }
@@ -67,6 +73,17 @@ pub enum UiEvent {
     Done,
     Info(String),
     Error(String),
+    /// A context-maintenance call (statie-spec.md "9. Context maintenance")
+    /// completed successfully and its patch was applied. `notes_tokens` is
+    /// the token count of the new `notes` text; `next_set` is whether a
+    /// maintainer-proposed commitment was applied.
+    Maintainer {
+        notes_tokens: usize,
+        next_set: bool,
+    },
+    /// A context-maintenance call failed (backend error, over budget after
+    /// retry, or its patch was rejected). The previous `notes` are kept.
+    MaintainerError(String),
     Quit,
 }
 
@@ -92,6 +109,17 @@ impl StepSink for ChannelSink {
 
     fn content_delta(&mut self, s: &str) {
         let _ = self.tx.send(UiEvent::ContentDelta(s.to_string()));
+    }
+
+    fn maintainer_done(&mut self, notes_tokens: usize, next_set: bool) {
+        let _ = self.tx.send(UiEvent::Maintainer {
+            notes_tokens,
+            next_set,
+        });
+    }
+
+    fn maintainer_failed(&mut self, reason: &str) {
+        let _ = self.tx.send(UiEvent::MaintainerError(reason.to_string()));
     }
 }
 
@@ -176,12 +204,43 @@ fn is_fatal(e: &TuiError) -> bool {
 /// instead of the driver task silently ending (the original bug: an
 /// unhandled model/network error propagated with `?`, closing the event
 /// channel and making the TUI look like it crashed on Enter).
-fn report_step_error(ev_tx: &mpsc::UnboundedSender<UiEvent>, e: &TuiError) {
+///
+/// Also restores a stale green checkpoint (statie-spec.md "10. Working
+/// set", "Green checkpoint") before parking, the same way the driver's
+/// autonomous-step-cap park already does (see `run_one_step`'s
+/// `Outcome::Continue` branch): a step error here means `Active::step`
+/// itself never returned a park for `Active::execute`'s own
+/// `restore_green_on_park`/`restore_green_and_append` to run (the model
+/// backend crashed, a tool errored past the retry cap in some other way,
+/// etc. -- see `is_fatal`'s doc for what reaches this path), so without
+/// this call a checkpointed-but-since-broken workspace would sit parked
+/// with the broken files still on disk. `active.restore_green_if_stale`
+/// only touches local files and the log, so it's safe to call
+/// unconditionally here; a failure of the restore itself is reported as its
+/// own `Error` event, never swallowed.
+async fn report_step_error<'a, K>(
+    active: &mut statie_core::Active<'a, K>,
+    ev_tx: &mpsc::UnboundedSender<UiEvent>,
+    e: &TuiError,
+) where
+    K: statie_core::Skill + ?Sized,
+    K::Workspace: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
     let _ = ev_tx.send(UiEvent::Error(format!("step failed: {e}")));
-    let _ = ev_tx.send(UiEvent::Parked(
+    let mut message =
         "step failed; fix the problem (config, server, network) and send a message to retry"
-            .to_string(),
-    ));
+            .to_string();
+    match active.restore_green_if_stale().await {
+        Ok(Some(sentence)) => {
+            message.push(' ');
+            message.push_str(&sentence);
+        }
+        Ok(None) => {}
+        Err(restore_err) => {
+            let _ = ev_tx.send(UiEvent::Error(restore_err.to_string()));
+        }
+    }
+    let _ = ev_tx.send(UiEvent::Parked(message));
 }
 
 /// Runs the driver loop against `session`, reading commands from `cmd_rx`
@@ -209,6 +268,11 @@ where
     // Messages to push as the very first `Event::User` steps after the
     // initial activation only.
     let mut pending_initial_messages = opts.initial_messages.clone();
+    // Operator patches (`--patch`), applied once via `apply_user_patch`
+    // right after the very first activation, before resuming `Handoff`
+    // continuation or draining `initial_messages` -- so a patch can, e.g.,
+    // fix a plan step before the model ever sees it.
+    let mut pending_patches = opts.patches.clone();
     // A `Handoff` outcome means "continue autonomously" (ARCHITECTURE.md):
     // the new activation should be ticked immediately rather than waiting
     // for a command. A user-issued `/skill` switch, by contrast, waits.
@@ -260,6 +324,21 @@ where
         };
         let _ = ev_tx.send(UiEvent::Activated(active.skill_name().to_string()));
 
+        for patch in std::mem::take(&mut pending_patches) {
+            match active.apply_user_patch(patch).await {
+                Ok(version) => {
+                    let keys = last_patched_keys(active.session());
+                    let _ = ev_tx.send(UiEvent::Info(format!(
+                        "[patched] keys {keys:?} (version {})",
+                        version.0
+                    )));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(UiEvent::Error(format!("patch failed: {e}")));
+                }
+            }
+        }
+
         'pre_wait: {
             if autonomous_after_activate {
                 match run_one_step(&mut active, Event::Tick, &ev_tx, &opts).await {
@@ -271,7 +350,7 @@ where
                     Ok(StepOutcome::Continue) => {}
                     Err(e) if is_fatal(&e) => return Err(e),
                     Err(e) => {
-                        report_step_error(&ev_tx, &e);
+                        report_step_error(&mut active, &ev_tx, &e).await;
                         pending_initial_messages.clear();
                         break 'pre_wait;
                     }
@@ -292,7 +371,7 @@ where
                     Ok(StepOutcome::Continue) => {}
                     Err(e) if is_fatal(&e) => return Err(e),
                     Err(e) => {
-                        report_step_error(&ev_tx, &e);
+                        report_step_error(&mut active, &ev_tx, &e).await;
                         break 'pre_wait;
                     }
                 }
@@ -326,7 +405,7 @@ where
                         Ok(StepOutcome::Continue) => {}
                         Err(e) if is_fatal(&e) => return Err(e),
                         Err(e) => {
-                            report_step_error(&ev_tx, &e);
+                            report_step_error(&mut active, &ev_tx, &e).await;
                         }
                     }
                 }
@@ -350,6 +429,18 @@ where
                             usage: active.last_usage(),
                             state,
                         });
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(UiEvent::Error(e.to_string()));
+                    }
+                },
+                DriverCmd::Patch(patch) => match active.apply_user_patch(patch).await {
+                    Ok(version) => {
+                        let keys = last_patched_keys(active.session());
+                        let _ = ev_tx.send(UiEvent::Info(format!(
+                            "patched: keys {keys:?} (version {})",
+                            version.0
+                        )));
                     }
                     Err(e) => {
                         let _ = ev_tx.send(UiEvent::Error(e.to_string()));
@@ -412,10 +503,18 @@ where
             Outcome::Continue => {
                 continues += 1;
                 if continues >= opts.max_autonomous_steps {
-                    let _ = ev_tx.send(UiEvent::Parked(step_cap_message(
-                        opts.max_autonomous_steps,
-                        &state,
-                    )));
+                    let mut message = step_cap_message(opts.max_autonomous_steps, &state);
+                    match active.restore_green_if_stale().await {
+                        Ok(Some(sentence)) => {
+                            message.push(' ');
+                            message.push_str(&sentence);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = ev_tx.send(UiEvent::Error(e.to_string()));
+                        }
+                    }
+                    let _ = ev_tx.send(UiEvent::Parked(message));
                     return Ok(StepOutcome::Continue);
                 }
                 ev = Event::Tick;
@@ -438,6 +537,28 @@ where
             }
         }
     }
+}
+
+/// Reads back the `keys` array logged by the most recent `user_patch`
+/// system entry, for the `/patch` command's `patched: keys [..]` reply.
+/// Empty if none is found (should not happen right after a successful
+/// `apply_user_patch`, which always logs one first).
+fn last_patched_keys<W>(session: &mut Session<W>) -> Vec<String> {
+    session
+        .log()
+        .entries(Some(LogKind::System), 10_000)
+        .iter()
+        .rev()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("user_patch"))
+        .and_then(|e| e.payload.get("keys"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn current_state_value<W>(session: &mut Session<W>) -> Value
@@ -524,6 +645,18 @@ pub fn render_state(v: &Value) -> String {
 
 /// One-line plain-text rendering of a single `LogEntry`.
 pub fn render_entry_line(e: &LogEntry) -> String {
+    // `Action::Continue` (harness-internal: a `Skill::validate` override
+    // committed the model's patch but ran no tool -- see
+    // `core/src/model.rs`'s doc on the variant) renders as its note instead
+    // of the raw `{"type":"continue","note":"..."}` JSON every other action
+    // kind gets, so the note that would otherwise only live in the next
+    // prompt's observation is also visible in the transcript.
+    if e.kind == LogKind::Action
+        && e.payload.get("type").and_then(Value::as_str) == Some("continue")
+    {
+        let note = e.payload.get("note").and_then(Value::as_str).unwrap_or("");
+        return format!("[step {}] continued: {note}", e.step);
+    }
     let kind = match e.kind {
         LogKind::User => "user",
         LogKind::Reasoning => "reasoning",
@@ -572,6 +705,7 @@ pub enum Command {
     Tools,
     Skill(String, bool),
     Edit(Value),
+    Patch(Value),
     Help,
     Quit,
     Unknown(String),
@@ -630,6 +764,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "edit",
         args: "<json merge patch>",
         help: "apply a JSON merge patch to the workspace",
+    },
+    CommandSpec {
+        name: "patch",
+        args: "<json>",
+        help: "operator patch applied directly to the workspace, e.g. /patch \
+               {\"plan\":[{\"id\":2,\"status\":\"done\"}]}",
     },
     CommandSpec {
         name: "help",
@@ -729,6 +869,10 @@ pub fn parse_command(input: &str) -> Option<Command> {
             Ok(v) => Command::Edit(v),
             Err(_) => Command::Unknown(trimmed.to_string()),
         },
+        "/patch" => match serde_json::from_str::<Value>(rest) {
+            Ok(v) => Command::Patch(v),
+            Err(_) => Command::Unknown(trimmed.to_string()),
+        },
         "/help" => Command::Help,
         "/quit" => Command::Quit,
         _ => Command::Unknown(trimmed.to_string()),
@@ -815,6 +959,24 @@ mod tests {
     }
 
     #[test]
+    fn patch_parses_json_object() {
+        assert_eq!(
+            parse_command(r#"/patch {"plan":[{"id":2,"status":"done"}]}"#),
+            Some(Command::Patch(
+                serde_json::json!({"plan": [{"id": 2, "status": "done"}]})
+            ))
+        );
+    }
+
+    #[test]
+    fn patch_invalid_json_is_unknown() {
+        assert!(matches!(
+            parse_command("/patch not json"),
+            Some(Command::Unknown(_))
+        ));
+    }
+
+    #[test]
     fn help_and_quit() {
         assert_eq!(parse_command("/help"), Some(Command::Help));
         assert_eq!(parse_command("/quit"), Some(Command::Quit));
@@ -836,6 +998,7 @@ mod tests {
                 "skill" => "/skill x".to_string(),
                 "skill!" => "/skill! x".to_string(),
                 "edit" => "/edit {}".to_string(),
+                "patch" => "/patch {}".to_string(),
                 _ => format!("/{}", spec.name),
             };
             let parsed = parse_command(&line);
@@ -864,6 +1027,7 @@ mod tests {
             "skill",
             "skill!",
             "edit",
+            "patch",
             "help",
             "quit",
         ] {

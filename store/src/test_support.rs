@@ -69,10 +69,17 @@ pub fn harness(step: u64) -> HarnessState {
             total: 1000,
             observation: 100,
             augmentation: 100,
+            notes: 400,
+            working_set: 6000,
         },
         activation: "toy".to_string(),
         step,
         last_overflow: None,
+        pinned: None,
+        green_step: None,
+        green_filtered: false,
+        tool_calls: 0,
+        last_test_cmd: None,
     }
 }
 

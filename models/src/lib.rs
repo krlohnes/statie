@@ -5,11 +5,13 @@
 //! endpoint. `OpenAiCompatModel` talks to an OpenAI-compatible chat
 //! completions endpoint (vLLM, llama.cpp server, LM Studio, ...).
 
+mod maintainer;
 mod mock;
 mod ollama;
 mod openai;
 mod thoughts;
 
+pub use maintainer::ModelMaintainer;
 pub use mock::{MockModel, MockTurn, RecordedPrompt};
 pub use ollama::{OllamaConfig, OllamaFormat, OllamaModel};
 pub use openai::{OpenAiCompatConfig, OpenAiCompatModel};

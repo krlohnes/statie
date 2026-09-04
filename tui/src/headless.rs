@@ -155,6 +155,16 @@ where
             UiEvent::Error(text) => {
                 let _ = writeln!(out, "[error] {text}");
             }
+            UiEvent::Maintainer {
+                notes_tokens,
+                next_set,
+            } => {
+                let suffix = if next_set { ", set next" } else { "" };
+                let _ = writeln!(out, "[maintainer] notes: {notes_tokens} tokens{suffix}");
+            }
+            UiEvent::MaintainerError(reason) => {
+                let _ = writeln!(out, "[maintainer error] {reason}");
+            }
             UiEvent::Quit => {
                 break;
             }

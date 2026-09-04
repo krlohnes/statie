@@ -51,17 +51,26 @@ fn headless_mock_run_completes_plan_implement_review_flow() {
         turn(serde_json::json!({
             "patch": {
                 "plan": [{"id": 1, "text": "write hello.txt", "status": "done"}],
-                "files": [{"path": "hello.txt", "note": "created"}],
-                "next_skill": "review"
+                "files": [{"path": "hello.txt", "note": "created"}]
             },
+            "action": {"type": "tool", "name": "test", "args": {"cmd": "true"}},
+        })),
+        // 6. implement -- hands off to review now that the passing test set
+        // `green_step` (`implement_no_green_note`, `skills/src/coding/
+        // mod.rs`, requires a passing run before this handoff).
+        turn(serde_json::json!({
+            "patch": {"next_skill": "review"},
             "action": {"type": "done"},
         })),
-        // 6. review
+        // 8. review -- `green_step` from step 5's passing test survives the
+        // handoff (`skills/src/coding/mod.rs` doc on
+        // `HarnessState::green_step`), so this approval does not need its
+        // own `test` call to satisfy `review_no_green_note`.
         turn(serde_json::json!({
             "patch": {"recent_summary": "checking"},
             "action": {"type": "tool", "name": "read_file", "args": {"path": "hello.txt"}},
         })),
-        // 7. review
+        // 9. review
         turn(serde_json::json!({
             "patch": {"findings": [], "done": true},
             "action": {"type": "done"},

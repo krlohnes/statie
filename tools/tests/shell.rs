@@ -187,3 +187,92 @@ fn allow_shell_false_excludes_shell_and_test() {
     assert!(tools.get("shell").is_none());
     assert!(tools.get("test").is_none());
 }
+
+// ---------------------------------------------------------------------
+// Fix 3: `command` is accepted as an alias for `cmd`, but the schema shown
+// to the model still lists only the canonical `cmd` field (schemars
+// doesn't know about serde aliases).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn command_alias_is_accepted_for_cmd() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let out = tool()
+        .call(json!({"command": "echo hi"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(text.contains("hi"), "got: {text}");
+}
+
+// ---------------------------------------------------------------------
+// Refuse in-place editor invocations (`sed -i`, `perl -i`) that edit a
+// file from remembered line numbers instead of anchoring on its current
+// text via `edit_file`.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn sed_i_is_refused_and_leaves_file_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let file_path = dir.path().join("f.txt");
+    let original = "line1\nline2\nline3\n";
+    std::fs::write(&file_path, original).unwrap();
+
+    let err = tool()
+        .call(json!({"cmd": "sed -i 's/a/b/' f.txt"}), &ctx)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            ToolError::ExecutionFailed(ref msg)
+                if msg == "refused: `sed -i` edits a file in place from remembered line numbers. Use edit_file (old/new, or after/before + new) so the change is anchored on the file's current text."
+        ),
+        "got: {err:?}"
+    );
+
+    let after = std::fs::read(&file_path).unwrap();
+    assert_eq!(after, original.as_bytes(), "file must be byte-identical");
+}
+
+#[tokio::test]
+async fn sed_n_without_i_still_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let file_path = dir.path().join("f.txt");
+    std::fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
+
+    let out = tool()
+        .call(json!({"cmd": "sed -n '1p' f.txt"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(text.contains("line1"), "got: {text}");
+}
+
+#[test]
+fn schema_lists_cmd_not_command() {
+    let schema = tool().args_schema();
+    let value = schema.as_value();
+    let properties = value
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .expect("schema should have properties");
+
+    assert!(
+        properties.contains_key("cmd"),
+        "schema properties should list `cmd`: {properties:?}"
+    );
+    assert!(
+        !properties.contains_key("command"),
+        "schema properties should not list the `command` alias: {properties:?}"
+    );
+}

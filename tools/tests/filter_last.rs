@@ -21,6 +21,7 @@ fn entry(step: u64, kind: LogKind, payload: serde_json::Value) -> LogEntry {
         kind,
         ts: "2026-09-01T00:00:00Z".to_string(),
         payload,
+        agent: None,
     }
 }
 
@@ -196,7 +197,7 @@ async fn no_prior_tool_output_is_execution_failed() {
 }
 
 #[tokio::test]
-async fn invalid_regex_is_invalid_args() {
+async fn invalid_regex_with_no_literal_match_reports_no_matches() {
     let dir = tempfile::tempdir().unwrap();
     let log = Arc::new(MemoryLog::new());
     log.append(entry(
@@ -207,12 +208,77 @@ async fn invalid_regex_is_invalid_args() {
     .unwrap();
     let ctx = ctx_with_log(dir.path(), log);
 
-    let err = tool()
-        .call(json!({"pattern": "("}), &ctx)
-        .await
-        .unwrap_err();
+    // "(" does not compile as a regex, and does not occur literally in the
+    // output either, so this falls back to a literal search (rather than
+    // erroring) and reports no matches.
+    let out = tool().call(json!({"pattern": "("}), &ctx).await.unwrap();
 
-    assert!(matches!(err, ToolError::InvalidArgs(_)), "got: {err:?}");
+    assert_eq!(
+        out.to_string(),
+        "no lines match /(/ in the last `shell` output (1 lines)"
+    );
+}
+
+#[tokio::test]
+async fn invalid_regex_that_occurs_literally_is_matched_with_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(MemoryLog::new());
+    let output = "before\nfn handle(agent, task) {\nafter";
+    log.append(entry(
+        1,
+        LogKind::ToolOutput,
+        json!({"name": "shell", "output": output, "truncated": false}),
+    ))
+    .unwrap();
+    let ctx = ctx_with_log(dir.path(), log);
+
+    // Not a valid regex (unbalanced parens/braces), but occurs literally.
+    let out = tool()
+        .call(json!({"pattern": "fn handle(agent, task) {"}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(
+        text.starts_with("note: pattern was not a valid regex; matched it literally\n"),
+        "got: {text}"
+    );
+    assert!(text.contains("2: fn handle(agent, task) {"), "got: {text}");
+}
+
+#[tokio::test]
+async fn invalid_regex_multiline_literal_with_escaped_newlines_matches_across_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(MemoryLog::new());
+    let output =
+        "before\nUiEvent::ChildStarted { agent, task } => {\n    handle(agent, task);\n}\nafter";
+    log.append(entry(
+        1,
+        LogKind::ToolOutput,
+        json!({"name": "shell", "output": output, "truncated": false}),
+    ))
+    .unwrap();
+    let ctx = ctx_with_log(dir.path(), log);
+
+    // Invalid regex (unbalanced braces) containing literal `\n` (backslash
+    // + n) escape sequences, as a model might paste from a code snippet.
+    let pattern = "UiEvent::ChildStarted { agent, task } => {\\n    handle(agent, task);\\n}";
+    let out = tool()
+        .call(json!({"pattern": pattern}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    assert!(
+        text.starts_with("note: pattern was not a valid regex; matched it literally\n"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("2: UiEvent::ChildStarted { agent, task } => {"),
+        "got: {text}"
+    );
+    assert!(text.contains("3:     handle(agent, task);"), "got: {text}");
+    assert!(text.contains("4: }"), "got: {text}");
 }
 
 #[tokio::test]

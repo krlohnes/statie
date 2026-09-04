@@ -204,6 +204,7 @@ mod tests {
             kind,
             ts: "2026-09-01T00:00:00Z".to_string(),
             payload,
+            agent: None,
         }
     }
 
@@ -371,5 +372,36 @@ mod tests {
 
         let log = JsonlLog::open(&path).unwrap();
         assert_eq!(log.len(), 1);
+    }
+
+    /// A pre-milestone-9 JSONL line (no `agent` key at all) still parses,
+    /// and re-serializing the resulting `LogEntry` (`agent: None`,
+    /// `skip_serializing_if`) produces a byte-identical line: the `agent`
+    /// field must not appear where it never used to.
+    #[test]
+    fn entry_without_agent_round_trips_byte_identically() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+
+        let pre_milestone_9_line =
+            r#"{"step":1,"kind":"user","ts":"2026-09-01T00:00:00Z","payload":{"text":"hi"}}"#;
+        fs::write(&path, format!("{pre_milestone_9_line}\n")).unwrap();
+
+        let log = JsonlLog::open(&path).unwrap();
+        let entries = log.entries(None, 10);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].agent.is_none());
+
+        let reserialized = serde_json::to_string(&entries[0]).unwrap();
+        assert_eq!(reserialized, pre_milestone_9_line);
+
+        // Appending the parsed entry back out must also stay byte-identical
+        // on disk (round trip through the live append path, not just
+        // serde_json::to_string).
+        let path2 = dir.path().join("session2.jsonl");
+        let log2 = JsonlLog::open(&path2).unwrap();
+        log2.append(entries[0].clone()).unwrap();
+        let contents = fs::read_to_string(&path2).unwrap();
+        assert_eq!(contents.trim_end(), pre_milestone_9_line);
     }
 }

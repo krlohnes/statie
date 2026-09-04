@@ -99,6 +99,91 @@ fn run_headless_memory_toy_with_mock_backend_reaches_done() {
     assert!(stdout.contains("steps=3"), "stdout: {stdout}");
 }
 
+/// `--patch` with invalid JSON exits with status 2 and a clear message on
+/// stderr, before any config/session work happens (no `--config` is even
+/// given here).
+#[test]
+fn patch_with_invalid_json_exits_2_with_a_clear_message() {
+    let output = Command::new(bin())
+        .args([
+            "--memory", "--skill", "toy", "--patch", "not json", "-p", "go",
+        ])
+        .output()
+        .expect("failed to run statie");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--patch") && stderr.contains("invalid JSON"),
+        "stderr: {stderr}"
+    );
+}
+
+/// A valid `--patch` on a `--memory` mock run is applied before the first
+/// step (bumping `counter` directly, no model call spent on it) and prints
+/// `[patched]` in the headless transcript.
+#[test]
+fn valid_patch_on_memory_mock_run_prints_patched_and_applies_before_first_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.json");
+
+    let cfg = serde_json::json!({
+        "model": {
+            "backend": "mock",
+            "mock_script": [
+                {
+                    "content": serde_json::json!({
+                        "patch": {},
+                        "action": {"type": "done"},
+                        "ack_inbox": [1],
+                    }).to_string()
+                },
+            ]
+        }
+    });
+
+    let mut file = std::fs::File::create(&cfg_path).unwrap();
+    file.write_all(serde_json::to_string(&cfg).unwrap().as_bytes())
+        .unwrap();
+    drop(file);
+
+    let output = Command::new(bin())
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--memory",
+            "--skill",
+            "toy",
+            "--toy-target",
+            "2",
+            "--patch",
+            r#"{"counter": 2}"#,
+            "-p",
+            "go",
+        ])
+        .output()
+        .expect("failed to run statie");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected success; stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("[patched]"), "stdout: {stdout}");
+    assert!(stdout.contains("counter"), "stdout: {stdout}");
+    // The patch alone already reaches target=2, so the single scripted
+    // turn only needs to send `done` (no counter-incrementing tool loop),
+    // proving the patch was applied before the first step.
+    assert!(stdout.contains("outcome=done"), "stdout: {stdout}");
+}
+
 #[test]
 fn no_subcommand_with_p_runs_headless() {
     let dir = tempfile::tempdir().unwrap();

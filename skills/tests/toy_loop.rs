@@ -75,11 +75,22 @@ async fn flat_prompt_over_fifty_steps() {
 
     let token_series: Vec<usize> = prompts[1..51].iter().map(|p| p.tokens).collect();
     eprintln!("token series (prompts 2..=51): {token_series:?}");
-    let max = *token_series.iter().max().unwrap();
-    let min = *token_series.iter().min().unwrap();
+    // The working set (statie-spec.md "10. Working set") is on by default
+    // (`Session::new` starts with `WorkingSetConfig::default()`, and this
+    // test's `make_session` never calls `with_working_set`): its "recent
+    // calls:" block grows by one line per step until it plateaus at
+    // `recent_calls` (6) lines, so the first few entries of this series
+    // legitimately grow (observed: 759, 772, 784, 796, 808, 821, then
+    // flat at 821-826 for the rest). Measure flatness over the plateaued
+    // tail (steps 8 onward), which is what this test is actually about;
+    // the ramp itself is covered by the working-set unit tests.
+    let plateau = &token_series[6..];
+    let max = *plateau.iter().max().unwrap();
+    let min = *plateau.iter().min().unwrap();
     assert!(
         max - min <= 8,
-        "prompt size grew across steps: max={max} min={min} series={token_series:?}"
+        "prompt size grew across steps in the plateaued region: max={max} min={min} \
+         plateau={plateau:?} full_series={token_series:?}"
     );
 
     let last_prompt = &prompts[50];
@@ -88,10 +99,21 @@ async fn flat_prompt_over_fifty_steps() {
         "last prompt should contain the latest observation:\n{}",
         last_prompt.user
     );
+    // The *Observation* section itself still carries only the latest tool
+    // output -- that invariant is unchanged. "echo: hello 49" legitimately
+    // reappears elsewhere in the prompt now: the working set (statie-spec.md
+    // "10. Working set") is on by default and its "recent calls:" block
+    // shows one line per recent call (including prior `echo` calls), by
+    // design -- that's the feature, not a regression, so scope this
+    // assertion to the Observation section rather than the whole prompt.
+    let observation_section = last_prompt
+        .user
+        .split("## Observation")
+        .nth(1)
+        .expect("last prompt should have an Observation section");
     assert!(
-        !last_prompt.user.contains("echo: hello 49"),
-        "last prompt should not contain the previous observation:\n{}",
-        last_prompt.user
+        !observation_section.contains("echo: hello 49"),
+        "the Observation section should not contain the previous observation:\n{observation_section}"
     );
 
     for p in &prompts {

@@ -8,6 +8,7 @@ mod filter_last;
 mod list_files;
 mod read_file;
 mod recall;
+mod revert_file;
 mod search;
 mod shell;
 mod test_tool;
@@ -23,6 +24,7 @@ pub use filter_last::FilterLastToolCall;
 pub use list_files::ListFiles;
 pub use read_file::ReadFile;
 pub use recall::Recall;
+pub use revert_file::RevertFile;
 pub use search::Search;
 pub use shell::Shell;
 pub use test_tool::{TestTool, detect_test_command};
@@ -65,13 +67,14 @@ impl Default for ToolConfig {
 pub fn default_tools(cfg: &ToolConfig) -> ToolSet {
     let mut tools = ToolSet::new();
 
-    tools.register(Arc::new(ReadFile {
-        max_output_bytes: cfg.max_output_bytes,
-    }));
+    tools.register(Arc::new(ReadFile::new(cfg.max_output_bytes)));
     tools.register(Arc::new(WriteFile {
         max_output_bytes: cfg.max_output_bytes,
     }));
     tools.register(Arc::new(EditFile {
+        max_output_bytes: cfg.max_output_bytes,
+    }));
+    tools.register(Arc::new(RevertFile {
         max_output_bytes: cfg.max_output_bytes,
     }));
     tools.register(Arc::new(ListFiles {
@@ -127,6 +130,7 @@ mod tests {
                 "list_files",
                 "read_file",
                 "recall",
+                "revert_file",
                 "search",
                 "shell",
                 "test",
@@ -152,6 +156,7 @@ mod tests {
                 "list_files",
                 "read_file",
                 "recall",
+                "revert_file",
                 "search",
                 "write_file"
             ]

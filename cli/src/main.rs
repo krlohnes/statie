@@ -4,6 +4,7 @@
 mod coding;
 mod config;
 mod eval;
+mod metrics;
 mod toy;
 
 use std::path::PathBuf;
@@ -68,6 +69,14 @@ struct RunArgs {
     #[arg(long)]
     memory: bool,
 
+    /// Operator-authored JSON merge patch applied directly to the workspace
+    /// before the first step (after resume replay, if any), bypassing the
+    /// model entirely. Repeatable; each occurrence is applied in order.
+    /// Invalid JSON on any occurrence exits with status 2 before anything
+    /// runs.
+    #[arg(long = "patch", value_name = "JSON")]
+    patches: Vec<String>,
+
     /// Target counter value for the `toy` skill.
     #[arg(long, default_value_t = 10)]
     toy_target: u64,
@@ -98,6 +107,17 @@ enum Command {
         /// Print the full transcript of both runs to stderr.
         #[arg(short, long)]
         verbose: bool,
+    },
+    /// Read-only summary of one session log: committed steps, rejections,
+    /// tool errors, edits landed, and more, plus breakdowns of rejection
+    /// and tool-error reasons.
+    Metrics {
+        /// Path to the session log (JSONL). Defaults to
+        /// `.statie/session.jsonl` under the current directory.
+        path: Option<PathBuf>,
+        /// Print the summary as one JSON object instead of text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -136,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
             json,
             verbose,
         }) => eval::cmd_eval(cli.config, task, steps, json, verbose).await,
+        Some(Command::Metrics { path, json }) => metrics::cmd_metrics(path, json),
         None => cmd_run(cli.config, cli.run).await,
     }
 }
@@ -266,8 +287,21 @@ async fn cmd_run(cli_flag: Option<PathBuf>, run: RunArgs) -> anyhow::Result<()> 
         resume,
         skill,
         memory,
+        patches,
         toy_target,
     } = run;
+
+    // Parsed and validated before anything else runs (config load, sandbox
+    // setup, session activation): a malformed `--patch` value is a usage
+    // error, not a runtime one, so it exits 2 like clap's own argument
+    // errors rather than 1 like a failed run.
+    let patches = match parse_patches(&patches) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
 
     // Headless mode is exactly "one or more -p/--prompt values". A bare
     // positional PROMPT alone seeds the TUI's first message rather than
@@ -310,7 +344,7 @@ async fn cmd_run(cli_flag: Option<PathBuf>, run: RunArgs) -> anyhow::Result<()> 
     match skill_set.as_str() {
         "toy" => {
             run_toy(
-                cfg, path, root, headless, messages, memory, toy_target, resume,
+                cfg, path, root, headless, messages, memory, toy_target, resume, patches,
             )
             .await
         }
@@ -325,6 +359,7 @@ async fn cmd_run(cli_flag: Option<PathBuf>, run: RunArgs) -> anyhow::Result<()> 
                 memory,
                 resume,
                 skill_explicit,
+                patches,
             )
             .await
         }
@@ -332,6 +367,20 @@ async fn cmd_run(cli_flag: Option<PathBuf>, run: RunArgs) -> anyhow::Result<()> 
             "unknown skill `{other}` (expected one of: router, plan, implement, review, toy)"
         ),
     }
+}
+
+/// Parses each `--patch` value as a JSON object, in order. On the first
+/// invalid one, returns a message naming its position (1-based, matching
+/// how a user would count repeated flags) and the parse error, so `cmd_run`
+/// can print it and exit 2 before any session work happens.
+fn parse_patches(raw: &[String]) -> Result<Vec<serde_json::Value>, String> {
+    raw.iter()
+        .enumerate()
+        .map(|(i, s)| {
+            serde_json::from_str::<serde_json::Value>(s)
+                .map_err(|e| format!("--patch #{}: invalid JSON: {e}", i + 1))
+        })
+        .collect()
 }
 
 /// Combines the positional PROMPT (if any) with the `-p`/`--prompt` values
@@ -399,14 +448,16 @@ async fn run_coding(
     memory: bool,
     resume: bool,
     skill_explicit: bool,
+    patches: Vec<serde_json::Value>,
 ) -> anyhow::Result<()> {
     let banner = build_banner(&cfg, &path, &root, resume);
     let model = cfg.build_model()?;
     let tools = statie_tools::default_tools(&cfg.tools);
     let tokenizer = Box::new(TiktokenTokenizer);
+    let maintainer = cfg.build_maintainer()?;
 
     let session_config = SessionConfig {
-        budgets: cfg.budget.into(),
+        budgets: cfg.effective_budgets(),
         retries: cfg.retries,
         root,
     };
@@ -426,11 +477,16 @@ async fn run_coding(
     let mut session = Session::new(
         store,
         Arc::clone(&log),
-        model,
+        model.into(),
         tools,
         tokenizer,
         session_config,
     );
+    if let Some(m) = maintainer {
+        session = session.with_maintainer(m);
+    }
+    session = session.with_working_set(cfg.working_set.into());
+    session = session.with_guards(cfg.guards);
 
     if cfg.augmenters.repo_bm25.enabled {
         let repo_bm25 = RepoBm25::build(&session.config().root, RepoBm25Options::default())?;
@@ -448,7 +504,7 @@ async fn run_coding(
     }
 
     let registry: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> =
-        Arc::new(CodingRegistry::new());
+        Arc::new(CodingRegistry::with_guards(cfg.guards));
 
     let opts = RunOptions {
         initial_skill: skill.to_string(),
@@ -458,6 +514,7 @@ async fn run_coding(
         resume,
         replay_entries: 40,
         skill_explicit,
+        patches,
     };
 
     if headless {
@@ -487,6 +544,7 @@ async fn run_toy(
     memory: bool,
     toy_target: u64,
     resume: bool,
+    patches: Vec<serde_json::Value>,
 ) -> anyhow::Result<()> {
     let banner = build_banner(&cfg, &path, &root, resume);
     let model = cfg.build_model()?;
@@ -514,7 +572,7 @@ async fn run_toy(
     let mut session = Session::new(
         store,
         Arc::clone(&log),
-        model,
+        model.into(),
         tools,
         tokenizer,
         session_config,
@@ -546,6 +604,7 @@ async fn run_toy(
         resume,
         replay_entries: 40,
         skill_explicit: false,
+        patches,
     };
 
     if headless {

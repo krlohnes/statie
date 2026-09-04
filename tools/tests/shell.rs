@@ -122,7 +122,11 @@ async fn timeout_kills_backgrounded_children() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = support::ctx_for(dir.path());
 
-    let marker = "statie-test-marker-timeout";
+    // Per-process marker so an overlapping `cargo test` run (another test
+    // binary, a parallel CI job) can't pkill this one's children or be
+    // counted by its pgrep.
+    let marker = format!("statie-test-marker-timeout-{}", std::process::id());
+    let marker = marker.as_str();
     // Clean up defensively in case a previous failed run left one behind.
     pkill_marker(marker);
 
@@ -155,7 +159,11 @@ async fn exited_shell_with_lingering_background_child_returns_promptly() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = support::ctx_for(dir.path());
 
-    let marker = "statie-test-marker-lingering";
+    // Per-process marker so an overlapping `cargo test` run (another test
+    // binary, a parallel CI job) can't pkill this one's children or be
+    // counted by its pgrep.
+    let marker = format!("statie-test-marker-lingering-{}", std::process::id());
+    let marker = marker.as_str();
     pkill_marker(marker);
 
     let cmd = format!("sh -c 'exec -a {marker} sleep 30' & echo started");

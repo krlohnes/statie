@@ -1,0 +1,8 @@
+{
+  "name": "python_method",
+  "prompt": "Add a `remove` method to `Inventory` in inventory.py so `python3 -m unittest -q` passes.",
+  "test_cmd": "python3 -m unittest -q",
+  "protected": ["test_inventory.py"],
+  "timeout_secs": 900,
+  "tags": ["python", "new-method"]
+}

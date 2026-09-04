@@ -1,0 +1,8 @@
+{
+  "name": "add_function",
+  "prompt": "Add a `median` function to src/lib.rs so the tests in tests/stats.rs pass. Verify with `cargo test`.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/stats.rs"],
+  "timeout_secs": 900,
+  "tags": ["rust", "new-function"]
+}

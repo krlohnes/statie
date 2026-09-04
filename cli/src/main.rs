@@ -1,6 +1,7 @@
 //! `statie`: the binary. Config loading, session wiring, and the `statie`
 //! commands (ARCHITECTURE.md "Workspace layout" / "Configuration").
 
+mod bench;
 mod coding;
 mod config;
 mod eval;
@@ -119,6 +120,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Runs a battery of small tasks (several seeds each) through the real
+    /// `statie` binary and reports landing rate and context cost per task.
+    Bench {
+        /// Directory of task fixtures (`<name>/task.json` +
+        /// `<name>/fixture/`). Defaults to `bench/tasks` under the current
+        /// directory.
+        #[arg(long, value_name = "DIR")]
+        tasks: Option<PathBuf>,
+        /// Run only this task; repeatable to run several.
+        #[arg(long = "task", value_name = "NAME")]
+        task: Vec<String>,
+        /// Number of seeds per task (seeds are 1..=N).
+        #[arg(long, default_value_t = 1)]
+        seeds: u64,
+        /// Directory to write per-run artifacts into. Defaults to a fresh
+        /// temp directory (path printed at the end).
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// Print the full report as JSON instead of the summary table.
+        #[arg(long)]
+        json: bool,
+        /// Also keep the whole sandbox per run under `<out>/<task>/seed<N>/
+        /// sandbox/` (large; off by default).
+        #[arg(long)]
+        keep: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -157,6 +184,17 @@ async fn main() -> anyhow::Result<()> {
             verbose,
         }) => eval::cmd_eval(cli.config, task, steps, json, verbose).await,
         Some(Command::Metrics { path, json }) => metrics::cmd_metrics(path, json),
+        Some(Command::Bench {
+            tasks,
+            task,
+            seeds,
+            out,
+            json,
+            keep,
+        }) => {
+            let tasks_dir = tasks.unwrap_or_else(|| PathBuf::from("bench/tasks"));
+            bench::cmd_bench(tasks_dir, task, seeds, cli.config, out, json, keep).await
+        }
         None => cmd_run(cli.config, cli.run).await,
     }
 }

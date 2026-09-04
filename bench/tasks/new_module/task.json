@@ -1,0 +1,8 @@
+{
+  "name": "new_module",
+  "prompt": "Create a `stats` module with `variance` and `stddev` functions so tests/variance.rs passes. Verify with `cargo test`.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/variance.rs"],
+  "timeout_secs": 900,
+  "tags": ["rust", "new-module"]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "add_struct_field",
+  "prompt": "Add a `retries: u32` field to `Settings` (3 by default and in `new`, 0 in `local`) so tests/settings.rs passes. Verify with `cargo test`.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/settings.rs"],
+  "timeout_secs": 900,
+  "tags": ["rust", "struct-field"]
+}

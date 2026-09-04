@@ -1,0 +1,8 @@
+{
+  "name": "rename_across_files",
+  "prompt": "Rename `parse_cfg` to `parse_config` everywhere in this crate; tests/config.rs already uses the new name. Verify with `cargo test`.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/config.rs"],
+  "timeout_secs": 900,
+  "tags": ["rust", "rename"]
+}

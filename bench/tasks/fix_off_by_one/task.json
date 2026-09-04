@@ -1,0 +1,8 @@
+{
+  "name": "fix_off_by_one",
+  "prompt": "`cargo test` fails in tests/chunks.rs; `chunk_count` is wrong. Fix it so all tests pass.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/chunks.rs"],
+  "timeout_secs": 900,
+  "tags": ["rust", "runtime-bug"]
+}

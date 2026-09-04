@@ -1,0 +1,8 @@
+{
+  "name": "match_arms",
+  "prompt": "The crate does not compile: `render` in src/render.rs does not cover every `Event` variant. Add the missing arms so tests/render.rs passes. Verify with `cargo test`.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/render.rs", "src/event.rs"],
+  "timeout_secs": 900,
+  "tags": ["rust", "non-exhaustive-match"]
+}

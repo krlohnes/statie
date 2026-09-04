@@ -81,9 +81,11 @@ statie would actually use and where it came from.
 | `model.base_url` | string | `"http://localhost:11434"` | Base URL of the model server. Ollama default shown; for `"openai"` backend a typical value is `"http://localhost:8000/v1"`. |
 | `model.model` | string | `"gemma4:26b"` | Model name/tag as the backend expects it. |
 | `model.think` | bool | `true` | Ask Ollama for native `thinking` output (`"think": true` on `/api/chat`). Ignored by other backends. |
+| `model.retries_on_5xx` | integer | `2` | How many times an Ollama call is retried after a 5xx or a dropped connection (the runner restarts itself after a crash) before the step parks. |
+| `model.retry_delay_secs` | integer | `15` | Wait between those retries; cancellation aborts the wait. |
 | `model.api_key` | string or null | `null` | Bearer token for `"openai"` backend. Falls back to `$STATIE_API_KEY` if unset. |
 | `model.num_ctx` | integer | `32768` | Context window sent on every Ollama request. Pinned on purpose: Ollama reloads the model (and re-allocates its KV cache) whenever a request uses a different `num_ctx`, so keep this constant and match any other client of the same server. |
-| `model.format` | string | `"json"` | Ollama `format` mode: `"schema"` (full JSON schema grammar), `"json"` (plain JSON mode) or `"none"`. Default is `json`: on Ollama 0.33 with gemma4 the full-schema grammar degraded output (the model collapsed to `yield`/`done` while its reasoning said to call a tool). Every output is validated against the schema regardless. |
+| `model.format` | string | `"json"` | Ollama `format` mode: `"schema"` (full JSON schema grammar), `"json"` (plain JSON mode) or `"none"`. Default is `json`. On Ollama 0.33 with gemma4 the first full-schema grammar degraded output (the model collapsed to `yield`/`done` while its reasoning said to call a tool); that schema was a `oneOf` over the action variants, and the action schema is now one flat object with a `type` enum, so `schema` is worth retrying. Every output is validated against the schema regardless. |
 | `model.schema_constrained` | bool or null | `null` | Whether the backend enforces the schema; `null` derives it from `format` (Ollama) or is `true` (OpenAI-compatible). When false the schema is also pasted into the system prompt. |
 | `model.options` | object | `{}` | Passed through verbatim: Ollama's `options` object, or merged into the OpenAI-compatible request body (e.g. vLLM's `guided_json`). |
 | `model.timeout_secs` | integer | `600` | Per-request timeout. |
@@ -91,6 +93,8 @@ statie would actually use and where it came from.
 | `budget.total` | integer | `24000` | Token budget for the whole prompt. |
 | `budget.observation` | integer | `3000` | Cap on the latest tool-observation section (head/tail truncated beyond this). |
 | `budget.augmentation` | integer | `2000` | Combined cap across all augmenters. |
+| `budget.working_set` | integer | `6000` | Cap on the working-set section: recent calls plus the last few read windows, derived from the log each step (spec section 10). |
+| `budget.notes` | integer | `400` | Cap on the harness-maintained `notes` section (see `maintainer`). Overridden by `maintainer.budget` when that section is present. |
 | `retries` | integer | `3` | Rejected model outputs tolerated before the session parks with a failure, asking the user to intervene. |
 | `store.kind` | string | `"sqlite"` | `"memory"` or `"sqlite"`. |
 | `store.path` | path | `.statie/session.db` | SQLite database path, resolved relative to `sandbox_root`. |
@@ -103,6 +107,19 @@ statie would actually use and where it came from.
 | `tools.shell_timeout_secs` | integer | `120` | Default timeout for the `shell` and `test` tools. |
 | `tools.allow_shell` | bool | `true` | Whether the `shell` and `test` tools are registered at all. |
 | `tools.max_output_bytes` | integer | `200000` | Per-tool output cap before truncation. |
+| `working_set.max_windows` | integer | `4` | How many recent `read_file`/`search` outputs stay in the prompt verbatim (newest first; a window is dropped once its file is edited). `0` disables the section. |
+| `working_set.recent_calls` | integer | `6` | How many recent steps get a one-line `tool args -> result` entry at the top of the working set. |
+| `maintainer` | object or absent | absent | Context maintenance (spec section 9). When present, a second model call runs after every committed step and distils that step's reasoning into the harness-owned `notes` field before the reasoning is dropped; it may also propose `next` when the model decided on a mutating call but did not write it. Absent means no maintainer and no behaviour change. |
+| `maintainer.model` | object | the top-level `model` | Same shape as `model`. A smaller model here buys back the extra call's latency; on one GPU the calls are serialized. |
+| `maintainer.budget` | integer | `400` | Token cap on `notes`; the maintainer is told the cap and retried once if it overruns, then the previous notes are kept. |
+| `maintainer.timeout_secs` | integer | `120` | Per-call timeout; a timeout keeps the previous notes and never blocks the step. |
+| `maintainer.prompt_budget` | integer | `4000` | Cap on the maintainer's own prompt (previous notes, state, commitment, patch, action, reasoning, observation; the last two are head/tail truncated to fit). |
+| `guards.redundant_reads` | bool | `true` | Rule-audit switch (spec section 10): an identical read since the last edit is skipped and its earlier result shown. `false` re-runs it. |
+| `guards.silent_reads` | bool | `true` | Consecutive reads whose patch wrote nothing are rejected at the cap. `false` never rejects on that ground. |
+| `guards.read_guard` | bool | `true` | Fourth read of one path with no edit between gets a note. `false` disables the note. |
+| `guards.redundant_verify` | bool | `true` | An identical `shell`/`test` command with nothing edited since is skipped and its earlier result shown. `false` re-runs it. |
+| `guards.done_stays_done` | bool | `true` | A `done` plan step may not be reopened. `false` allows it. |
+| `guards.commitment_read_cap` | bool | `true` | Reads against a set `next` beyond the cap are rejected. `false` lets them run and appends a "still pending" note instead. |
 | `max_autonomous_steps` | integer | `200` | Safety cap on consecutive autonomous steps (`Outcome::Continue`) before a run stops on its own. |
 
 ## Commands
@@ -123,6 +140,17 @@ statie would actually use and where it came from.
   it also asks the server whether `model.model` is present.
 - `statie eval [--task toy|coding] [--steps N] [--json] [-v]` — see
   [Eval](#eval).
+- `statie metrics [PATH] [--json]` — read-only summary of one session log
+  (default `./.statie/session.jsonl`; archived runs live under
+  `.statie/archive/<timestamp>/session.jsonl`). Prints one line of counts
+  (`steps rej failures tool_err skipped paged continued edits first_edit
+  green restored maint maint_err activations last`) followed by rejections
+  grouped by reason and tool errors grouped by tool and reason, sorted by
+  count. `steps` is committed model steps; `first_edit` is the ordinal of
+  the committed step at which the first edit landed, not the log's step
+  counter. `--json` prints the same as an object. A missing file exits
+  non-zero. The counts are the same ones the eval table's trailing columns
+  use.
 
 Session options, valid with or without `-p`:
 
@@ -137,6 +165,10 @@ Session options, valid with or without `-p`:
   own. An explicit `--skill` wins over the stored activation on resume.
 - `--memory` — in-memory store and log; nothing touches disk. Never archives
   or resumes.
+- `--patch <json>` — operator-authored JSON merge patch applied directly to
+  the workspace before the first step, bypassing the model. Repeatable;
+  applied in order, after resume replay. Invalid JSON on any occurrence
+  exits with status 2 before anything runs.
 - `--toy-target <n>` — target for the `toy` skill (default 10).
 
 ## In the TUI
@@ -160,6 +192,7 @@ commands (type `/` for completion, Tab to accept):
 | `/tools` | tools available to the current skill |
 | `/skill <name>` | switch skill (must be an allowed transition); `/skill! <name>` forces it |
 | `/edit <json>` | apply a merge patch to the workspace yourself |
+| `/patch <json>` | operator patch applied directly to the workspace, bypassing the model, e.g. `/patch {"plan":[{"id":2,"status":"done"}]}` |
 | `/help`, `/quit` | |
 
 Keys: ↑/↓ and PgUp/PgDn scroll history, Home/End jump, ctrl-u clears the
@@ -187,6 +220,7 @@ for the prompt (the full output stays in the session log).
 | `filter_last_tool_call` | regex over the full output of the previous tool call, for when it overflowed |
 | `shell` | `sh -c` in the sandbox with a timeout; runs in its own process group and kills it on timeout, cancel, or lingering background children |
 | `test` | the project's test command (auto-detected or explicit), reported as `result: pass` / `result: fail (exit N)` plus a failure summary |
+| `revert_file` | restore a file to its content from before this session's first `edit_file`/`write_file` of it (a file created this session is removed); the backup lives in `.statie/orig/`, is taken on first modification, cleared on a fresh start, kept on `--resume` |
 | `recall` | search the session log (never the model's reasoning) |
 
 The coding skills: `router` decides where to go, `plan` explores and writes
@@ -222,8 +256,11 @@ families of prompt-token stats: `est_*` from the local cl100k estimate, and
 `eval_count`, or an OpenAI-compatible `usage` object). `srv_max` is the
 number to compare against `model.num_ctx`. `--task toy` drives the counter
 skill for `--steps`; `--task coding` asks the router to create a file and
-checks that it did. `--json` prints an object instead of a table; `-v`
-prints both transcripts to stderr.
+checks that it did. The table's trailing columns (`rej`, `tool_err`,
+`edits` as landed/attempted, `first_edit`, `maint` as runs/errors,
+`skipped`, `paged`, `continued`, `green`, `restored`) are the same log
+counts `statie metrics` prints. `--json` prints an object instead of a
+table; `-v` prints both transcripts to stderr.
 
 ## Running against Ollama: field notes
 
@@ -335,11 +372,636 @@ either a default or a config knob:
   The coding skills now reject `yield` outright (`ask_user` with a concrete
   question is the only way to pause), and the park message shows the model's
   own `recent_summary` plus how to resume.
+- **A stray `next_skill` used to be a silent handoff.** Dogfooding statie on
+  its own predicate module: in the implement skill the model wrote
+  `"next_skill": "plan"` in the same patch as a `read_file` call. The tool
+  ran, and the next step switched to plan (the harness honoured a changed
+  handoff target at the top of every step), where the model re-read the
+  same file for 20 steps because plan has no write tools. A handoff target
+  may now change only together with action `done`; anything else is a
+  rejection that says so.
+- **A 200-line `read_file` never fit the observation.** Dense Rust is 12-15
+  tokens a line, so the default window always overflowed the 2000-token
+  budget, the model saw a truncated view, and it looped between `read_file`
+  and `filter_last_tool_call` instead of editing. The window is now 100 lines
+  and additionally size-capped at a line boundary, and the output ends with
+  the exact `offset` to continue from. In the same run the loop-guard note
+  ("occurrence #3 ... nothing has changed") was appended to the tool output
+  and truncated away with it; it is now prepended so it survives.
+- **Tools not in the skill's list still ran.** The prompt lists only the
+  active tools, but execution looked the tool up in the full set, so the
+  plan skill (no `shell`) ran `cargo test` anyway. Execution now checks the
+  skill's list and answers with the available tools.
+- **`command` is not `cmd`, ten times.** The model guessed `command` for
+  `shell`, got serde's "missing field `cmd`", and re-listed the repository
+  root after every failure; the loop guard ignored tool errors, so it never
+  said "nothing has changed". Argument errors now come back with the tool's
+  schema and an instruction to call it again; `shell`/`test` accept
+  `command` and the file tools accept `file`/`file_path` as aliases; and tool
+  errors count toward the loop guard like outputs do.
+- **A rejection retry must not be a replay.** After writing a plan the model
+  sent a bare `done` four times with byte-identical output (identical prompt,
+  temperature 0.3) until the retry cap parked the run, while its reasoning
+  said "I will now implement". Rejection observations now carry `attempt k
+  of n` and, from the second identical rejection, say so and demand a
+  different output; the premature-`done` message shows the exact JSON to
+  send; and a bare `done` in `plan` with a non-empty plan is taken as the
+  handoff to `implement` it obviously means.
+- **An invented anchor costs the whole file.** `edit_file` with an `old`
+  the model imagined (a guessed method list) misses; the error named the
+  closest line, and the model paged the 815-line file from line 1 in
+  100-line windows, three times, without ever editing. The miss now returns
+  the numbered text around the closest line so the next step can copy it
+  verbatim, `search` shows a line of context and the `read_file` offset to
+  use, and the implement instructions say to read from a reported line
+  number rather than from the top.
+- **A one-line anchor is what a small model can copy.** With the numbered
+  miss window in place the model edited the trait correctly on the next
+  step, then stalled on a 90-line function: it could not hold a multi-line
+  `old` block that spanned two read windows, so it made 62 reads and 2
+  edits in one attempt, cycling the same three offsets for 25 steps.
+  `edit_file` now inserts `new` after or before a single unique anchor
+  line (`after`/`before`), and the implement instructions say to prefer
+  that for additions. Because varying offsets slip past the identical-call
+  loop guard, a read guard now counts reads of one path with no edit in
+  between and from the fourth says so: make the change with the lines in
+  front of you, or write the line numbers and anchor into the workspace.
+- **State outlives messages, so the operator needs to edit state.** The
+  model marked a plan step done that it had not done, later reset finished
+  steps to pending, and trusted its plan over every resume message saying
+  otherwise. `/patch <json>` in the TUI and `--patch <json>` on a headless
+  run apply an operator's merge patch through the same validation as the
+  model's, logged with `source: user`, and the model's next observation says
+  what changed.
+- **Thinking mode was where the edit got deferred.** With `think: true`,
+  gemma4 had the anchor line in the observation, reasoned "I need to see the
+  code around line 741 to make sure", read it, overwrote its own
+  `recent_summary` with a vaguer one, and lost the thread; eight attempts,
+  three edits. With `think: false` the first step was the edit. The edit was
+  wrong (it repeated the anchor line inside `new`), and the model then could
+  not read the failure: the `test` summary stopped at `panicked at
+  file:line` and dropped the assertion message on the next lines, while 150
+  `test ... ok` lines filled the rest of the budget. The summary now carries
+  the lines after each panic and the rustc error blocks, and passing-test
+  lines are omitted with a count.
 - **A model error must not kill the UI.** Running without a reachable
   server used to exit the TUI on the first Enter. Step failures are now shown
   in red and the session parks; only store/log failures or an unknown skill
   are fatal. The startup banner prints the config path, model, and sandbox so
   a wrong setup is visible before typing.
+
+- **A commitment the operator seeds works; one the model writes must be a
+  change.** Resumed with `--patch` setting `next` to the exact three-line
+  deletion, gemma4's first step was that `edit_file`, no reads, correct.
+  Then, with nothing committed, it ran the same `cargo test` seven times in
+  sixteen steps with no edit between, read the file from line 1 after the
+  read guard fired, and finally wrote its own commitment: `next.tool:
+  read_file`. Nothing rejected that, so the read cap then refused the very
+  call the commitment demanded, and the session parked on five identical
+  rejections. Three rules came out of it: `next.tool` must be a mutating
+  tool (`edit_file`, `write_file`, `shell`, `test`) or the patch is
+  rejected with the shape to send; a `shell` or `test` command identical to
+  the previous one with no `edit_file`/`write_file` since is rejected with
+  the previous result line ("nothing has changed; make an edit first"); and
+  in the implement skill a second consecutive read with no `next` set is
+  rejected until the model writes the commitment ("commit before you look"
+  as a rule, not a hint).
+
+- **The guards make failure fast; they do not make the model decide.**
+  Resumed again with the three rules in place and no seeded commitment,
+  gemma4 (think on) read from line 1 although the message gave the line
+  range, reopened plan step 1 ("run the tests to observe the errors"), and
+  re-ran the tests. The redundant-verification rule rejected the repeat,
+  quoting the previous result; the uncommitted-read rule rejected the
+  second bare read with the exact `next` JSON to send. The model retried
+  the same two calls until the retry cap, each time resetting more of the
+  plan to pending and overwriting the operator's note in `recent_summary`
+  with "I will now run the requested test command". Ten model calls to
+  park instead of eighty steps of reading, but zero edits. The rejection
+  text told it what to write and it did not write it. New rule: a plan
+  step that is `done` cannot go back to `pending`/`in_progress`; the
+  rejection names the first open step. Beyond that, this is the point where
+  the harness has removed every non-decision it can see, and what remains
+  is the model not holding a decision it was handed.
+
+- **Thinking off plus the rules: the model decided, then lost the edit
+  to an argument slip.** With `think: false`, the plan repaired by an
+  operator patch (steps 1-4 done, step 5 in progress with the exact
+  change), and the message naming the line range, the first step read
+  lines 760-809 and nothing else. The second step set `next` to the right
+  `edit_file` on its own, and the third sent that edit with `old` equal to
+  the nested block and `new` equal to the correct restructured code. It
+  also set `after` to the tail of `old`, and the tool rejected the pair.
+  The model then re-read lines 1-100 twice and asked for the same read
+  three more times until the commitment cap parked it. Two changes:
+  `edit_file` now lets `old` win when anchors are also given (with a note
+  in the output), and an identical read-only call with no mutation since
+  is rejected, naming the step that already ran it.
+
+- **Constrained decoding is the paper's fix for small models, and the
+  first try failed on schema shape.** SKILL.state's failure taxonomy for
+  Gemma-4-31B is all output format (dropped keys, type confusion, JSON
+  slips) and its remedy is grammar-constrained decoding. Ours was built
+  early and turned off after gemma4 collapsed to `yield`/`done` under it.
+  That schema advertised the action as a `oneOf` over five variants, and a
+  grammar gives an off-distribution model the shortest branch for free.
+  The action schema is now a single flat object: a `type` enum whose
+  description says which fields each type needs, plus optional `name`,
+  `args`, `message`, `skill`, `task`. No union keywords anywhere in the
+  output schema. Parsing is unchanged. Retry with `model.format: "schema"`
+  is the next live test.
+
+- **Schema mode and the maintainer, first live run together.** Fresh
+  session, thinking off, flat action schema, maintainer on. Two new
+  failure classes in nine steps, neither of them the model deliberating.
+  Under the grammar the model filled the optional `task` field with its
+  rationale and omitted `args`, so every read arrived without a path; the
+  schema now requires `name` and `args` (non-tool actions send `""` and
+  `{}`). The maintainer, asked for a decision, proposed `next = shell cat
+  <file>` inside the plan skill, which has no shell tool; the commitment
+  rules accepted it as mutating and the worker's reads were rejected
+  against it until the cap. The maintainer now sees the active tool list
+  and the session drops a proposed `next` whose tool is not active. A
+  third: the grammar allowed a `files` entry without `note` (merge-patch
+  schemas strip `required`) and the type refused it; `note` now defaults.
+
+- **The grammar and the types must agree on what is optional.** The
+  merge-patch schema strips `required` inside the patch on purpose (a patch
+  is partial), so under the grammar a new plan step arrived as `{id, text}`
+  and the `PlanStep` type refused it for lacking `status`; two of four
+  attempts in one step died that way and the session parked. `status`
+  now defaults to `pending` and `Commitment.what` to empty (the commitment
+  rule then says what is missing). Rule: a field that is optional in the
+  patch grammar needs a serde default.
+- **Do not offer the model an action the skill will reject.** In the plan
+  skill gemma4 sent `yield` five times in fifteen calls and an `ask_user`
+  without a message; each was rejected after the fact by a skill rule. The
+  action `type` enum in the schema is now per activation: `yield`,
+  `ask_user`, and `delegate` are removed from the grammar and from the
+  "Exact shapes" examples when the skill forbids them.
+- **Plan said "run `test` first" and had no `test` tool.** The model's first
+  plan step was always to run the failing test, and it tried `shell`,
+  `yield`, and `ask_user` to get there. The plan skill now has `test`.
+- **The maintainer earned its keep on the first clean run.** With no
+  incidents, its notes after step 11 read "found the failing test at line
+  1606", the exact fact the next read needed and the kind of thing that
+  used to die with the reasoning. It also proposed nothing, which is the
+  right call while the worker is still exploring.
+
+- **First hand-off to implement on a fresh unit.** With the per-skill
+  grammar and `test` in plan, gemma4 planned, ran the baseline test with
+  `test`, filed the test file with a note, and handed off to implement in
+  seven calls. In implement it re-ran the test, then set `next` to a
+  `read_file` and was told twice that a read is not a commitment, then
+  re-ran the test and parked on the redundant-verification rule. The
+  rejection now says the simplest fix first: to read first, send the read
+  with no `next`. `message` joins `name` and `args` as a required field
+  with an empty placeholder, so `ask_user` without a question can no
+  longer be produced by the grammar; a rule rejects the empty question.
+
+- **A rule that rejects the step throws away the patch too.** Run 18
+  reached implement in eight calls. There the model re-ran the test it had
+  just run, and the redundant-verification rule rejected the step, four
+  times, until the cap. The rejected output each time also marked plan
+  step 1 done, which was the very state change that would have moved it
+  on. The two redundancy rules now commit the patch and skip the call:
+  the observation quotes the earlier result and a `skipped_redundant`
+  entry is logged. Progress in the patch is never the casualty of a
+  redundant action. The maintainer, meanwhile, proposed `next = test` in
+  plan and the worker fulfilled it on the next step, the first proposed
+  commitment to land.
+
+- **Two rules pointing opposite ways.** Run 19 reached implement, read
+  the first 100 lines of a 989-line file, and asked for the next 100. The
+  uncommitted-read rule (one free read) demanded a `next`; the model set
+  `next` to that read; the commitment rule said a read is not a
+  commitment, three times, park. One free read is not enough to find an
+  edit in a file that size, and the two messages together told a model
+  with no edit in mind yet to both write `next` and not write `next`. The
+  cap is now three, and the read rule says to `search` for the spot
+  instead of paging and that `next.tool` is never `read_file`.
+
+- **Count what the read leaves behind, not the read.** Three reads of
+  three different things are not a stall; run 10's sixty-two reads were,
+  and every one of them carried an empty patch. The read rule now counts
+  consecutive reads whose patch wrote nothing and rejects the third with
+  what to write; reads that record a file note, a plan step, or a summary
+  line are unlimited. Run 20 also showed the commit-and-skip rules
+  working (three redundant calls skipped, patches kept) and the model
+  writing a real `edit_file` commitment it then never executed; in seven
+  runs on the three-file unit it has not sent one `edit_file`. The next
+  run shrinks the unit to one file: the variants, hooks, and TUI arms are
+  landed, and the headless match is left non-exhaustive so the compiler
+  names the three missing arms and the line.
+
+- **The working set lands the edit; the rules then fight the rework.**
+  Run 21 (first run with the working set, budget 6000 of 14000, four
+  windows, six recent calls) sent `edit_file` at step 46, the first edit
+  in eight runs on this unit, and a second at step 58. The arms were
+  right in shape and wrong in field names (`agent_path` for `agent`):
+  the model wrote them from the test's expected output without reading
+  the variant definitions. From there the run was the rules, not the
+  model. Steps 13-27 it wanted `search` for the test name, the right
+  call, and was rejected nine times because it also put that search in
+  `next`; when it obeyed and made the committed `shell grep` instead, the
+  call was redundant, skipped, and the commitment stayed open, so the
+  next `search` was rejected again for not honouring it. After the
+  failing test named the real fields the model tried to reopen the plan
+  step "add the arms" and done-stays-done refused three times, each
+  refusal redirecting it to "the first open step: run the test". It
+  obeyed: four test runs, each skipped as redundant, with the compiler
+  error in the observation and the variant definitions in the working
+  set the whole time, then a `done`, then an `ask_user` that was a
+  statement. 52 steps, 17 rejections, 12 skipped calls, 2 edits, first
+  edit at step 46. Two harness bugs fall out: a committed call that is
+  skipped as redundant must still discharge the commitment, and a
+  `shell`/`test` commitment must match on the tool alone (the model's
+  `next.path` on a grep made the grep itself a mismatch). Two rules
+  move in the audit: done-stays-done blocked legitimate rework and then
+  steered the model into the redundant loop, and a non-mutating `next`
+  should be dropped with a note rather than rejected, since the model
+  uses the slot to name its next look.
+
+- **A malformed slot is a note, not a failure.** Run 22, with those
+  fixes in, parked as a failure at the second implement step: the model
+  wrote `next = {tool: test, path: ...}` with no `what`, four times,
+  and the rule rejected it four times to the retry cap. The remaining
+  two `next` rules (empty `what`, missing `path` for an edit) now do
+  what the non-mutating rule does: the slot is dropped, the committed
+  `next` is left as it was, and the model reads a one-line note in its
+  next observation. No `next` rule rejects a step any more.
+
+- **Three ways into one slot.** Run 23 parked as a failure at step 8
+  on "you committed to `read_file tui/src/headless.rs`", a commitment
+  the model can no longer write. The maintainer had proposed it at step
+  3, and the session checked only that the tool was active. The model
+  patch, the operator patch, and the maintainer proposal are three paths
+  into `next`, and only the first was checked for shape. The maintainer
+  proposal now passes the same three checks (mutating tool, non-empty
+  `what`, path for an edit) and is dropped with a logged reason
+  otherwise, and the maintainer's output schema constrains `next.tool`
+  to the four mutating tools so a schema-decoding model cannot propose a
+  read at all.
+
+- **The rules stopped being the story.** Run 24, with all three fixes
+  in and every guard on, made 54 committed steps (about 100 model
+  calls) with 9 rejections, none fatal: 4 commitment-read-cap, 4
+  done-stays-done, 1 handoff. It sent 16 `edit_file` calls. Six landed,
+  the first at step 12; ten failed because the anchor was text the
+  model had invented for the Maintainer arm beside its insertion point
+  ("closest match is near line 158; the file there reads ...", seven
+  times), and the six that landed used field names it guessed rather
+  than the ones the compiler and the working set had shown it. The run
+  ended when the Ollama runner crashed at the 105th model call. The
+  pattern behind the anchor failures: an edit drops that path's read
+  windows, so the next anchor is written from memory. The edit tool's
+  own output already shows the edited region with line numbers; that
+  output now stays in the working set as a window on the path until
+  the next edit of it.
+
+- **The cap rejects the wrong reads.** Run 25 (edit windows in, all
+  guards on) parked as a failure at step 13 with 7 rejections, every
+  one "you committed to `edit_file tui/src/headless.rs`". The commitment
+  read cap allows two reads of the committed path and rejects any read
+  of another path outright, and the model wanted the test file, which
+  the task told it to read. The audit starts here: run 26 is the same
+  unit with `guards.commitment_read_cap` off (reads run, a "still
+  pending" note is appended). Two smaller things from the same run: the
+  model sent `after` as a one-element array for the second time (the
+  tools now join a list of strings into one string), and its `old`
+  anchor for the Maintainer arm was invented again with the real arm in
+  a working-set window; the maintainer's notes had already said to copy
+  it from the observation.
+
+- **Reject less, commit more.** Run 26 (commitment read cap off) read
+  the test file, searched, and found the test at step 17 with no
+  rejection on the way: the cap-off run was no worse than run 25, so
+  the cap stays off. Then at step 18 it sent `done` with a plan step
+  open, `done` to review, an empty `ask_user`, and `done` again, four
+  different rules, retry cap, failure. Each of those four carried the
+  patch that marked the read step done, and each rejection threw it
+  away. The harness now converts a premature `done` in implement and
+  an empty `ask_user` the way it converts a malformed `next`: the patch
+  commits, no action runs, and the next observation says which plan
+  step is open. Also found while reading the logs: with `think: false`
+  the model produces no reasoning at all, so the maintainer has been
+  working from the patch, action, and observation only in every run
+  since run 10. Thinking stays off (it deferred edits when it was on),
+  but the maintainer's "reasoning discarded" input has been empty.
+
+- **The first run that ran out of steps instead of rules.** Run 27
+  (`Continue` action, edit windows, list-to-string arguments, read cap
+  off) reached the 80-step autonomous cap with 3 rejections in about
+  190 model calls, 10 edits, the first at step 33. The file ended with
+  the three arms present and correctly named, two of them duplicated,
+  and two `writeln(` without the `!` far from the arms: the model had
+  twice rewritten the whole file with `write_file` from memory. Its
+  last forty steps were one read, `read_file tui/src/headless.rs` with
+  no offset, sent twelve times and skipped twelve times, when the arms
+  it wanted to see were at line 170 and the default window ends at
+  100. Three changes: a repeated identical `read_file` whose last window
+  was truncated now pages forward instead of being skipped; `write_file`
+  refuses to replace an existing file over 40 lines and points at
+  `edit_file`; `filter_last_tool_call` matches a pattern literally when
+  it is not a valid regex (the model passed a code snippet). Also: the
+  plan skill's `done` on an empty plan is a commit-and-note now, not a
+  rejection, and the dogfood step cap is 160.
+
+- **Green, then thrown away.** Run 28 (paging, write guard, plan
+  `Continue`, read cap off, cap 160) is the first of fifteen runs on
+  this unit in which the task's own verification passed: the target
+  test at model call 209 (committed step 94), the whole driver suite
+  at 230, the target again at 283. 26 edits, the first at step 11; 22
+  commit-and-note conversions; 10 paged reads; 4 rejections in 355
+  model calls. Then the model saw the duplicate arms it had left (a
+  warning, not an error), committed to removing them, missed the
+  anchors, deleted line ranges with `sed -i` from memory, and reached
+  the step cap with a syntax error in the file. Nothing in the harness
+  noticed the green state, and nothing kept it. Two changes: the
+  session snapshots every file the run has edited when the `test` tool
+  reports a pass, tells the model the verification passed and that
+  cleanup beyond the task is review's call, and restores the snapshot
+  when the run parks with the last verification failing; and `shell`
+  refuses `sed -i` and `perl -i`, which edit by line number from
+  memory, pointing at `edit_file`.
+
+- **The anchor comes back in `new`.** Run 29 (green checkpoint and
+  `sed -i` refusal in) never went green: 147 committed steps, 4
+  rejections, 11 edits that landed and 21 tool errors, and the file
+  grew from 198 to 258 lines before it parked on a real question
+  ("should I rewrite `run_headless`?"). Counting across runs 24 to 29,
+  38 of 102 `edit_file` calls used `after: <anchor>` and then repeated
+  the anchor at the top of `new`, so every insertion duplicated the arm
+  it was anchored on; the duplicates are where the "unexpected closing
+  delimiter" came from. The tool now strips a repeated anchor from
+  `new` (with a note), refuses a `new` that is only the anchor, and
+  reports when an edit leaves a code file's braces unbalanced.
+
+- **Green in 35 steps, zero rejections.** Run 30 (anchor stripping
+  in) went green at model call 68, committed step 24: 3 edits, the
+  anchor stripped once, no tool errors, no rejections, 6 paged reads,
+  and the checkpoint fired. The model then sent `done`, which was
+  right, but its plan still had "run the test" open, and the
+  premature-`done` conversion told it to make a change and test. It
+  went to silence a compiler warning, broke the file, and the Ollama
+  runner crashed on the next call (the second crash in seven runs, both
+  at 8-11k prompt tokens). The driver's "step failed" path did not
+  restore the checkpoint. Two changes: a `done` while the last
+  verification passed marks the open plan steps done and hands off to
+  review, and every driver park, including a backend error, restores a
+  stale checkpoint.
+
+- **Run 31, stopped by hand at 101 steps.** Green handoff and
+  error-path restore in. 2 rejections, 9 edits, 21 tool errors, of
+  which 9 were the write guard refusing to replace the file (the model
+  reached for `write_file` nine times) and 4 were `write_file`/`search`
+  calls missing a required field. The anchor was stripped 5 times and
+  the brace note fired 3 times, but the file still grew from 196 to 284
+  lines. By the time it was stopped the crate compiled and the target
+  test ran, failing only on the exact text of the "finished" line.
+
+- **Landed.** Run 32, same configuration as run 31: router → plan →
+  implement → review → done in 30 committed steps (54 model calls).
+  First edit at step 19, 4 edits, 2 tool errors, 5 rejections (two
+  `next_skill` changes, two done-stays-done, one silent read), the
+  anchor stripped twice, one paged read. Green at model call 50, the
+  green handoff marked the plan done and moved to review, and all 18
+  driver tests pass on disk. Not clean: the two maintainer arms are
+  duplicated (a warning), and review approved in one step of 71
+  completion tokens without reading anything. Review now has to look
+  before it approves: an approval with no tool call in the activation
+  is a commit-and-note, not an approval. Runs 31 and 32 are the same
+  binary and config, one stopped at 101 steps without green and one
+  done in 30: the variance between runs is larger than the effect of
+  any single rule, which is what the audit has to measure against.
+
+- **The first audit series died on the server.** Runs 33-37, one
+  rule off each on the run 32 binary (done-stays-done, redundant
+  reads, silent reads, read guard, redundant verify; read cap off
+  throughout): four of the five ended on a 500 from Ollama mid-run,
+  two as a llama-server stack-buffer overrun on the Windows host and
+  two as "model runner has unexpectedly stopped", at 8-11k prompt
+  tokens with 0 rejections apiece before the crash; run 35 (silent
+  reads off) parked at 33 steps on a real question with no edit. The
+  runner was back for the next run every time, so the harness now
+  retries a 5xx or dropped connection after a delay (`model.retries_on_5xx`,
+  default 2; `model.retry_delay_secs`, default 15) before parking, and
+  the series will be rerun. Nothing in these five runs says anything
+  about the rules; what they do say is that a run's survival is
+  currently the host's, not the harness's.
+
+- **Audit series, second pass.** Runs 38-43 on one binary (retry and
+  review-looks-first in), read cap off throughout, one run per
+  switch, no backend errors:
+
+  | run | rule off | steps | rej | tool err | edits | outcome |
+  |---|---|---|---|---|---|---|
+  | 38 | none | 44 | 1 | 7 | 6 | parked, question |
+  | 39 | done stays done | 144 | 1 | 8 | 9 | parked, question |
+  | 40 | redundant reads | 165 | 1 | 36 | 17 | step cap |
+  | 41 | silent reads | 159 | 6 | 27 | 29 | failed in review |
+  | 42 | read guard | 27 | 0 | 2 | 5 | done, green twice |
+  | 43 | redundant verify | 172 | 9 | 15 | 17 | step cap |
+
+  Verdict: at one run per switch nothing separates from the noise.
+  Run 42 landed and run 32 landed with every rule on; runs 38 and 39
+  parked on a real question at 44 and 144 steps. Rejections are one
+  per run except where done-stays-done fired (4 of run 43's 9) and
+  where review got the send-back shape wrong (run 41). The rules
+  cost almost nothing and buy almost nothing; the steps go to edits
+  that miss (run 40: 13 anchors written on one line for a four-line
+  pattern, 11 ambiguous anchors in a file that had grown to 357
+  lines), and to review shape. Those are the next units, not the
+  switches. Two knobs stay off by evidence: the commitment read cap
+  (fatal in run 25) and nothing else yet. Run 43 also produced two
+  model outputs cut off at 25k characters mid-string, a `write_file`
+  of the whole file that the guard would have refused anyway.
+
+- **Landed again, and the filtered test hid a regression.** Run 44
+  (line-break-tolerant anchors, duplicate-insert refusal, review
+  send-back and look-first in; read cap off): done in 46 committed
+  steps, zero tool errors, 2 rejections, 6 edits from step 9, green
+  twice, review asked to look, ran the test, approved. The three arms
+  are right. The model also inserted a catch-all `Maintainer { .. }`
+  arm ahead of the existing one, which shadows it: the target test
+  passes, the driver suite has one failure that nobody ran. The task
+  prompt named the filtered command and the model never widened it.
+  The `test` tool now notes when a passing run filtered tests out, and
+  review is told to run the unfiltered target before approving.
+
+- **Three for three green; one for three done.** Runs 45-47, one
+  binary (filtered-test note in), every rule on, read cap off:
+
+  | run | steps | rej | tool err | edits | green | suite on disk | outcome |
+  |---|---|---|---|---|---|---|---|
+  | 45 | 62 | 8 | 8 | 4 | step 44 | 18/18 | failed in review |
+  | 46 | 77 | 7 | 0 | 3 | step 30 | 18/18 | failed in review |
+  | 47 | 48 | 7 | 2 | 4 | step 12 | 18/18 | done |
+
+  Every run reached green and left the whole driver suite passing.
+  Two then failed in review, and both the same way: the review model
+  sent `done: true` without a tool call, the look-first rule converted
+  it, and the model sent the same approval again, 35 times in run 46,
+  until it added `next_skill: implement` to the approval, at which
+  point the conversion stripped `done` but not `next_skill` and the
+  core rule rejected the step to the retry cap. Two fixes: the
+  conversion strips `next_skill` as well, and the same conversion
+  firing three times in a row parks as a question to the user instead
+  of looping. Implement is not the problem any more; a 26B review
+  that will not read is.
+
+- **Two of three done, the third a question.** Runs 48-50, repeat
+  cap in, every rule on, read cap off: run 48 done in 29 committed
+  steps (1 edit, 1 rejection), run 50 done in 16 (1 edit, 0
+  rejections, the fastest landing so far), both with the whole driver
+  suite green on disk; run 49 sent `done` with a plan step open three
+  times without reading the file it had planned to read, and parked
+  as a question at 26 steps with no edit, which is the cap doing its
+  job. From run 21 (17 rejections, no edit in 52 steps) to here (0-1
+  rejections, done in 16-29) the harness changed and the model and
+  config did not. The audit proper, three runs per switch, runs on
+  this binary.
+
+- **The audit's first four, and a stall the notes caused.** Runs 51-54
+  (three per switch, read cap off): 51 done in 26 steps, 53 green and
+  parked as a question at 22, 52 and 54 parked at 96 and 68 with the
+  arms on disk (run 54's suite passes) and no test run after the edit
+  landed. Both stalls have one shape: the model sent `done` with the
+  plan step still open, the note said "make the change with a tool
+  call", and the model made it again, seven times, each refused as a
+  duplicate insert, each refusal read as a failure to retry. Three
+  changes, none a switch: the premature-`done` note now offers the
+  bookkeeping path first (mark the step done and run `test`; if the
+  work is not done, make the change); the duplicate-insert refusal
+  says the edit is already applied and to run `test`; and a `test`
+  that fails with the same summary as the previous run gets a note
+  saying so, with whether anything was edited in between. That last
+  one was overdue: 13 of the 34 runs since run 21 had three or more
+  identical failures in a row, and run 43 had 22 on one unclosed brace.
+  Run 52 also ran the test six times against the same `E0026` (a
+  variant field it guessed) without reading the variant's definition.
+
+- **The audit, three runs per switch.** Runs 51-65, one binary (the
+  one runs 48-50 landed on), commitment read cap off throughout, one
+  other switch off per row group. "green" is the committed step of the
+  first passing `test`; "suite on disk" is the whole driver suite run by
+  hand afterwards ("no build" means the file was left not compiling,
+  which is also how the task starts); "question" is a park on
+  `ask_user`.
+
+  | run | off | steps | rej | tool err | edits | green | suite on disk | outcome |
+  |---|---|---|---|---|---|---|---|---|
+  | 51 | done_stays_done | 26 | 0 | 0 | 1 | step 21 | 18/18 | done |
+  | 52 | done_stays_done | 96 | 1 | 13 | 12 | - | 17/18 | question |
+  | 53 | done_stays_done | 22 | 1 | 0 | 2 | step 16 | 18/18 | question |
+  | 54 | redundant_reads | 68 | 0 | 14 | 3 | - | 18/18 | question |
+  | 55 | redundant_reads | 22 | 0 | 0 | 1 | step 16 | 18/18 | done |
+  | 56 | redundant_reads | 61 | 1 | 8 | 4 | - | no build | question |
+  | 57 | silent_reads | 45 | 7 | 3 | 3 | - | no build | question |
+  | 58 | silent_reads | 92 | 1 | 2 | 3 | - | 17/18 | question |
+  | 59 | silent_reads | 60 | 2 | 8 | 7 | - | no build | done (false) |
+  | 60 | read_guard | 51 | 1 | 0 | 5 | - | no build | question |
+  | 61 | read_guard | 90 | 13 | 6 | 8 | - | no build | question |
+  | 62 | read_guard | 25 | 0 | 0 | 1 | - | 17/18 | question |
+  | 63 | redundant_verify | 32 | 1 | 2 | 5 | step 29 | 18/18 | question |
+  | 64 | redundant_verify | 28 | 0 | 2 | 1 | step 24 | 18/18 | done |
+  | 65 | redundant_verify | 9 | 1 | 1 | 0 | - | no build | question |
+
+  Against the same binary with every rule on (runs 45-50: green in five
+  of six, done in three), the read-side rules are the ones that show:
+  with **silent reads** off or the **read guard** off, none of six runs
+  reached green, and run 59's `done` was a review approval of a tree
+  that did not compile. **Done stays done** off (two of three green,
+  one done) and **redundant verify** off (two of three green, one done;
+  run 65 never edited, the plan skill paged forty lines into a
+  2079-line file and asked the user where the test was instead of
+  searching) are within the variance of the all-on baseline.
+  **Redundant reads** off sits between (one of three). Run-to-run
+  variance is still larger than any effect here, and two of the stalls
+  (52, 54) were the premature-`done` note steering into duplicate
+  inserts, fixed above; but the pattern is consistent with the working
+  hypothesis: the rules that force a read to leave something in state,
+  or force an edit after reads, are what carry a 26B model in 16k of
+  context. Defaults after the audit: every switch on except the
+  commitment read cap. Done-stays-done and redundant-verify are the
+  candidates to peel next, with more runs; nothing here justifies
+  turning either off today.
+
+- **A `done` that was not.** Run 59 (silent reads off) is the one row
+  above that says done with the file not compiling: implement's last
+  `test` failed on a non-exhaustive match and it handed off anyway;
+  review ran the unfiltered suite, got the same failure, and approved
+  with no findings. The harness already carried whether the latest
+  test passed, for the green checkpoint, so both approvals are now
+  conversions: implement's `done` with the plan complete and no
+  passing run, and review's `done: true` with no findings and no
+  passing run, each keep the patch and say to run the tests and fix
+  or send back. Three in a row park as a question, the same cap as the
+  blind approvals in runs 45-46.
+
+- **Three on the post-audit binary, three different endings.** Runs
+  66-68 (premature-`done` wording, already-applied refusal,
+  repeated-failure note, no-green conversions in; every rule on, read
+  cap off): run 66 parked at 8 steps on an `ask_user` that was not a
+  question ("I need to fix the unbalanced braces... I will first read
+  the file"); run 67 reached green twice and said done in 85 steps,
+  but review approved on the filtered target test with the note
+  "17 test(s) were filtered out; run it without the filter" in front
+  of it, and the whole suite fails on disk (run 44's shadowed arm
+  again); run 68 hit the step cap with the file at 258 lines of
+  duplicate arms, five whole-file rewrites refused, eight attempts to
+  reopen a done plan step rejected, and 46 skipped repeats. The new
+  steers fired and did what they say (four "already applied", four
+  "handing off needs a passing run", one repeated-failure note); none
+  of them addresses these three endings. Counting across all 48 runs
+  since 21: 15 model-written `ask_user` parks, 14 of them statements
+  of intent with no question in them. That is a conversion, not a
+  park. Review approving a filtered pass is a rule, not a note. And
+  "I need to clean up the mess in `headless.rs`" has parked six runs:
+  once a file is corrupted past what `edit_file` can undo, the model
+  has no way back but a rewrite it is refused; a `revert_file` that
+  restores the pre-edit content is the missing tool. All three landed:
+  the non-question `ask_user` conversion, review's approval on a
+  filtered pass as a `Continue` (the harness state now records whether
+  the pass was filtered, and the Harness View says so), and
+  `revert_file` with a pre-edit backup; the `write_file` refusal now
+  points at it.
+
+- **Three for three green on disk; review still will not look.** Runs
+  69-71 (non-question conversion, filtered-approval rule, `revert_file`
+  in; every rule on, read cap off): every run reached green and left
+  the whole driver suite passing on disk, the first series to do that.
+  Run 71 said done in 52 steps: review approved on the filtered target,
+  the new rule sent it back for the unfiltered run, it ran it, and
+  approved properly. Runs 69 and 70 went green in 26 and 25 steps and
+  then review sent `done: true` with no tool call three times each;
+  the look-first note converted each, and the repeat cap parked both
+  as questions with the work finished on disk. `revert_file` was
+  registered and never called; run 71 still took nine "already
+  applied" refusals in a row. The note does not move this model, but a
+  real test observation does (run 71): a blind approval now becomes
+  the harness running the last test command itself, once per review
+  activation, with the output as the observation. And the nine
+  refusals had a cause of their own: the arms were in the file but
+  wrong, the test kept failing on them, and "already applied, run the
+  test" sent the model in a circle. The refusal now quotes the block
+  that is there, numbered, and says to replace it with old/new.
+
+- **Three for three done.** Runs 72-74 (blind-approval substitution
+  and the quoted-block refusal in; every rule on, read cap off): done
+  in 30, 89, and 32 committed steps, every one with the whole driver
+  suite green on disk, the first series where all three landed. The
+  substitution never fired: review looked on its own in all three.
+  The filtered-approval rule fired in runs 73 and 74 and the model ran
+  the unfiltered target and approved both times. The non-question
+  `ask_user` conversion fired four times across the three runs, each
+  followed by a tool call. Run 73's 89 steps were mostly one stretch
+  in implement: thirteen repeats of the same test call skipped as
+  redundant, interleaved with ten empty `ask_user`s, before it read
+  the right file and finished. From run 21 (17 rejections, no edit in
+  52 steps, nine ways to die) to here (0 rejections, done in 30-89
+  steps, whole suite green) the model, the prompt budget, and the
+  context size did not change; the harness did.
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

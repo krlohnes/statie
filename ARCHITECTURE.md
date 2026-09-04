@@ -419,17 +419,116 @@ impl<'a, K: Skill + ?Sized> Active<'a, K> {
 `step` algorithm:
 
 1. `Event::User(t)` → `push_user(t)`. `Event::Cancel` → cancel token, return `Parked(Cancelled)` record. `Tick` → nothing. A fresh `CancellationToken` is then installed into the session's `CancelHandle` for this step.
-2. Load state + version. If `skill.handoff(agent)` is `Some(name)` → `Handoff(name)` without calling the model. Else if `skill.is_terminal(agent)` → `Done`.
+2. Load state + version. If `skill.is_terminal(agent)` → `Done`.
 3. Run augmenters (each with its own budget; total capped by `budgets.augmentation`). The Augmentation section is omitted entirely when no augmenter returns a snippet.
 4. Build `BoundedPrompt` (sections above) with the current version. `OverBudget` → `SessionError::OverBudget` (not retried).
 5. `model.step(prompt, &Schema::of::<StepOutput<<K::Patch as PatchStrategy<W>>::Patch>>(), sink, cancel)`. Cancelled → `Parked(Cancelled)`; nothing committed. Log reasoning (kind Reasoning) regardless, including on outputs that go on to be rejected.
 6. Parse content → `ParsedOutput<W>`. On failure → pending observation `"output rejected: <reason>"`, failures += 1, log System `{"event":"rejected", "reason"}`; if failures > retries → reset failures, log System `{"event":"failure"}`, `Parked(Failure)`; else `Continue`. State unchanged.
-7. `skill.validate(&cur, parsed)` → same rejection path on error, with the validator's message.
+7. `skill.validate(&cur, parsed)` → same rejection path on error, with the validator's message. If the validated patch changes `skill.handoff(next)` relative to `skill.handoff(cur.agent)` and the action is not `Done`, reject the same way: a handoff target may only change together with action `done`, otherwise the *next* step would silently hand off before the model ever saw this step's tool result.
 8. `commit`: assert `patch.version() == version` (B1) else reject as stale (`"stale version"`); build next `HarnessState` (acks applied, step+1, active_tools = skill.tools(), activation = skill.name()); `store.commit(...)`; wrap the action in `Executable::new` only here. failures = 0. Log Patch `{"version","patch"}` + Action entries.
 9. `execute(Executable<Action>)`: `Tool` → look up in ToolSet (unknown tool → rejection observation, log System `tool_error`, `Continue`, not counted as a validation failure), run with cancel via `tokio::select!`; output logged whole as ToolOutput `{"name","output","truncated"}`; `Observation::truncate` becomes pending; `Continue`. A tool `Err` → log System `tool_error`, rejection observation, `Continue`. Cancel mid-tool → `Observation::tool_aborted` pending, log System `cancelled`, `Parked(Cancelled)`. `AskUser`/`Yield` → `Parked`. `Done` → checks `skill.handoff` again, then `Done`/`Handoff`.
 10. Return `StepRecord { entries, outcome }` — caller must `log.append_record(rec)` to get the `Outcome`.
 
 Retry counter resets on successful commit. Pending observation is cleared once it has been put into a prompt (taken via `Option::take`).
+
+### Guards against non-progress (field-driven)
+
+Every one of these came out of a live run in which the model burned 10 to 60
+steps without changing anything; each is a harness rule, not a prompt hint,
+so it holds when the model ignores instructions.
+
+- **Loop guard.** The last 8 committed tool calls (name, args, output or
+  error text) are kept; the third identical triple gets a note prepended to
+  its observation saying nothing has changed. Tool errors count.
+- **Read guard.** Consecutive read-only calls (`read_file`, `search`,
+  `filter_last_tool_call`, `list_files`, `recall`) on one path are counted;
+  any mutating call (`write_file`, `edit_file`, `shell`, `test`) resets all
+  counters. From the fourth read of a path with no edit in between, the
+  observation says so and asks for the edit or for the line numbers to be
+  written into the workspace.
+- **Active tools.** A call to a registered tool the skill does not list is
+  rejected with the skill's list; the prompt and the executor use the same
+  list.
+- **Handoff only on `done`.** A patch that changes `skill.handoff(next)`
+  under any other action is rejected (step 7 above).
+- **Rejections change the prompt.** Every rejection observation carries
+  `attempt k of n`; the second identical reason adds a sentence demanding a
+  different output, so a low-temperature model cannot replay itself into the
+  retry cap.
+- **Commitment.** A workspace may expose a `Commitment { tool, path, what }`
+  through `Skill::commitment`; the coding workspace stores it in `next`.
+  While a mutating commitment is set, the model may read the committed path
+  at most twice; any other read-only call is rejected ("make that call now,
+  or change `next` and say why"). A matching mutating call spends the
+  commitment: the harness clears `next` with a `source: "harness"` patch and
+  the observation says so. The Harness View shows the open commitment and
+  the reads left. This exists because reasoning is discarded by design: a
+  decision that is not state is lost, and the model demonstrably makes the
+  decision, then reads "one more thing", then forgets it. The coding skills
+  validate the slot itself (`commitment_rules`): `next.tool` must be one of
+  `edit_file`, `write_file`, `shell`, `test` (a commitment is the change,
+  not the look; a `read_file` commitment once deadlocked against the read
+  cap), `what` must be non-empty, and `edit_file`/`write_file` need a
+  `path`.
+- **Silent reads.** `Skill::silent_read_cap` (default `None`; the
+  implement skill returns `Some(2)`) bounds consecutive read-only calls
+  whose patch wrote nothing to the workspace while no commitment is set.
+  A read that records anything (a file note, a plan step, a summary line)
+  is never counted and resets the streak; a mutating call or a new
+  commitment resets it too. Past the cap, a silent read is rejected with
+  what to write, and a hint to `search` rather than page. This replaced a
+  plain count of consecutive reads, which fired on three legitimate looks
+  at a 989-line file: reading is not the problem, reading that leaves
+  nothing in state is (the paper's limitation two in miniature).
+- **Redundant verification.** The most recent `shell`/`test` command is
+  kept (normalized: trimmed, cut at the first pipe, `2>&1` dropped) with
+  the first line of its result. Running the same command again with no
+  `edit_file`/`write_file` since does not run it: the step's patch commits,
+  the call is skipped, a `skipped_redundant` System entry is logged, and
+  the observation quotes the earlier result ("nothing has changed since
+  you last ran ...; make the change first"). Only an exact repeat of the
+  latest command is caught; A, B, A is fine. This was a rejection until a
+  live run showed the model marking its plan step done in the same output
+  as the redundant call: rejecting the step threw the progress away.
+- **Done stays done.** A patch that moves a plan step from `done` back to
+  `pending` or `in_progress` is rejected (`plan_rules` in the coding
+  skills), naming the first open step to work on instead, or "add a new
+  step for new work". After a resume the model has three times re-read its
+  plan from the top, reopened step 1 ("run the tests to observe the
+  errors"), and redone finished work. `done -> skipped` and reopening a
+  skipped step are allowed; operator patches go through the same rule.
+- **Redundant reads.** Every successful read-only call is remembered by
+  (tool, args) until the next mutating call. An identical call before any
+  mutation is not re-run: the patch commits, the call is skipped, and the
+  observation names the step that already ran it (read a different range,
+  search, or make the committed change). `filter_last_tool_call` is
+  exempt (re-reading is its job). A skipped call never fulfils a
+  commitment and does not touch the read counters.
+- **Repeated failure.** The session keeps the normalized failure summary
+  of the most recent failing `test` (the text after `--- failure summary
+  ---` up to the next section) and how many consecutive failing runs
+  have shared it. From the second identical failure the observation is
+  prefixed with a note saying so, in one of two shapes: "your edit(s)
+  since did not change it; read the exact lines the error points to"
+  when an `edit_file`/`write_file` ran in between, or "nothing was
+  edited in between" when none did. A `repeated_failure` System entry
+  carries the count and which shape. A pass or a different failure
+  clears the memory. Thirteen of the thirty-four runs from 21 to 54 had
+  three or more `test` runs fail with the same first line, the worst
+  twenty-two in a row on one unclosed brace, and the model never
+  noticed the text had not changed.
+
+### Output schema shape
+
+`Schema::of::<StepOutput<P>>()` is what the backend sends as `format` in
+schema mode and what the prompt pastes otherwise. `Action` implements
+`JsonSchema` by hand as one flat object (`type` enum + optional `name`,
+`args`, `message`, `skill`, `task`, `required: ["type"]`) instead of the
+derived `oneOf` over variants: under grammar-constrained decoding a small
+model took the shortest branch (`{"type":"yield"}`) while its reasoning
+said to call a tool. Serde parsing of the tagged enum is unchanged; tests
+in `core/src/model.rs` assert no `oneOf`/`anyOf`/`allOf` under `action`
+and validate every variant against the schema.
 
 ### System prompt contents
 
@@ -648,6 +747,15 @@ is intentionally not a general expression language.
   vision-capable child can look at what it built. The image never enters the
   log; the path does.
 
+**Delegate executor implementation notes (deviations from the design
+above):** the `delegate` unit's `ConfiguredChildRunner` always runs a child
+over an `InMemoryStore<ReportWorkspace>` rather than a sqlite region, since
+`SqliteStore` gaining a `region` concept is itself listed above as a change
+still to make, not something to build against; and `statie-skills` gained
+real (not dev-only) dependencies on `statie-store`, `async-trait`, and
+`tokio-util`, since `ConfiguredChildRunner` needs `InMemoryStore` and must
+implement the `async_trait`-based `ChildRunner` trait.
+
 ### Testing plan
 
 - Unit: `Report` schema has no `required` inside `MergePatch`; `data_schema`
@@ -664,6 +772,266 @@ is intentionally not a general expression language.
 - Live (field notes, not CI): coding task with `ui-review` child on
   gemma4:26b — the parent's `srv_max` must not grow with the child's step
   count.
+
+## Milestone 10: context maintenance
+
+Design: statie-spec.md section 9. The paper drops the reasoning trace once
+the patch is validated; every dogfood stall was a decision that lived in
+that trace and died with it. The maintainer is a second model call per
+step whose only job is to distil the trace into a bounded, harness-owned
+`notes` field before it is gone. State stays authoritative; notes are one
+field, not a transcript.
+
+### Types (`core/src/maintainer.rs`)
+
+- `Maintainer::maintain(MaintainInput) -> Result<MaintainOutput, MaintainError>`.
+  Input: this step's reasoning text, the raw patch, the action, the
+  observation the next step will see, the committed agent state, the open
+  commitment, the previous notes, and `budgets.notes` as a `TokenBudget`.
+  Output: new notes and an optional `next` commitment.
+- `MaintainError::{Backend, Parse, OverBudget, Timeout}`.
+- `MockMaintainer` (scripted outputs, records every call) for tests.
+- `ModelMaintainer` (`statie-models`) drives any `Model` with
+  `SystemPrompt::for_maintainer` and a flat output schema; one retry when
+  the notes come back over budget, then `OverBudget`.
+- `Notes` is a sealed `Promptable` with a crate-private constructor; the
+  session wraps `Skill::notes(ws)` into it for rendering.
+
+### Session (`run_maintainer`)
+
+Runs after `Outcome::Continue` and after `AskUser`/`Yield` parks; never on
+a rejection, `Done`, cancel, or failure. Applies `{"notes", "next"?}`
+through the trusted-patch path shared with operator patches, logged with
+`source: "maintainer"`, plus a System entry `{"event":"maintainer",
+"notes_tokens", "next_set"}`. `next` is included only when the workspace's
+own commitment is `None`; if the skill rejects it, the patch is retried
+once without `next`. Any error logs `{"event":"maintainer_error","reason"}`
+and keeps the previous notes; the step outcome never changes. `StepSink`
+gets `maintainer_done` / `maintainer_failed` hooks.
+
+### Ownership
+
+`Skill::harness_owned_fields` names top-level keys the model may not
+change; `validate_default` rejects a model patch whose post-patch value for
+such a key differs from the committed value ("field `notes` is
+harness-owned in skill `implement` and cannot be patched"). Operator and
+maintainer patches skip the check. The coding workspace owns `notes` and
+`reports`; the earlier `reports` shape heuristic is gone.
+
+### Prompt and budget
+
+`Section::Notes` renders between the agent state and the harness view under
+"notes (kept by the harness from your previous reasoning):", only when
+non-empty, against `budgets.notes` (default 400). The maintainer's own
+prompt carries no spec and no tool list: previous notes, agent state,
+commitment, patch, action, reasoning, observation, in that order, with
+reasoning and observation truncated head+tail to fit.
+
+### Config and eval
+
+`maintainer: { model?, budget, timeout_secs, prompt_budget }`; `model` has the
+shape of the top-level `model` and defaults to it; `budget` overrides
+`budgets.notes`. The TUI and headless output print `[maintainer] notes: N
+tokens` (plus `, set next`) and `[maintainer error] <reason>`. `statie eval` reports `rej`,
+`tool_err`, `edits` (landed/attempted), `first_edit`, and `maint`
+(runs/errors) per harness, so the maintainer's effect on stalls is
+measurable on the same task.
+
+## Milestone 11: working set
+
+Design: statie-spec.md section 10. The prompt carried one observation; a
+coding step needs the last few. `WorkingSet::from_log` (core) derives,
+every step, a bounded section from the parent's own log entries: one
+line per executed call for the last `working_set.recent_calls` steps
+(`step N: tool args -> first result line`, errors and skips marked), then
+the last `working_set.max_windows` distinct `read_file`/`search` outputs
+verbatim, newest first, each headed `--- tool path lines a-b (step n) ---`.
+A window is replaced by a later identical call and dropped once a later
+`edit_file`/`write_file` touched its path. This step's own observation is
+not repeated. `budgets.working_set` (default 6000) bounds the section:
+oldest windows drop whole, then recent-call lines, and a single oversized
+window is head-truncated with a marker. It renders after the harness view
+and before augmentation. It is not an `Augmenter`: augmentation is
+"never load-bearing" and clamped separately; the working set is what the
+model just read. `working_set.max_windows: 0` disables it. Nothing is
+persisted (C2).
+
+Why: seven runs on one unit produced no edit because the model never had
+the failing test and the file to change in one prompt; it re-read what
+the harness had dropped and the redundancy rule then refused the re-read.
+The rule audit in spec section 10 follows from this: several guards may
+have been compensation for a starved prompt.
+
+Edit windows (spec section 10, "Edit windows"): a successful
+`edit_file`/`write_file` output is a window on its path, keyed by path,
+replacing every earlier window on that path; a read made after the edit
+sits beside it. Failed and skipped edits are not windows. Run 24 showed
+why: an edit dropped the path's read windows, and the next anchor was
+written from memory and missed the file seven times.
+
+## Commit-and-note: `Action::Continue`
+
+A rejection discards the step's patch and spends one of the retries; on
+a small model the retry is usually a different wrong action (run 26:
+`done`, `done` to review, empty `ask_user`, `done`, cap). Where the patch
+is fine and only the action is wrong, a skill's `validate` override may
+keep the patch and replace the action with the harness-internal
+`Action::Continue { note }`: it is never in the model-facing schema (a
+model output naming `"type": "continue"` is rejected at parse), it runs
+no tool, spends no commitment, logs a `continued` System entry, and
+makes `note` the next observation. The coding skills use it for a
+premature `done` in implement (the first open plan step is named, with
+the bookkeeping path first: "if that step's work is already done, set
+its status to done and run `test`; if not, make the change"; run 54
+had landed the edit, sent `done` without marking the step, and obeyed
+the earlier "make the change" wording by re-inserting the same arms
+seven times) and an empty `ask_user` (all three skills). Two more from
+run 59, both keyed on `HarnessState.green_step` (set on every `test`
+call: the step on a pass, `None` on a fail; never cleared otherwise, so
+it survives the handoff): implement's `done` with the plan complete but
+no passing test is a `Continue` ("run `test` now; if it fails, fix what
+it reports"), and review's approval (`done: true`, no findings) with no
+passing test is a `Continue` ("approval needs a passing unfiltered run;
+send it back with the failure as a finding"). Run 59 had implement hand
+off straight after a failing `test`, and review run the unfiltered suite,
+watch it fail, and approve. And an `ask_user` whose message has no `?`
+in it is a `Continue` in all three skills ("a statement of what you will
+do next, not a question; do it with a tool call"): of the fifteen
+model-written `ask_user` parks in runs 21-68, fourteen were "I need to
+fix X. I will first read Y", a plan narrated to a user who had nothing
+to answer. The test is the character, not the grammar; a real question
+without its `?` gets one steer and, if the model insists three times,
+the repeat cap parks it anyway. Review's approval on a filtered pass is
+the last of these: `HarnessState.green_filtered` is set beside
+`green_step` when the passing `test` output carries the tool's
+"filtered out" note, the Harness View shows "(filtered; run the
+unfiltered target before approving)", and an approval while it is set
+is a `Continue` asking for the unfiltered run (run 67 approved on the
+filtered target with the note in front of it; the suite failed on
+disk). Implement keeps its green either way. One conversion goes
+further than a note: review's blind approval (`done: true`, no
+findings, `tool_calls == 0`) is replaced by a `test` call on
+`HarnessState.last_test_cmd` (the last `test` command the session ran,
+set beside `green_step`; no `cmd` when none), so the model's next
+prompt holds a real test result instead of a request to get one. Runs
+45-46 and 69-70 showed the look-first note never moves this model; run
+71 showed a test observation does. The same mechanism, with the patch left
+unchanged, backs the `next` shape rules (`strip_malformed_next`) and
+the working set's redundant-call skips: the slot or call is dropped,
+the note says why, the step still lands. A conversion is a steer, not a
+wall: the same `Continue` note on `CONTINUE_REPEAT_CAP` (3) consecutive
+steps parks the session as a question carrying the note (runs 45-46: a
+review model sent the same blind approval 35 times), and every
+conversion that replaces the action also drops any `next_skill` in the
+patch, since the core rule rejects a skill change on a non-`done`
+action.
+
+Two tool-side rules from run 27 sit beside it: a repeated identical
+`read_file` whose last window was truncated pages forward (args rewritten
+to the next offset, a `paged_read` entry, a note prefixed to the window)
+instead of being skipped, because twelve skips in a row taught the model
+nothing; and `write_file` refuses to replace an existing file over 40
+lines, since a model rewriting a file from memory damaged lines it never
+meant to touch. `filter_last_tool_call` matches an invalid regex
+literally rather than erroring. `edit_file` strips a repeated anchor from
+`new` (38 of 102 calls across six runs put the `after` anchor back at
+the top of `new`, duplicating the anchored block each time), refuses a
+`new` that is only the anchor, and notes when an edit leaves a code
+file's braces unbalanced. From runs 38-43: an `after`/`before`
+insertion whose text (two or more non-blank lines) is already in the
+file is refused with the line range and the words "this edit is
+already applied; run `test` to verify instead of inserting it again"
+(one run's file grew from 198 to 357 lines by re-inserting the same
+arms on every retry, after which every anchor was ambiguous; with the
+refusal worded as a plain failure, run 54 retried it seven times; with
+"run `test`" in it, run 71 retried it nine times because the block was
+there but wrong, so the refusal now quotes the existing lines, numbered
+and capped at 40, and says to replace them with old/new); `search` with a `path` and no `pattern`
+shows the file's first window instead of failing on the missing field;
+`revert_file` (implement only) restores a path to the bytes it had
+before the session's first `edit_file`/`write_file` of it, or removes a
+file created this session: both write tools take a one-time backup
+under `.statie/orig/` before their first modification of a path (never
+overwritten, so it is the original; a fresh start clears the directory,
+`--resume` keeps it), and the `write_file` refusal points at it. Six
+runs had parked on "I need to clean up the mess in `headless.rs`" with
+no way back. And when exact and per-line matching both fail, `old` and anchors are
+matched with all whitespace collapsed and mapped back to a line range
+(the model writes a four-line struct pattern on one line; 13 misses in
+one run), with token boundaries respected and ambiguity an error.
+Review's send-back is a conversion too: `done: true` with findings
+becomes `done: false` plus a handoff to implement, and `next_skill`
+on a tool call becomes the handoff when there are findings, or is
+dropped with a note when there are none. And a filtered
+test is not a verification: the `test` tool notes when a passing cargo
+run filtered tests out (run 44: the target test passed, one arm
+shadowed another, and the suite failure that showed it was never run),
+and review is told to run the unfiltered target before approving. The plan skill's `done` on an empty plan
+is a `Continue` too.
+
+## Green checkpoint
+
+Run 28 landed its unit at committed step 94 (the target test passed, then
+the whole suite) and then spent sixty steps polishing duplicate arms
+until the file no longer parsed. Nothing in the harness had noticed the
+green state. `core/src/green.rs` fixes that: when the `test` tool reports
+`result: pass`, the session snapshots every file the activation has
+edited (paths from successful `edit_file`/`write_file` actions in the
+log; files over 1 MiB are listed as skipped), logs `green_checkpoint`,
+and prefixes the observation with "verification passed at step N ...
+hand off (`done` with `next_skill: review`); cleanup beyond the task is
+review's call". The session tracks the most recent `test` result; at
+every park site (`ask_user`, `yield`, `done`/handoff, retry-cap failure,
+and the driver's autonomous step cap through
+`Active::restore_green_if_stale`) a checkpoint whose pass is no longer
+the latest result is written back to the sandbox, files created after
+it are deleted, `restored_green` is logged, and the park message says
+so. The checkpoint lives in memory for the session (C2) and survives a
+handoff, since review may send the work back to implement. `shell`
+refuses `sed -i`/`perl -i` for the same reason `write_file` refuses
+large existing files: both edit from remembered positions, not from
+the file's current text.
+
+Two more from runs 32-37. Review must look before it approves: the
+harness state counts `tool_calls` per activation, and review's
+`done: true` with none is a `Continue` asking it to read the changed
+files or run the tests (run 32's review approved a diff with duplicated
+arms in one step of 71 tokens). And a transient backend failure is not
+a park: `OllamaModel` retries a 5xx or dropped connection after
+`model.retry_delay_secs` up to `model.retries_on_5xx` times, aborting
+the wait on cancellation, because the runner on the dogfood host
+restarts itself within seconds and four of five audit runs had died on
+its first crash.
+
+## Milestone 12: rule audit
+
+`Guards` (`core/src/guards.rs`) is one `bool` per non-progress rule the
+spec's audit table marks "peel": `redundant_reads` (7.8), `silent_reads`,
+`read_guard`, `redundant_verify` (7.7), `done_stays_done`, and
+`commitment_read_cap`. All default `true`; `Session::with_guards` and the
+CLI's `guards` config section set them. The five session-level rules are
+gated at their existing check sites in `core/src/session.rs`; with
+`commitment_read_cap` off, a read against a set commitment runs and the
+observation gets a one-line "still pending" note instead of a rejection.
+`done_stays_done` lives in the coding skills: `plan_rules` takes the flag,
+each of `PlanSkill`/`ImplementSkill`/`ReviewSkill` carries it (builder
+`with_done_stays_done`), and `coding_skills_configured(delegates, flag)`
+builds the set; `CodingRegistry::with_guards` is the CLI's one entry point.
+With no `guards` section the behaviour is byte-for-byte what it was.
+
+Run 21, the first with the working set, changed the audit's order before
+it started (spec section 10, "Run 21"): the commitment slot could deadlock
+on a call the redundancy rules skip, a `shell`/`test` commitment was
+compared by `path`, and a non-mutating `next` was a rejection when the
+model was using the slot to name its next look. Those three are fixed
+ahead of the switch runs, and done-stays-done is peeled first.
+
+The audit itself (runs 38-43 one per switch, runs 51-65 three per
+switch; tables in the README field notes) left the defaults as they
+are: every switch on except `commitment_read_cap`. Silent reads and the
+read guard are the two whose absence showed (no green in six runs);
+done-stays-done and redundant-verify are the only candidates to peel,
+and only with more runs than the audit had.
 
 ## Testing conventions
 

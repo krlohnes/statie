@@ -114,6 +114,10 @@ statie would actually use and where it came from.
 | `maintainer.budget` | integer | `400` | Token cap on `notes`; the maintainer is told the cap and retried once if it overruns, then the previous notes are kept. |
 | `maintainer.timeout_secs` | integer | `120` | Per-call timeout; a timeout keeps the previous notes and never blocks the step. |
 | `maintainer.prompt_budget` | integer | `4000` | Cap on the maintainer's own prompt (previous notes, state, commitment, patch, action, reasoning, observation; the last two are head/tail truncated to fit). |
+| `thinker` | object or absent | absent | The `think` tool's backend (spec section 10). When present, a `think {question}` call runs a second model call with thinking on and no output schema, handing it the calling step's own prompt plus the question, and returns its conclusion as the tool output and as the workspace's harness-owned `decision`. Absent means the tool answers "not configured" and nothing else changes. |
+| `thinker.model` | object | the top-level `model` | Same shape as `model`; must be an Ollama backend. The `think` flag and `format` are overridden for this call (thinking on, no format). |
+| `thinker.timeout_secs` | integer | `600` | Per-call timeout; a timeout comes back as a `think failed` observation, never a rejection. Thinking runs long on this model (a minute is typical on a 26b Gemma). |
+| `thinker.num_ctx` | integer | `32768` | The reasoning call's own context window, separate from the pinned `model.num_ctx`. Native thinking runs 8k to 11k tokens on this model; in a 16k window shared with a 5k prompt it hit the limit and answered nothing. Ollama reloads the model when `num_ctx` changes, so each `think` costs a reload each way; it fires rarely. |
 | `guards.redundant_reads` | bool | `true` | Rule-audit switch (spec section 10): an identical read since the last edit is skipped and its earlier result shown. `false` re-runs it. |
 | `guards.silent_reads` | bool | `true` | Consecutive reads whose patch wrote nothing are rejected at the cap. `false` never rejects on that ground. |
 | `guards.read_guard` | bool | `true` | Fourth read of one path with no edit between gets a note. `false` disables the note. |
@@ -223,6 +227,7 @@ for the prompt (the full output stays in the session log).
 | (all read/edit tools) | after a successful `read_file`, `edit_file`, `write_file`, or `revert_file` the harness updates the workspace's `seen` list: per file, its length and the line ranges read and edited, with the step; the model reads it before re-reading and cannot patch it |
 | `revert_file` | restore a file to its content from before this session's first `edit_file`/`write_file` of it (a file created this session is removed); the backup lives in `.statie/orig/`, is taken on first modification, cleared on a fresh start, kept on `--resume` |
 | `recall` | search the session log (never the model's reasoning) |
+| `think` | ask a reasoning subagent a question; it sees the caller's whole prompt, thinks with no tools and no schema, and returns a conclusion, which the harness also writes into the workspace's `decision` field (harness-owned, cleared when a test passes). Needs a `thinker` config section; available to `plan`, `implement`, and `review` |
 
 The coding skills: `router` decides where to go, `plan` explores and writes
 a step list, `implement` works the plan with `edit_file`/`write_file` and
@@ -1231,6 +1236,102 @@ either a default or a config knob:
   thinking-off landing rate went 11, 13, 14, 14 of 14 and the
   rejection count 18, 2, 4, 0, with the model, budgets, and window
   fixed throughout.
+
+- **Fifth build: `think` as a tool.** Native thinking is a switch this
+  model cannot budget, and it fights the schema (see the spec, "Thinking
+  as a tool"). So the trace moved out of the acting model: `think
+  {question}` runs a second call with thinking on and no format, its
+  conclusion comes back as the tool output and as the harness-owned
+  `decision` field, and the harness substitutes it once per streak
+  when an edit follows a repeated identical failure. The battery gained
+  an eighth task, `trap_rounding`: a discount line that looks wrong and
+  is not, and a tax rounding constant that is, one cent off. Sixteen
+  runs each, baseline (tool listed, no `thinker` section) against the
+  thinker on.
+
+  | build | landed | done | median steps | rejections | tool errors | mean peak prompt | max peak | minutes |
+  |---|---|---|---|---|---|---|---|---|
+  | build 5, no thinker | 14/16 | 14 | 12.5 | 2 | 5 | 6148 | 7057 | 15 |
+  | build 5, thinker on | 15/16 | 15 | 16 | 10 | 17 | 6372 | 8456 | 21 |
+
+  What the pair showed. `think` fired exactly once in sixteen runs, by
+  the trigger, and never by the model: sixteen runs, including a
+  56-step flail on the trap with six empty `ask_user` calls, and the
+  acting model did not ask once. When it fired, the subagent had been
+  handed the acting model's system prompt verbatim, output contract
+  and all, and imitated it: a `<thoughts>` block, tool calls it
+  cannot make, no `ANSWER:` section, and all 24k characters returned
+  as the answer. Its diagnosis was still right (a missing semicolon and
+  a duplicated body) and the run landed. The trigger watched only
+  edits; on the trap the model re-ran the failing test five times
+  without editing, the exact stuck shape, and nothing fired. The
+  baseline's two misses were a llama-server crash on the first calls
+  of the battery and the trap's second seed, which read the smelly
+  file, could not decide, and parked on empty `ask_user`s. The
+  thinker arm's miss was the rename task's insert-form `edit_file`
+  loop. Its extra rejections and tool errors are all pre-existing
+  shapes (handoff with an open step, `edit_file` with `after` where
+  `old` was meant) at higher frequency; whether the longer tool list
+  causes that is the next pair's question. Fixes from this pair: the
+  subagent gets the user prompt only, with an instruction not to
+  imitate it; a reply without `ANSWER:` returns its tail, not its
+  whole; and the trigger also fires on a `test` re-run with nothing
+  edited and on an empty `ask_user` while a repeated failure is open.
+
+- **Sixth build: the repeat that never counted.** Sixteen runs each,
+  same pair, after the subagent prompt and trigger fixes above.
+
+  | build | landed | done | median steps | rejections | tool errors | mean peak prompt | max peak | minutes |
+  |---|---|---|---|---|---|---|---|---|
+  | build 6, no thinker | 14/16 | 14 | 13 | 2 | 8 | 6118 | 7586 | 16 |
+  | build 6, thinker on | 15/16 | 15 | 13 | 1 | 7 | 6140 | 8125 | 19 |
+
+  Rejections and tool errors are back at baseline levels, so the
+  previous pair's increase was variance, not the longer tool list.
+  Two things this pair found. First, a bug older than the tool: Rust's
+  panic line carries the thread id, `(12100280)` one run and
+  `(12100417)` the next, so two identical assertion failures never
+  normalised to the same summary, and the repeated-failure guard had
+  only ever fired on compile errors. With the id and the `finished in
+  0.00s` timing scrubbed, the guard fired in five baseline runs, seven
+  times on the trap's second seed alone. Second, with the guard now
+  firing, the trigger fired, and every `think` it made came back
+  empty. Reproduced against the server: prompt 5088 tokens, thinking
+  11296 tokens, `done_reason: length`. The trace filled the 16k window
+  and never reached the answer; the manual runs had never hit this
+  because they sent no `num_ctx` and got the model's 262k window. And
+  it fired five times in one run, because each new repeat re-armed it
+  with nothing edited in between. Fixes: the thinker gets its own
+  `num_ctx` (32768 by default), an exhausted window is reported as
+  such, and the trigger re-arms only after an edit.
+
+- **Seventh build: the tool earns its keep on the trap.** Same pair,
+  sixteen runs each, thinker window 32k.
+
+  | build | landed | done | median steps | rejections | tool errors | mean peak prompt | max peak | minutes |
+  |---|---|---|---|---|---|---|---|---|
+  | build 7, no thinker | 14/16 | 14 | 13 | 5 | 7 | 6130 | 7319 | 16 |
+  | build 7, thinker on | 15/16 | 15 | 15 | 5 | 14 | 6358 | 8378 | 22 |
+
+  The trap is where the two arms differ. Without the thinker both
+  seeds parked: one never edited, the other "fixed" the discount line
+  three times and asked the user. With it, both landed, and both runs
+  took the same road: the model fell for the discount smell, edited
+  it, re-ran the failing test twice, the trigger fired once, and the
+  subagent answered in about a hundred characters after seven to nine
+  thousand of reasoning at a 3.5k-token prompt: "In `src/tax.rs`, line
+  3, change `500` to `5000`." The model made that edit and the test
+  passed. Two `think` calls in sixteen runs, one per trap seed, none on
+  the seven ordinary tasks, which is the shape the trigger was built
+  for. The cost is wall time: the trap runs took four to five minutes
+  each against a minute and a half, most of it the reasoning call and
+  the model reload each way for its window. The thinker arm's one miss
+  was the read-loop shape on `add_function` (four skipped re-reads of
+  the same file, then a park), unrelated to the tool; its tool-error
+  count is the insert-form `edit_file` again, concentrated in three
+  runs. Across builds 5 to 7 the trap went 1, 0, 0 of 2 without the
+  thinker and 1, 1, 2 of 2 with it, and the ordinary tasks did not
+  move.
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

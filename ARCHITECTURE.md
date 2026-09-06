@@ -1139,6 +1139,100 @@ substitute a fake that writes a log and a summary line. The fixtures'
 standalone roots; `cli/tests/bench_tasks.rs` checks every task fails as
 shipped and passes with `solution/` overlaid.
 
+## Milestone 14: the `think` tool
+
+Design: statie-spec.md section 10, "Thinking as a tool". Native thinking on
+this model is a switch with no budget, it doubles wall time on every step,
+and once a thinking block precedes the answer the server stops enforcing
+the output schema (or, with a schema attached, returns nothing at all on
+some seeds). Manual runs against a trap fixture showed the trace itself is
+what finds a bug the pattern match misses, and that it is reliable only
+with the schema off and room to run. So thinking becomes a tool call: the
+acting model keeps thinking off and the schema on; the thought runs as a
+separate call with thinking on and no format; its conclusion comes back as
+an observation and is written into a harness-owned field.
+
+### Types (`core/src/thinker.rs`)
+
+- `Thinker::think(ThinkInput{system, user, question}, cancel) ->
+  Result<ThinkOutput, ThinkError>`. The input is the calling step's own
+  prompt, verbatim, plus the question. `ModelThinker` sends only the
+  user half: the first live battery showed that quoting the worker's
+  system prompt, output contract and all, makes the subagent imitate it
+  (`<thoughts>` tags, tool calls it cannot make, no `ANSWER:`). The user
+  prompt is framed as "everything the acting model currently sees",
+  followed by the question and an instruction to reply in prose and end
+  with an `ANSWER:` section of at most ten lines. Output: `answer` (the
+  text after the last `ANSWER:` marker; without one, the last 1500
+  characters behind a "(no ANSWER section…)" prefix, never the whole
+  reply), `reasoning_chars`, `content_chars`, usage. A `<thoughts>` block
+  in the content is stripped first (`strip_thoughts`).
+- `ThinkError::{Backend, Timeout, Empty}`. `MockThinker` (scripted,
+  records every call) for tests. `THINK_SYSTEM_PROMPT` is the fixed system
+  prompt every backend uses: no tools, trace concrete inputs with exact
+  arithmetic, change your mind if the numbers say so, end with `ANSWER:`.
+- `ModelThinker` (`statie-models`) drives `OllamaModel::chat_free`, a
+  second entry point on the Ollama client that sends `think: true` and
+  never a `format` key, under a timeout.
+
+### Tool and session
+
+`think {question}` is registered in `default_tools` so it renders in the
+tool list with its schema, but its registry `call` errors: the session
+intercepts the name before dispatch. It keeps a copy of each step's
+rendered prompt, calls the thinker with it and the question, and the tool
+output is `question: …\nanswer:\n…`. No thinker configured, an invalid
+question, or a backend error each become an observation ("`think` is not
+configured…", the usual invalid-args text, "think failed: …"), never a
+rejection. A `System` entry `{"event":"think", question, configured,
+reasoning_chars, content_chars, answer_chars, prompt_tokens, error}` is
+logged every time. `HarnessState.last_think_step` records the step of the
+most recent `think` call, configured or not; the trigger below reads it.
+Otherwise a `think` step is an ordinary tool step: it counts in
+`tool_calls`, the identical-call guard applies, the maintainer runs after
+it, and it is neither read-only nor mutating.
+
+### `decision` (skills)
+
+The coding workspace's `decision: Option<{question, answer, step}>` is
+harness-owned like `seen`: `after_tool` writes it from a `think` output
+(answer capped at 1200 chars), clears it when a `test` passes, and a model
+patch naming it is stripped with a note. The acting model reads it and
+cannot re-litigate it after eviction. `think` is available to `plan`,
+`implement`, and `review`, not `router`.
+
+### Trigger
+
+On the trap fixture the acting model was unanimous and wrong; it would
+never have asked. So `HarnessState.repeated_failure_step` records the
+step of a `test` call whose failure was identical to the previous run's
+(cleared by a pass or a different failure), and `ImplementSkill::validate`
+converts the model's next stuck move into `think` with a fixed question
+("The test failed the same way after my last edit. Trace the failing
+test's input through the code with exact arithmetic … which function is
+actually wrong, and what is the exact change to make?") plus a note
+naming the shape, at most once per streak: it fires only while
+`last_think_step` is older than the repeat. Three shapes count as stuck:
+an `edit_file`/`write_file`; a `test` re-run with `edits_since_test == 0`;
+and an `ask_user` with no `?` (which takes precedence over the empty-ask
+conversions). The model's own `think`, reads, a real question, and a
+`test` after an edit are untouched; `plan` and `review` have no trigger.
+The repeat itself is detected by `normalize_failure_summary`, which now
+scrubs the parenthesised thread id from Rust's panic line and `finished
+in 0.00s` timings: before that, two identical assertion failures never
+compared equal, and the guard had only ever fired on compile errors.
+
+### Config
+
+`thinker: {model?, timeout_secs, num_ctx}` in the CLI config, absent by
+default; `model` defaults to the top-level model and must be an Ollama
+backend. `num_ctx` (default 32768) is the reasoning call's own window,
+the one deliberate exception to the pinned session `num_ctx`: the trace
+runs 8k to 11k tokens on this model and exhausted a 16k window shared
+with the prompt (`done_reason: length`, no content). The trigger re-arms
+only after an edit since the last `think`, so a streak of repeats with
+nothing changed costs one call, not one per repeat.
+
 ## Testing conventions
 
 - Unit tests live beside code (`#[cfg(test)]`). Integration tests in `<crate>/tests/`.

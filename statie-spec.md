@@ -805,6 +805,49 @@ reads it before re-reading and cannot patch it. Eviction and clearing
 are the hook's, not the model's. Whether it lowers steps or peak
 prompt is a bench question, answered against the baseline above.
 
+### Thinking as a tool
+
+Native thinking on Gemma 4 is a switch, not a dial: `think` levels are
+accepted by Ollama and ignored by the Gemma renderer (verified against
+the server and the renderer source), the trace has no budget, and once
+a thinking block precedes the answer the server stops enforcing the
+output schema; with a schema attached, some seeds return nothing at
+all. Manual runs on a trap fixture (a discount line that looks wrong
+and is not, a tax rounding constant that is) settled what the trace is
+for: direct answers pattern-matched the smell 9 times in 10; native
+thinking found the real bug every time it completed and completed half
+the time under a schema; the same reasoning run without a schema
+completed 8 of 8, and a short acting call given its conclusion as a
+tool observation landed the edit 6 of 8. What the trace buys is the
+"wait" moment where the model recomputes a value it got wrong the
+first time, and that moment needs room and no grammar.
+
+So thinking is a tool. `think {question}` runs a second model call with
+thinking on and no format, whose prompt is the calling step's own
+prompt verbatim plus the question, and whose conclusion (the text after
+its `ANSWER:` marker) comes back as the tool output. The acting model
+keeps thinking off and the schema on. The harness writes the conclusion
+into a harness-owned `decision` field so it survives eviction and the
+model cannot re-litigate it, and clears it when a test passes. The
+model may call it; the harness also substitutes it once per failure
+streak when an edit follows a repeated identical test failure, since on
+the trap the direct samples were unanimous and wrong and would never
+have asked, and re-arms only after an edit. The reasoning call gets its
+own context window (the trace runs 8k to 11k tokens here; in the
+session's 16k window it ran out before answering), the one deliberate
+exception to the pinned `num_ctx`. Cost is one long call where it fires
+and nothing where it does not; the battery must not slow down.
+
+Measured (README field notes, builds 5 to 7): on the trap task the
+thinker arm went from parked on both seeds to landed on both, each by
+one triggered call whose answer named the file, the line, and the
+constant; the seven ordinary tasks made no `think` calls and did not
+move. Two calls in sixteen runs. Three things had to be true first,
+each found by a battery: the subagent must not be shown the acting
+model's output contract, the repeated-failure guard must scrub the
+thread id from Rust's panic line, and the reasoning call needs a
+window the trace fits in.
+
 ## 11. Model backends
 
 ### First target: Gemma 4 on Ollama
@@ -864,3 +907,17 @@ skillstate/
 - ~~Whether `recent_summary` should be model-owned only or harness-seeded with the last N action names.~~ Resolved by section 9: `recent_summary` stays model-owned; the harness keeps its own `notes` through the maintainer.
 - Whether inbox acks are explicit patch fields or inferred from the model referencing an inbox id in its action.
 - Embedding backend for augmentation once BM25 hits its limit (Ollama `/api/embed` is the obvious first choice).
+- Structured thinking patterns. The `think` tool (section 10) hosts the
+  model's native chain of thought as a subagent call and returns a
+  conclusion. What it does not do is shape the thought. Manual runs against
+  the trap fixture showed the shape matters: forced value-tracing in
+  structured fields found the bug 2/5, a free scratch field 6/8 on
+  diagnosis but 2/8 on the edit that followed, hypotheses-then-verify 5/5
+  with cargo as the judge, native thinking 5/5 when it completed. Patterns
+  worth designing later, as distinct tools or as modes of `think`: trace
+  (walk a concrete input through the code, one value per step), hypotheses
+  (k concrete candidate fixes, each applied and tested in the sandbox, the
+  passing one kept), options (design choices with trade-offs, verdict
+  stored, no tool can judge), and a separate acting call after any of them
+  so the hands are never the same call as the thought. A different topic
+  from the tool itself; parked here on purpose.

@@ -59,6 +59,7 @@ mod sandbox;
 mod session;
 mod skill;
 mod store;
+mod thinker;
 mod tokenizer;
 mod tool;
 mod version;
@@ -105,6 +106,10 @@ pub use skill::{
     validate_default,
 };
 pub use store::{ApplyFn, LoggedPatch, StateStore, apply_fn};
+pub use thinker::{
+    MockThinker, THINK_SYSTEM_PROMPT, ThinkCall, ThinkError, ThinkInput, ThinkOutput, Thinker,
+    extract_answer,
+};
 pub use tokenizer::{Budgets, HeuristicTokenizer, TiktokenTokenizer, TokenBudget, Tokenizer};
 pub use tool::{Tool, ToolCtx, ToolList, ToolSet};
 pub use version::{Committed, CommittedState, HarnessState, InboxItem, Pinned, Version};

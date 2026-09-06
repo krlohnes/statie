@@ -9,10 +9,12 @@ mod maintainer;
 mod mock;
 mod ollama;
 mod openai;
+mod thinker;
 mod thoughts;
 
 pub use maintainer::ModelMaintainer;
 pub use mock::{MockModel, MockTurn, RecordedPrompt};
-pub use ollama::{OllamaConfig, OllamaFormat, OllamaModel};
+pub use ollama::{FreeReply, OllamaConfig, OllamaFormat, OllamaModel};
 pub use openai::{OpenAiCompatConfig, OpenAiCompatModel};
+pub use thinker::ModelThinker;
 pub use thoughts::strip_thoughts;

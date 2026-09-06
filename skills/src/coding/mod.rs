@@ -121,6 +121,11 @@ pub struct CodingWorkspace {
     /// before re-reading a file; you cannot patch it.
     #[serde(default)]
     pub seen: Vec<SeenFile>,
+    /// The reasoning subagent's most recent conclusion, from your last
+    /// `think` call. Read it and act on it; you cannot patch it. Cleared by
+    /// the harness when a test passes.
+    #[serde(default)]
+    pub decision: Option<Decision>,
 }
 
 /// One entry of `CodingWorkspace::seen` (milestone 10): what the harness
@@ -149,6 +154,21 @@ pub struct SeenFile {
     pub edited: Vec<[u32; 2]>,
     /// The harness step of the most recent change recorded for this entry.
     #[serde(default)]
+    pub step: u64,
+}
+
+/// One entry of `CodingWorkspace::decision`: the reasoning subagent's most
+/// recent conclusion from a `think` tool call, written by the harness (see
+/// `common_after_tool`'s handling of the `think` tool) and cleared when a
+/// `test` call passes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Decision {
+    /// The question the model asked `think`.
+    pub question: String,
+    /// The subagent's conclusion (truncated to 1200 chars with a trailing
+    /// " …[truncated]" marker if longer).
+    pub answer: String,
+    /// Harness step at which it was recorded.
     pub step: u64,
 }
 
@@ -242,15 +262,18 @@ fn common_commitment(ws: &CodingWorkspace) -> Option<Commitment> {
 /// `harness_owned_fields` shared by every coding skill: `notes` (maintained
 /// by the harness's `Maintainer` call after each step, see statie-spec.md
 /// "9. Context maintenance"), `reports` (written by `absorb_report` after
-/// a `delegate` action), and `seen` (milestone 10, written by `Skill::
+/// a `delegate` action), `seen` (milestone 10, written by `Skill::
 /// after_tool` after a `read_file`/`edit_file`/`write_file`/`revert_file`
-/// call) are never model-patchable. Checked uniformly by `validate_default`
-/// against every action.
+/// call), and `decision` (written by `Skill::after_tool` from a `think`
+/// call's output, cleared on a passing `test`; see `common_after_tool`) are
+/// never model-patchable. Checked uniformly by `validate_default` against
+/// every action.
 fn common_harness_owned_fields() -> Vec<String> {
     vec![
         "notes".to_string(),
         "reports".to_string(),
         "seen".to_string(),
+        "decision".to_string(),
     ]
 }
 
@@ -411,11 +434,41 @@ fn count_lines(text: &str) -> u32 {
     n as u32
 }
 
+/// Longer than this, a `think` answer is truncated with a trailing
+/// `" …[truncated]"` marker (see `Decision::answer`'s doc).
+const DECISION_ANSWER_CAP: usize = 1200;
+
+/// Truncation marker appended to an over-cap `think` answer.
+const DECISION_TRUNCATED_MARKER: &str = " …[truncated]";
+
+/// Truncates `answer` to `DECISION_ANSWER_CAP` characters (char-boundary
+/// safe) with a trailing `DECISION_TRUNCATED_MARKER` if it's longer;
+/// returned unchanged otherwise.
+fn truncate_decision_answer(answer: &str) -> String {
+    if answer.chars().count() <= DECISION_ANSWER_CAP {
+        return answer.to_string();
+    }
+    let truncated: String = answer.chars().take(DECISION_ANSWER_CAP).collect();
+    format!("{truncated}{DECISION_TRUNCATED_MARKER}")
+}
+
+/// Parses a `think` tool's success output (`"question: <question>\nanswer:\n
+/// <answer text>"`, see this crate's `think` handling in `common_after_tool`)
+/// into `(question, answer)`. Returns `None` for the two non-conclusion
+/// shapes (a leading "`think` is not configured" or "think failed:" text)
+/// or anything else that doesn't match the expected header.
+fn parse_think_output(output: &str) -> Option<(String, String)> {
+    let question = output.strip_prefix("question: ")?;
+    let (question, rest) = question.split_once("\nanswer:\n")?;
+    Some((question.to_string(), rest.to_string()))
+}
+
 /// `Skill::after_tool` shared by `plan`/`implement`/`review`: maintains
 /// `CodingWorkspace::seen` from a successfully executed `read_file`,
-/// `edit_file`, `write_file`, or `revert_file` call. Any other tool
-/// (`search`, `list_files`, `shell`, `test`, `recall`,
-/// `filter_last_tool_call`) returns `None` -- nothing to record.
+/// `edit_file`, `write_file`, or `revert_file` call, and
+/// `CodingWorkspace::decision` from a `think` call (set) or a passing
+/// `test` call (cleared). Any other tool (`search`, `list_files`, `shell`,
+/// `recall`, `filter_last_tool_call`) returns `None` -- nothing to record.
 fn common_after_tool(
     ws: &CodingWorkspace,
     step: u64,
@@ -423,6 +476,24 @@ fn common_after_tool(
     args: &serde_json::Value,
     output: &str,
 ) -> Option<Patch> {
+    if name == "think" {
+        let (question, answer) = parse_think_output(output)?;
+        return Some(serde_json::json!({
+            "decision": {
+                "question": question,
+                "answer": truncate_decision_answer(&answer),
+                "step": step,
+            }
+        }));
+    }
+
+    if name == "test" {
+        if ws.decision.is_some() && statie_core::is_pass(output) {
+            return Some(serde_json::json!({ "decision": null }));
+        }
+        return None;
+    }
+
     let mut seen = ws.seen.clone();
 
     match name {
@@ -664,6 +735,182 @@ enum Reason {
     NonMutating(String),
     EmptyWhat,
     MissingPath(String),
+}
+
+/// The question the harness asks `think` on the model's behalf when
+/// [`implement_repeat_failure_thinks`] fires.
+pub const REPEAT_FAILURE_QUESTION: &str = "The test failed the same way after my last edit. \
+     Trace the failing test's input through the code with exact arithmetic, checking every \
+     intermediate value against what the test expects: which function is actually wrong, and \
+     what is the exact change to make?";
+
+/// `implement`-only: a bench trap fixture showed the acting model unanimous
+/// and wrong -- every edit it tried addressed the wrong function, the test
+/// failed identically after each one, and the model never called `think` on
+/// its own to break out of the loop. Telling it to "think harder" via a note
+/// does not work (the repeated-failure guard's own note in `Session::
+/// note_test_result`, `core/src/session.rs`, already says as much); running
+/// the reasoning subagent for it, the same way `implement_no_green_runs_test`
+/// runs `test` for it, does.
+///
+/// A first live battery run against the trap fixture showed a second stuck
+/// shape the original (edit-only) trigger never caught: the model re-ran the
+/// failing test five times running with nothing edited in between, instead
+/// of editing again -- so the trigger, keyed on the next `edit_file`/
+/// `write_file`, never fired at all. A third shape observed in the same
+/// battery: with a repeat open, the model sent `ask_user` with no `?` (a
+/// statement of intent, not a question) instead of either editing or
+/// thinking -- `ask_user_empty_note`/`ask_user_statement_note` would
+/// otherwise just convert that into a `Continue` note and leave the loop
+/// unbroken. This function now fires on all three shapes, with the same
+/// `repeated_failure_step`/`last_think_step` gating and the same `think`
+/// substitution, differing only in which action it fires on and the note's
+/// wording (each explains what was replaced and why).
+///
+/// Called in `ImplementSkill::validate` right after `strip_malformed_next`
+/// and before the `done`-handling chain (`green_done_note`/
+/// `implement_bare_done`/`implement_no_green_runs_test`/
+/// `premature_done_note`, the latter of which falls through to
+/// `ask_user_empty_note`/`ask_user_statement_note` for a non-`Done` action):
+/// those all key off action `Done` or `AskUser`, so running this function
+/// first means its `think` substitution is always seen before the
+/// done/ask_user conversions -- in particular, an `ask_user` this function
+/// replaces is a `Tool { name: "think", .. }` by the time
+/// `premature_done_note` runs, so the empty-ask/statement-ask conversions
+/// never see the original `ask_user` and cannot re-convert it.
+///
+/// Fires when both of these hold:
+/// - `cur.harness.repeated_failure_step` (`core/src/version.rs`) is
+///   `Some(t)`: the most recent `test` call failed identically to the one
+///   before it.
+/// - Either `cur.harness.last_think_step` is `None` (no `think` call has run
+///   at all since that repeat was detected), or it is `Some(s)` with `s <
+///   t` AND `cur.agent.seen` (`CodingWorkspace::seen`) has some entry whose
+///   `edited` is non-empty with `step > s` -- i.e. the model has actually
+///   edited something since that last `think` call. `last_think_step` is
+///   set unconditionally by every `think` call, configured or not
+///   (`core/src/session.rs`'s `execute_think`), so without the edit check
+///   this fired again on every later stuck action in the same streak: a
+///   second live battery showed the model re-run the same failing test five
+///   times running with nothing edited in between, and each repeat re-armed
+///   the trigger (`last_think_step` stayed behind `repeated_failure_step`
+///   forever) even though the reasoning subagent had already answered once
+///   and nothing new had happened for it to say anything different about --
+///   all five calls came back empty (see `ModelThinker::think`'s
+///   `done_reason: "length"` handling). Requiring an edit since the last
+///   `think` means a bare repeat of the same stuck action gets left alone
+///   once one `think` call has already run for it.
+///
+/// ...and `out.action()` is one of:
+/// - `Action::Tool { name, .. }` with `name` one of `edit_file`/
+///   `write_file` -- the model is about to make another blind edit.
+/// - `Action::Tool { name: "test", .. }` with `cur.harness.edits_since_test
+///   == 0` -- the model is re-running the same failing test with nothing
+///   edited since (seen in the live battery: five identical `test` calls
+///   running, no edit between any of them). `edits_since_test > 0` (a real
+///   edit happened since the last `test`) is left alone; that is
+///   `implement_no_green_runs_test`'s and the model's own territory, not a
+///   stuck shape.
+/// - `Action::AskUser { message }` where `message` contains no `?` -- the
+///   same shape `ask_user_empty_note`/`ask_user_statement_note` convert to a
+///   `Continue` note, except a repeated failure is open, so a reasoning
+///   call is more useful than a note the model has already shown it does
+///   not act on.
+///
+/// A `think` call, a read, a `test` with edits since the last one, a real
+/// question to the user, or `done` are all left alone; `plan`/`review` never
+/// call this function at all.
+///
+/// Effect: the action is replaced with `Action::Tool { name: "think", args:
+/// {"question": REPEAT_FAILURE_QUESTION} }`. For the edit and `test` shapes,
+/// the raw patch is left exactly as the model sent it (the model's action
+/// was already a tool call, so there is no `done`/`next_skill` to strip);
+/// for the `ask_user` shape, `next_skill` is stripped from the raw patch
+/// first, the same as `ask_user_empty_note`/`ask_user_statement_note` do,
+/// since a stray `next_skill` left over from an `ask_user` step would make
+/// `core/src/session.rs`'s step 7.5 reject the now-non-`Done` step. The
+/// session runs this `think` call like any other (`core/src/session.rs`'s
+/// `Active::execute` intercepts `name == "think"` before dispatch), which
+/// writes `CodingWorkspace::decision` (`common_after_tool`'s `think`
+/// handling) from its answer -- so the model's NEXT step sees the
+/// subagent's conclusion in both the tool observation and `decision`, and
+/// can act on it instead of repeating the same wrong edit, the same idle
+/// test rerun, or the same unanswerable non-question a third time.
+///
+/// A patch that fails to deserialize/apply is not relevant here (this
+/// function never inspects the merged workspace) -- always returns a note
+/// when the conditions above hold.
+fn implement_repeat_failure_thinks(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    enum Shape {
+        Edit,
+        IdleTest,
+        NonQuestionAsk,
+    }
+
+    let shape = match out.action() {
+        statie_core::Action::Tool { name, .. } if name == "edit_file" || name == "write_file" => {
+            Shape::Edit
+        }
+        statie_core::Action::Tool { name, .. }
+            if name == "test" && cur.harness.edits_since_test == 0 =>
+        {
+            Shape::IdleTest
+        }
+        statie_core::Action::AskUser { message } if !message.contains('?') => Shape::NonQuestionAsk,
+        _ => return None,
+    };
+
+    let repeat_step = cur.harness.repeated_failure_step?;
+    if let Some(think_step) = cur.harness.last_think_step {
+        if think_step >= repeat_step {
+            return None;
+        }
+        // A `think` call has already run since the repeat was detected (but
+        // before it), so only re-arm once the model has actually edited
+        // something since that call -- otherwise this is the same stuck
+        // action the subagent already answered once, and calling it again
+        // would just ask the same question (see the doc comment above).
+        let edited_since = cur
+            .agent
+            .seen
+            .iter()
+            .any(|f| f.step > think_step && !f.edited.is_empty());
+        if !edited_since {
+            return None;
+        }
+    }
+
+    if matches!(shape, Shape::NonQuestionAsk)
+        && let Some(obj) = out.patch_mut().0.as_object_mut()
+    {
+        obj.remove("next_skill");
+    }
+
+    out.set_action(statie_core::Action::Tool {
+        name: "think".to_string(),
+        args: serde_json::json!({"question": REPEAT_FAILURE_QUESTION}),
+    });
+
+    Some(match shape {
+        Shape::Edit => "your last edit did not change the test failure, so the harness asked the \
+             reasoning subagent first (its conclusion is below, and in `decision`). Act on \
+             it: if it names a different cause, fix that; if it agrees with you, make your \
+             edit."
+            .to_string(),
+        Shape::IdleTest => {
+            "you re-ran the test with nothing edited, so the harness asked the reasoning \
+             subagent instead (its conclusion is below, and in `decision`). Act on it."
+                .to_string()
+        }
+        Shape::NonQuestionAsk => {
+            "you had nothing to ask and a repeated test failure is open, so the harness asked \
+             the reasoning subagent (its conclusion is below, and in `decision`). Act on it."
+                .to_string()
+        }
+    })
 }
 
 /// Applies `out`'s raw patch to `cur` the same way `strip_malformed_next`
@@ -2053,6 +2300,7 @@ impl Skill for PlanSkill {
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
             "test".to_string(),
+            "think".to_string(),
         ]
     }
 
@@ -2316,6 +2564,9 @@ impl Skill for ImplementSkill {
              - Keep `files` and `recent_summary` up to date as you go.\n\
              - `notes` is kept by the harness from your previous reasoning: read it \
                before deciding; you cannot patch it.\n\
+             - `think` asks a reasoning subagent that sees what you see; use it when a \
+               fix did not change the failure or you cannot tell which cause is real, \
+               then act on its `decision`.\n\
              - If you are blocked (missing information only the user can give you), use \
                action `ask_user` rather than guessing -- it is the only way to pause; \
                `yield` is rejected in this skill.\n\n\
@@ -2348,6 +2599,7 @@ impl Skill for ImplementSkill {
             "test".to_string(),
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
+            "think".to_string(),
         ]
     }
 
@@ -2450,7 +2702,16 @@ impl Skill for ImplementSkill {
     /// being rejected outright. Then strips a malformed `next` (see
     /// `strip_malformed_next`) before `validate_default` runs, attaching the
     /// note it returns to the resulting `ValidatedStep`. Then
-    /// `implement_done_not_ours_strip`: whenever the raw patch would commit
+    /// `implement_repeat_failure_thinks`: with a repeated test failure open
+    /// and no `think` since, an edit, an idle test rerun, or a non-question
+    /// `ask_user` is replaced with a `think` call instead (see its doc for
+    /// the three shapes). This runs deliberately early -- before
+    /// `implement_done_not_ours_strip` and the `done`/`ask_user` chain below
+    /// -- so an `ask_user` it replaces is already `Tool { name: "think",
+    /// .. }` by the time `premature_done_note`'s fallthrough to
+    /// `ask_user_empty_note`/`ask_user_statement_note` would otherwise see
+    /// and re-convert it. Then `implement_done_not_ours_strip`: whenever the
+    /// raw patch would commit
     /// `done: true`, that key is removed before any of the conversions below
     /// run -- `done` is never `implement`'s to set, only `review`'s (see
     /// that function's doc for why this only strips the key and returns a
@@ -2494,6 +2755,7 @@ impl Skill for ImplementSkill {
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
         let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let strip_note = strip_malformed_next(&cur.agent, &mut out);
+        let repeat_think_note = implement_repeat_failure_thinks(cur, &mut out);
         let not_ours_note = implement_done_not_ours_strip(&cur.agent, &mut out);
         let mut extra_note = None;
         if let Some(note) = green_done_note(cur, &mut out) {
@@ -2522,6 +2784,7 @@ impl Skill for ImplementSkill {
         let notes: Vec<String> = owned_notes
             .into_iter()
             .chain(strip_note)
+            .chain(repeat_think_note)
             .chain(not_ours_note)
             .chain(extra_note)
             .collect();
@@ -2607,6 +2870,7 @@ impl Skill for ReviewSkill {
             "test".to_string(),
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
+            "think".to_string(),
         ]
     }
 

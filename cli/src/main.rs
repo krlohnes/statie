@@ -493,6 +493,7 @@ async fn run_coding(
     let tools = statie_tools::default_tools(&cfg.tools);
     let tokenizer = Box::new(TiktokenTokenizer);
     let maintainer = cfg.build_maintainer()?;
+    let thinker = cfg.build_thinker()?;
 
     let session_config = SessionConfig {
         budgets: cfg.effective_budgets(),
@@ -522,6 +523,9 @@ async fn run_coding(
     );
     if let Some(m) = maintainer {
         session = session.with_maintainer(m);
+    }
+    if let Some(t) = thinker {
+        session = session.with_thinker(t);
     }
     session = session.with_working_set(cfg.working_set.into());
     session = session.with_guards(cfg.guards);

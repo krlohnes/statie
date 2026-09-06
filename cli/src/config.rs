@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use statie_core::{Guards, Maintainer, SessionLog, StateStore, TiktokenTokenizer};
+use statie_core::{Guards, Maintainer, SessionLog, StateStore, Thinker, TiktokenTokenizer};
 use statie_models::{
-    MockModel, MockTurn, ModelMaintainer, OllamaConfig, OllamaFormat, OllamaModel,
+    MockModel, MockTurn, ModelMaintainer, ModelThinker, OllamaConfig, OllamaFormat, OllamaModel,
     OpenAiCompatConfig, OpenAiCompatModel,
 };
 use statie_skills::ChildSkillConfig;
@@ -43,6 +43,11 @@ pub struct Config {
     /// Absent (the default) means no maintainer is attached and the loop
     /// behaves exactly as it did before this feature existed.
     pub maintainer: Option<MaintainerConfig>,
+    /// The `think` tool's reasoning backend. Absent (the default) means no
+    /// thinker is attached: a `think` call still commits, but its output
+    /// tells the model `think` is not configured (see
+    /// `Session::with_thinker`).
+    pub thinker: Option<ThinkerConfig>,
     /// Working-set config (statie-spec.md "10. Working set"): recent tool
     /// calls and read/search windows kept in front of the model.
     /// `max_windows: 0` disables the section.
@@ -69,6 +74,7 @@ impl Default for Config {
             max_autonomous_steps: 200,
             subagents: BTreeMap::new(),
             maintainer: None,
+            thinker: None,
             working_set: WorkingSetConfigEntry::default(),
             guards: Guards::default(),
         }
@@ -121,6 +127,37 @@ impl Default for MaintainerConfig {
             budget: 400,
             timeout_secs: 120,
             prompt_budget: 4000,
+        }
+    }
+}
+
+/// The `think` tool's reasoning backend config. `model` defaults to the
+/// top-level `model` when omitted, the same as `MaintainerConfig::model`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThinkerConfig {
+    pub model: Option<ModelConfig>,
+    pub timeout_secs: u64,
+    /// Context window sent on the reasoning call, separate from the
+    /// session's pinned `model.num_ctx`: a second live battery reproduced
+    /// every `think` call coming back empty because native thinking on the
+    /// configured model routinely runs 8k-11k tokens, and the session's
+    /// 16384 `num_ctx` shared between the prompt and that trace left no
+    /// room -- the model hit the context limit (`done_reason: "length"`)
+    /// before ever emitting content. The trace needs room the acting model
+    /// does not. Ollama reloads the model whenever a request's `num_ctx`
+    /// differs from the last one, so every `think` call costs a reload each
+    /// way (into this window, then back to `model.num_ctx` for the next
+    /// acting-model step); acceptable because `think` fires rarely.
+    pub num_ctx: u32,
+}
+
+impl Default for ThinkerConfig {
+    fn default() -> Self {
+        ThinkerConfig {
+            model: None,
+            timeout_secs: 600,
+            num_ctx: 32768,
         }
     }
 }
@@ -469,6 +506,37 @@ impl Config {
             Duration::from_secs(m.timeout_secs),
         );
         Ok(Some(Arc::new(maintainer)))
+    }
+
+    /// Builds the `think` tool's reasoning backend from `self.thinker`.
+    /// `None` when the section is absent -- `think` calls then report
+    /// themselves as unconfigured instead of parking, exactly as before
+    /// this feature existed. `thinker.model` is built when given, else the
+    /// top-level `model` is reused, mirroring `build_maintainer`. Only the
+    /// Ollama backend is supported (`ModelThinker` is built directly from
+    /// an `OllamaModel`, not the `Arc<dyn Model>` trait object
+    /// `build_model_from` returns for other backends): a `thinker.model`
+    /// (or, absent that, top-level `model`) with any other backend is a
+    /// named error. The resolved model config's `num_ctx` is overridden by
+    /// `thinker.num_ctx` -- the reasoning call gets its own context window,
+    /// separate from the acting model's pinned `model.num_ctx` (see
+    /// `ThinkerConfig::num_ctx`'s doc).
+    pub fn build_thinker(&self) -> anyhow::Result<Option<Arc<dyn Thinker>>> {
+        let Some(t) = &self.thinker else {
+            return Ok(None);
+        };
+        let model_cfg = t.model.as_ref().unwrap_or(&self.model);
+        if model_cfg.backend != "ollama" {
+            anyhow::bail!(
+                "thinker requires the ollama backend (got `{}`)",
+                model_cfg.backend
+            );
+        }
+        let mut ollama_cfg = ollama_config(model_cfg);
+        ollama_cfg.num_ctx = t.num_ctx;
+        let model = OllamaModel::new(ollama_cfg)?;
+        let thinker = ModelThinker::new(Arc::new(model), Duration::from_secs(t.timeout_secs));
+        Ok(Some(Arc::new(thinker)))
     }
 
     /// Resolves `self.store.path` and `self.session_log` against the
@@ -1218,6 +1286,79 @@ mod tests {
         .unwrap();
         let maintainer = cfg.build_maintainer().unwrap();
         assert!(maintainer.is_some());
+    }
+
+    #[test]
+    fn thinker_section_parses_and_fills_in_defaults() {
+        let cfg: Config = serde_json::from_str(r#"{"thinker":{"timeout_secs":30}}"#).unwrap();
+        let t = cfg.thinker.expect("thinker section should parse");
+        assert_eq!(t.timeout_secs, 30);
+        assert!(t.model.is_none());
+        assert_eq!(t.num_ctx, 32768, "thinker.num_ctx must default to 32768");
+    }
+
+    #[test]
+    fn thinker_num_ctx_defaults_and_parses_explicit_value() {
+        let cfg: Config = serde_json::from_str(r#"{"thinker":{}}"#).unwrap();
+        let t = cfg.thinker.expect("thinker section should parse");
+        assert_eq!(t.num_ctx, 32768);
+
+        let cfg: Config = serde_json::from_str(r#"{"thinker":{"num_ctx":65536}}"#).unwrap();
+        let t = cfg.thinker.expect("thinker section should parse");
+        assert_eq!(t.num_ctx, 65536);
+    }
+
+    /// The thinker's `num_ctx` must win over the (possibly much smaller)
+    /// session `model.num_ctx` when the Ollama backend is built -- this is
+    /// the fix for the second live battery's every-`think`-call-empty
+    /// failure (the reasoning trace exhausted a 16384 window shared with the
+    /// session's model).
+    #[test]
+    fn thinker_num_ctx_overrides_model_num_ctx_in_built_ollama_config() {
+        let text = serde_json::json!({
+            "model": {"backend": "ollama", "num_ctx": 16384},
+            "thinker": {"num_ctx": 65536}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let t = cfg.thinker.as_ref().expect("thinker section should parse");
+        let model_cfg = t.model.as_ref().unwrap_or(&cfg.model);
+        let mut ollama_cfg = ollama_config(model_cfg);
+        ollama_cfg.num_ctx = t.num_ctx;
+        assert_eq!(
+            ollama_cfg.num_ctx, 65536,
+            "must carry the thinker's num_ctx, not the model's"
+        );
+        assert_ne!(ollama_cfg.num_ctx, cfg.model.num_ctx);
+    }
+
+    #[test]
+    fn absent_thinker_section_builds_none() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.thinker.is_none());
+        let thinker = cfg.build_thinker().unwrap();
+        assert!(thinker.is_none());
+    }
+
+    #[test]
+    fn present_thinker_section_builds_some_with_ollama_backend() {
+        let cfg: Config = serde_json::from_str(r#"{"thinker":{"timeout_secs":30}}"#).unwrap();
+        // Top-level model defaults to backend "ollama", so this should build.
+        let thinker = cfg.build_thinker().unwrap();
+        assert!(thinker.is_some());
+    }
+
+    #[test]
+    fn thinker_with_non_ollama_backend_errors() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"model":{"backend":"mock"},"thinker":{"timeout_secs":30}}"#)
+                .unwrap();
+        let result = cfg.build_thinker();
+        let err = match result {
+            Ok(_) => panic!("expected an error for a non-ollama thinker backend"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("ollama"), "{err}");
     }
 
     #[test]

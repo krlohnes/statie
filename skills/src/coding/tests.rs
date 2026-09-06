@@ -9,9 +9,10 @@ use statie_core::{
 use statie_patch::JsonMergePatch;
 
 use super::{
-    CodingWorkspace, FileNote, ImplementSkill, PlanSkill, PlanStep, ReviewSkill, RouterSkill,
-    SeenFile, StepStatus, coding_skills, coding_skills_with_delegates, common_after_tool,
-    count_lines, has_named_handoff, merge_range, parse_edit_header, parse_revert_lines, seen_entry,
+    CodingWorkspace, Decision, FileNote, ImplementSkill, PlanSkill, PlanStep, ReviewSkill,
+    RouterSkill, SeenFile, StepStatus, coding_skills, coding_skills_with_delegates,
+    common_after_tool, count_lines, has_named_handoff, merge_range, parse_edit_header,
+    parse_revert_lines, seen_entry,
 };
 
 fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
@@ -29,6 +30,8 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             tool_calls: 0,
             last_test_cmd: None,
             edits_since_test: 0,
+            last_think_step: None,
+            repeated_failure_step: None,
         },
         agent,
     }
@@ -1316,6 +1319,7 @@ fn tools_exact_per_skill() {
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
             "test".to_string(),
+            "think".to_string(),
         ])
     );
 
@@ -1332,6 +1336,7 @@ fn tools_exact_per_skill() {
             "test".to_string(),
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
+            "think".to_string(),
         ])
     );
 
@@ -1344,6 +1349,7 @@ fn tools_exact_per_skill() {
             "test".to_string(),
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
+            "think".to_string(),
         ])
     );
 }
@@ -2362,13 +2368,155 @@ fn after_tool_other_tools_produce_no_patch() {
         "test",
         "recall",
         "filter_last_tool_call",
+        "think",
     ] {
         assert_eq!(
             common_after_tool(&ws, 1, name, &json!({}), "irrelevant output"),
             None,
-            "tool `{name}` should never produce a seen patch"
+            "tool `{name}` should never produce a patch for unrelated output"
         );
     }
+}
+
+// =======================================================================
+// `common_after_tool`'s `think`/`test` handling of `CodingWorkspace::
+// decision` (see `skills/tests/decision.rs`'s doc for why the `think`
+// shapes are unit-tested here rather than driven through a real `Session`:
+// `core::Session::execute` special-cases `Action::Tool { name: "think",
+// .. }` before dispatch and never calls `Skill::after_tool` for it, so only
+// a direct call to the private `common_after_tool` can exercise them).
+// =======================================================================
+
+#[test]
+fn after_tool_think_output_sets_decision() {
+    let ws = CodingWorkspace::default();
+    let output = "question: why does the test fail?\nanswer:\nthe mock is stale.";
+    let patch = common_after_tool(
+        &ws,
+        7,
+        "think",
+        &json!({"question": "why does the test fail?"}),
+        output,
+    )
+    .expect("a think conclusion should produce a decision patch");
+    assert_eq!(
+        patch,
+        json!({"decision": {"question": "why does the test fail?", "answer": "the mock is stale.", "step": 7}})
+    );
+}
+
+#[test]
+fn after_tool_think_output_over_1200_chars_is_truncated() {
+    let ws = CodingWorkspace::default();
+    let long_answer = "x".repeat(1300);
+    let output = format!("question: what now?\nanswer:\n{long_answer}");
+    let patch = common_after_tool(&ws, 3, "think", &json!({"question": "what now?"}), &output)
+        .expect("a think conclusion should produce a decision patch");
+    let answer = patch["decision"]["answer"]
+        .as_str()
+        .expect("answer should be a string");
+    assert_eq!(
+        answer.chars().count(),
+        1200 + " …[truncated]".chars().count()
+    );
+    assert!(answer.starts_with(&"x".repeat(1200)));
+    assert!(answer.ends_with(" …[truncated]"));
+}
+
+#[test]
+fn after_tool_think_not_configured_output_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "`think` is not configured: set a `thinker` section in the config (see \
+                  README, Config). Decide from what you have.";
+    assert_eq!(
+        common_after_tool(&ws, 1, "think", &json!({"question": "q"}), output),
+        None,
+        "a not-configured think output must leave an existing decision unchanged (no patch)"
+    );
+}
+
+#[test]
+fn after_tool_think_failed_output_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "think failed: subagent timed out";
+    assert_eq!(
+        common_after_tool(&ws, 1, "think", &json!({"question": "q"}), output),
+        None,
+        "a think-failed output must leave an existing decision unchanged (no patch)"
+    );
+}
+
+#[test]
+fn after_tool_test_pass_clears_an_existing_decision() {
+    let ws = CodingWorkspace {
+        decision: Some(Decision {
+            question: "why?".to_string(),
+            answer: "because.".to_string(),
+            step: 0,
+        }),
+        ..Default::default()
+    };
+    let output = "command: cargo test\nresult: pass\nexit: 0\n";
+    let patch = common_after_tool(&ws, 5, "test", &json!({}), output)
+        .expect("a passing test should produce a clearing patch");
+    assert_eq!(patch, json!({"decision": null}));
+}
+
+#[test]
+fn after_tool_test_fail_leaves_an_existing_decision_alone() {
+    let ws = CodingWorkspace {
+        decision: Some(Decision {
+            question: "why?".to_string(),
+            answer: "because.".to_string(),
+            step: 0,
+        }),
+        ..Default::default()
+    };
+    let output = "command: cargo test\nresult: fail (exit 1)\n";
+    assert_eq!(
+        common_after_tool(&ws, 5, "test", &json!({}), output),
+        None,
+        "a failing test must leave an existing decision alone (no patch)"
+    );
+}
+
+#[test]
+fn after_tool_test_pass_with_no_existing_decision_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "command: cargo test\nresult: pass\nexit: 0\n";
+    assert_eq!(
+        common_after_tool(&ws, 5, "test", &json!({}), output),
+        None,
+        "there is nothing to clear when decision is already unset"
+    );
+}
+
+#[test]
+fn model_patch_touching_decision_is_stripped_and_noted() {
+    let skill = ImplementSkill::new();
+    let cur_ws = CodingWorkspace::default();
+    let cur = committed(cur_ws.clone());
+
+    let content = json!({
+        "patch": {"decision": {"question": "q", "answer": "a", "step": 5}},
+        "action": {"type": "ask_user", "message": "?"},
+    });
+    let step =
+        parse_and_validate(&skill, &cur, content).expect("patch should be kept, not rejected");
+
+    assert_eq!(
+        step.patch().next().decision,
+        None,
+        "`decision` must be left unchanged by the dropped patch"
+    );
+    assert_eq!(
+        step.notes(),
+        &[
+            "`decision` is kept by the harness; that part of your patch was dropped and the \
+             rest was kept."
+                .to_string()
+        ]
+    );
 }
 
 #[test]
@@ -2550,4 +2698,490 @@ fn implement_bare_done_with_stale_self_next_skill_still_hands_off_to_review() {
         Some("review"),
         "must hand off to review, not stay stuck on the stale self-reference"
     );
+}
+
+// ---------------------------------------------------------------------
+// `implement_repeat_failure_thinks` (`skills/src/coding/mod.rs`): after a
+// `test` call's failure has recurred identically, the harness substitutes a
+// `think` call for the model's next edit, once per failure streak.
+// ---------------------------------------------------------------------
+
+/// The exact note `implement_repeat_failure_thinks` attaches when it
+/// substitutes `think` for an edit right after an identical failure.
+const REPEAT_THINK_NOTE: &str = "your last edit did not change the test failure, so the harness \
+     asked the reasoning subagent first (its conclusion is below, and in `decision`). Act on it: \
+     if it names a different cause, fix that; if it agrees with you, make your edit.";
+
+/// The exact note `implement_repeat_failure_thinks` attaches when it
+/// substitutes `think` for an idle `test` rerun (nothing edited since).
+const IDLE_TEST_THINK_NOTE: &str = "you re-ran the test with nothing edited, so the harness \
+     asked the reasoning subagent instead (its conclusion is below, and in `decision`). Act on \
+     it.";
+
+/// The exact note `implement_repeat_failure_thinks` attaches when it
+/// substitutes `think` for a non-question `ask_user` with a repeat open.
+const ASK_USER_THINK_NOTE: &str = "you had nothing to ask and a repeated test failure is open, \
+     so the harness asked the reasoning subagent (its conclusion is below, and in `decision`). \
+     Act on it.";
+
+fn edit_file_turn_content() -> serde_json::Value {
+    json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "edit_file",
+            "args": {"path": "a.rs", "old": "x", "new": "y"},
+        },
+        "ack_inbox": []
+    })
+}
+
+fn write_file_turn_content() -> serde_json::Value {
+    json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "write_file",
+            "args": {"path": "a.rs", "content": "y"},
+        },
+        "ack_inbox": []
+    })
+}
+
+#[test]
+fn repeat_failure_thinks_fires_for_edit_file_with_no_prior_think() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+
+    let step = parse_and_validate(&skill, &cur, edit_file_turn_content())
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "think"
+                    && args == &json!({"question": super::REPEAT_FAILURE_QUESTION})
+        ),
+        "expected a substituted `think` call with REPEAT_FAILURE_QUESTION, got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        &[REPEAT_THINK_NOTE.to_string()],
+        "the exact repeat-think note must be attached"
+    );
+    // The patch (empty here) survives untouched.
+    let (patch, _action, _acks) = step.into_parts();
+    assert_eq!(patch.next().recent_summary, "");
+}
+
+#[test]
+fn repeat_failure_thinks_fires_for_write_file_with_no_prior_think() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+
+    let step = parse_and_validate(&skill, &cur, write_file_turn_content())
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "think"
+                    && args == &json!({"question": super::REPEAT_FAILURE_QUESTION})
+        ),
+        "expected a substituted `think` call, got {:?}",
+        step.action()
+    );
+    assert_eq!(step.notes(), &[REPEAT_THINK_NOTE.to_string()]);
+}
+
+#[test]
+fn repeat_failure_thinks_fires_when_last_think_predates_the_repeat() {
+    let skill = ImplementSkill::new();
+    // An edit after the last think call (step 5): the trigger only re-arms
+    // once something has actually been edited since that call.
+    let agent = CodingWorkspace {
+        seen: vec![SeenFile {
+            path: "a.rs".to_string(),
+            edited: vec![[1, 3]],
+            step: 7,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut cur = committed(agent);
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = Some(5);
+
+    let step = parse_and_validate(&skill, &cur, edit_file_turn_content())
+        .expect("a think call before the repeat must not block the substitution");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "think"),
+        "expected a substituted `think` call, got {:?}",
+        step.action()
+    );
+}
+
+/// The trigger's re-arm gate (added after a second live battery showed the
+/// original edit-since-last-think-agnostic version fire on every stuck
+/// repeat, running the reasoning subagent five times with nothing new to say
+/// -- all five came back empty): `last_think_step: Some(5)`,
+/// `repeated_failure_step: Some(10)`, with an edit recorded in `seen` at
+/// step 7 (after the last think, before the repeat) DOES re-arm the
+/// trigger.
+#[test]
+fn repeat_failure_thinks_rearms_when_seen_has_an_edit_after_last_think_step() {
+    let skill = ImplementSkill::new();
+    let agent = CodingWorkspace {
+        seen: vec![SeenFile {
+            path: "a.rs".to_string(),
+            edited: vec![[1, 3]],
+            step: 7,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut cur = committed(agent);
+    cur.harness.last_think_step = Some(5);
+    cur.harness.repeated_failure_step = Some(10);
+
+    let step =
+        parse_and_validate(&skill, &cur, edit_file_turn_content()).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "think"),
+        "an edit since the last think call must re-arm the trigger, got {:?}",
+        step.action()
+    );
+}
+
+/// Same as above, but the recorded edit is BEFORE `last_think_step` (step 3,
+/// not after): nothing new has happened since the last `think` call
+/// answered, so the trigger must not fire again.
+#[test]
+fn repeat_failure_thinks_does_not_rearm_when_seen_edit_predates_last_think_step() {
+    let skill = ImplementSkill::new();
+    let agent = CodingWorkspace {
+        seen: vec![SeenFile {
+            path: "a.rs".to_string(),
+            edited: vec![[1, 3]],
+            step: 3,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut cur = committed(agent);
+    cur.harness.last_think_step = Some(5);
+    cur.harness.repeated_failure_step = Some(10);
+
+    let step =
+        parse_and_validate(&skill, &cur, edit_file_turn_content()).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "edit_file"),
+        "an edit predating the last think call must not re-arm the trigger, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+/// Same gating, but `seen` is empty entirely: nothing has been edited at
+/// all since the last think call, so the trigger must not fire.
+#[test]
+fn repeat_failure_thinks_does_not_rearm_when_seen_is_empty() {
+    let skill = ImplementSkill::new();
+    let cur_agent = CodingWorkspace::default();
+    assert!(cur_agent.seen.is_empty());
+    let mut cur = committed(cur_agent);
+    cur.harness.last_think_step = Some(5);
+    cur.harness.repeated_failure_step = Some(10);
+
+    let step =
+        parse_and_validate(&skill, &cur, edit_file_turn_content()).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "edit_file"),
+        "an empty seen list must not re-arm the trigger, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+/// `last_think_step: None` (no think call has ever run) fires regardless of
+/// `seen` -- the edit-since gate only applies once a `think` call has
+/// actually run for this streak.
+#[test]
+fn repeat_failure_thinks_fires_with_no_prior_think_even_when_seen_is_empty() {
+    let skill = ImplementSkill::new();
+    let cur_agent = CodingWorkspace::default();
+    assert!(cur_agent.seen.is_empty());
+    let mut cur = committed(cur_agent);
+    cur.harness.last_think_step = None;
+    cur.harness.repeated_failure_step = Some(10);
+
+    let step = parse_and_validate(&skill, &cur, edit_file_turn_content())
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "think"),
+        "expected a substituted `think` call, got {:?}",
+        step.action()
+    );
+}
+
+#[test]
+fn repeat_failure_thinks_does_not_fire_when_think_ran_at_the_repeat_step() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = Some(10);
+
+    let step =
+        parse_and_validate(&skill, &cur, edit_file_turn_content()).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "edit_file"),
+        "the model's own edit_file call must commit unchanged, got {:?}",
+        step.action()
+    );
+    assert!(
+        step.notes().is_empty(),
+        "no repeat-think note expected: {:?}",
+        step.notes()
+    );
+}
+
+#[test]
+fn repeat_failure_thinks_does_not_fire_when_think_ran_after_the_repeat_step() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = Some(11);
+
+    let step = parse_and_validate(&skill, &cur, write_file_turn_content())
+        .expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "write_file"),
+        "the model's own write_file call must commit unchanged, got {:?}",
+        step.action()
+    );
+    assert!(
+        step.notes().is_empty(),
+        "no repeat-think note expected: {:?}",
+        step.notes()
+    );
+}
+
+#[test]
+fn repeat_failure_thinks_does_not_fire_without_a_repeated_failure() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = None;
+    cur.harness.last_think_step = None;
+
+    let step =
+        parse_and_validate(&skill, &cur, edit_file_turn_content()).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "edit_file"),
+        "got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+#[test]
+fn repeat_failure_thinks_does_not_fire_for_read_file() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "tool", "name": "read_file", "args": {"path": "a.rs"}},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "read_file"),
+        "a read must not be substituted, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+/// The idle-test shape (no edits since the last `test`) DOES fire -- see
+/// `repeat_failure_thinks_fires_for_idle_test_with_no_edits_since_test`
+/// below. This test covers the shape that must NOT fire: a `test` call with
+/// real edits since the last one, which is `implement_no_green_runs_test`'s
+/// and the model's own territory.
+#[test]
+fn repeat_failure_thinks_does_not_fire_for_test_with_edits_since_test() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+    cur.harness.edits_since_test = 2;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "tool", "name": "test", "args": {"cmd": "cargo test"}},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "test"),
+        "a test call with edits since the last one must not be substituted, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+/// The stuck shape a first live battery showed the original (edit-only)
+/// trigger miss entirely: the model re-runs the failing test with nothing
+/// edited since, five times running on the trap fixture. `edits_since_test
+/// == 0` on a `test` call, with a repeated failure open, must now be
+/// substituted for `think` the same as an edit would be.
+#[test]
+fn repeat_failure_thinks_fires_for_idle_test_with_no_edits_since_test() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+    cur.harness.edits_since_test = 0;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "tool", "name": "test", "args": {"cmd": "cargo test"}},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "think"
+                    && args == &json!({"question": super::REPEAT_FAILURE_QUESTION})
+        ),
+        "expected a substituted `think` call, got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        &[IDLE_TEST_THINK_NOTE.to_string()],
+        "the idle-test repeat-think note must be attached"
+    );
+}
+
+#[test]
+fn repeat_failure_thinks_does_not_fire_for_the_models_own_think_call() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "tool", "name": "think", "args": {"question": "why?"}},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    match step.action() {
+        statie_core::Action::Tool { name, args } => {
+            assert_eq!(name, "think");
+            assert_eq!(
+                args,
+                &json!({"question": "why?"}),
+                "the model's own think question must not be overwritten"
+            );
+        }
+        other => panic!("expected Action::Tool(think), got {other:?}"),
+    }
+    assert!(step.notes().is_empty());
+}
+
+/// The patch survives even when it carries real content (not just an empty
+/// object) -- the substitution only replaces the action, never the patch.
+#[test]
+fn repeat_failure_thinks_leaves_a_non_empty_patch_intact() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {"recent_summary": "tried fixing tax.rs"},
+        "action": {
+            "type": "tool",
+            "name": "edit_file",
+            "args": {"path": "a.rs", "old": "x", "new": "y"},
+        },
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("the substituted think call must not be rejected");
+    assert!(matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "think"));
+    let (patch, _action, _acks) = step.into_parts();
+    assert_eq!(patch.next().recent_summary, "tried fixing tax.rs");
+}
+
+/// Live battery shape: with a repeat open, the model sends `ask_user` with a
+/// statement of intent instead of a question -- `ask_user_empty_note`/
+/// `ask_user_statement_note` would otherwise just convert this into a
+/// `Continue` note, which the model has already shown it does not act on.
+/// `implement_repeat_failure_thinks` must take precedence and substitute
+/// `think` instead.
+#[test]
+fn repeat_failure_thinks_fires_for_non_question_ask_user() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "ask_user", "message": "I will look at tax.rs next"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "think"
+                    && args == &json!({"question": super::REPEAT_FAILURE_QUESTION})
+        ),
+        "expected a substituted `think` call, got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        &[ASK_USER_THINK_NOTE.to_string()],
+        "the ask-user repeat-think note must be attached"
+    );
+}
+
+/// A real question (contains `?`) with a repeat open must NOT be
+/// substituted -- the model asking the user something it genuinely cannot
+/// find out itself is left alone even when a repeated failure is open.
+#[test]
+fn repeat_failure_thinks_does_not_fire_for_a_real_question_ask_user() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "ask_user", "message": "Which file should I fix?"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::AskUser { message } if message == "Which file should I fix?"),
+        "a real question must not be substituted, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
 }

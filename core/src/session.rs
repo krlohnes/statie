@@ -26,6 +26,7 @@ use crate::report::ReportOutcome;
 use crate::sandbox::SandboxRoot;
 use crate::skill::{Commitment, ParsedOutput, Skill, ValidatedStep, validate_user_patch};
 use crate::store::{LoggedPatch, StateStore, apply_fn};
+use crate::thinker::{ThinkInput, Thinker};
 use crate::tokenizer::{Budgets, TokenBudget, Tokenizer};
 use crate::tool::ToolSet;
 use crate::version::{CommittedState, HarnessState, InboxItem, Version};
@@ -304,19 +305,61 @@ fn summarize_verify_output(text: &str) -> String {
 /// first line (dropping the `command: ...` line), trimmed.
 fn normalize_failure_summary(output: &str) -> String {
     const MARKER: &str = "--- failure summary ---\n";
-    if let Some(start) = output.find(MARKER) {
+    let raw = if let Some(start) = output.find(MARKER) {
         let rest = &output[start + MARKER.len()..];
         let summary_lines: Vec<&str> = rest
             .lines()
             .take_while(|l| !l.starts_with("--- "))
             .collect();
-        summary_lines.join("\n").trim().to_string()
+        summary_lines.join("\n")
     } else {
         match output.split_once('\n') {
-            Some((_, rest)) => rest.trim().to_string(),
-            None => output.trim().to_string(),
+            Some((_, rest)) => rest.to_string(),
+            None => output.to_string(),
         }
+    };
+    scrub_volatile(&raw).trim().to_string()
+}
+
+/// Removes the parts of a test failure that change between two runs of
+/// the same failing test, so the repeated-failure guard compares what the
+/// model can act on: a parenthesised run of digits (Rust's panic line
+/// carries the thread id, `thread 'name' (12100280) panicked at ...`, and
+/// it differs every run) and `finished in 0.00s` timings. Without this,
+/// two byte-identical assertion failures never counted as a repeat: the
+/// first live battery with the trap task re-ran the same failing test five
+/// times and the guard fired zero times.
+fn scrub_volatile(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '(' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 && j < chars.len() && chars[j] == ')' {
+                i = j + 1;
+                continue;
+            }
+        }
+        const TIMING: &[char] = &['f', 'i', 'n', 'i', 's', 'h', 'e', 'd', ' ', 'i', 'n', ' '];
+        if chars[i..].starts_with(TIMING) {
+            let mut j = i + TIMING.len();
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                j += 1;
+            }
+            if j > i + TIMING.len() && j < chars.len() && chars[j] == 's' {
+                out.push_str("finished in Xs");
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
     }
+    out
 }
 
 /// A cloneable, shareable handle that can cancel the in-flight `step()`
@@ -432,6 +475,21 @@ pub struct Session<W> {
     /// `Done` -- to distil the step's dropped reasoning into the
     /// harness-owned `notes` field.
     maintainer: Option<Arc<dyn Maintainer>>,
+    /// The `think` tool (statie-spec.md's `think` tool): `None` means
+    /// `think` is registered (if the active tool set includes it) but every
+    /// call reports itself as unconfigured, telling the model to decide
+    /// from what it has instead of parking on a call that can never
+    /// resolve. When set, `Active::execute`'s `Action::Tool` interception
+    /// for `name == "think"` calls it directly instead of dispatching to
+    /// `self.session.tools` (`think` is not run by the registry -- see
+    /// `statie_tools::Think`).
+    thinker: Option<Arc<dyn Thinker>>,
+    /// A copy of the current step's rendered prompt (`system()`/`user()`),
+    /// kept so a `think` call made during this step can hand the reasoning
+    /// subagent exactly what the worker itself saw. Set once per step, right
+    /// after `BoundedPrompt` is built; cheap clone of two already-rendered
+    /// strings.
+    last_prompt: Option<(String, String)>,
     /// Working-set config (statie-spec.md "10. Working set"). Defaults to
     /// `WorkingSetConfig::default()` (on: 4 windows, 6 recent-call lines);
     /// `max_windows: 0` (via `with_working_set`) disables the section and
@@ -567,6 +625,8 @@ impl<W> Session<W> {
             child_runner: None,
             delegations: 0,
             maintainer: None,
+            thinker: None,
+            last_prompt: None,
             working_set: WorkingSetConfig::default(),
             guards: Guards::default(),
             green_checkpoint: None,
@@ -588,6 +648,14 @@ impl<W> Session<W> {
     /// loop behaves exactly as it did before this feature existed.
     pub fn with_maintainer(mut self, m: Arc<dyn Maintainer>) -> Self {
         self.maintainer = Some(m);
+        self
+    }
+
+    /// Attaches the `think` tool's reasoning backend. Without one, a `think`
+    /// call still commits (never rejected) but its tool output tells the
+    /// model `think` is not configured.
+    pub fn with_thinker(mut self, t: Arc<dyn Thinker>) -> Self {
+        self.thinker = Some(t);
         self
     }
 
@@ -689,6 +757,8 @@ impl<W> Session<W> {
                         tool_calls: 0,
                         last_test_cmd: None,
                         edits_since_test: 0,
+                        last_think_step: None,
+                        repeated_failure_step: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -703,6 +773,10 @@ impl<W> Session<W> {
                 // Reset per-activation: this activation has not yet run any
                 // tool call (see `HarnessState::tool_calls`'s doc).
                 harness.tool_calls = 0;
+                // Mirrors `tool_calls`: this activation has not yet run a
+                // `think` call either (see `HarnessState::last_think_step`'s
+                // doc).
+                harness.last_think_step = None;
                 self.store.set_harness(harness).await?;
             }
         }
@@ -1236,6 +1310,7 @@ where
         }
         let prompt = builder.build()?;
         self.session.last_prompt_tokens = Some(prompt.tokens());
+        self.session.last_prompt = Some((prompt.system().to_string(), prompt.user().to_string()));
 
         // 5. Call the model.
         let raw: RawOutput = match self
@@ -2078,6 +2153,18 @@ where
                     return Ok(Outcome::Continue);
                 }
 
+                // `think` (statie-spec.md's `think` tool): the session
+                // intercepts it here, before dispatch to the registry --
+                // `statie_tools::Think::call` always errors, by design (see
+                // that type's doc). Everything else about a tool step stays
+                // generic (`tool_calls` increments via `record_tool_call`,
+                // the identical-call guard applies, the observation goes
+                // through the usual truncation) -- only the dispatch itself
+                // differs.
+                if name == "think" {
+                    return self.execute_think(step, entries, args, token).await;
+                }
+
                 let Some(tool) = self.session.tools.get(&name) else {
                     entries.push(system_entry(
                         step,
@@ -2367,6 +2454,22 @@ where
                             // whether anything changed since the run the
                             // model is about to point at.
                             harness.edits_since_test = 0;
+                            // `repeated_failure_step` (`core/src/
+                            // version.rs`): `Some(step)` exactly when this
+                            // call's failure was identical to the previous
+                            // run's -- the same condition
+                            // `note_test_result` used above to decide
+                            // whether to log a `repeated_failure` entry
+                            // (`repeated_failure_count >= 2`); `None` on a
+                            // pass or on a fail with a fresh summary.
+                            harness.repeated_failure_step = if self.session.last_test_result
+                                == Some(false)
+                                && self.session.repeated_failure_count >= 2
+                            {
+                                Some(step)
+                            } else {
+                                None
+                            };
                         } else if matches!(
                             name.as_str(),
                             "edit_file" | "write_file" | "revert_file"
@@ -2381,42 +2484,15 @@ where
                         harness.tool_calls += 1;
                         self.session.store.set_harness(harness).await?;
 
-                        // Milestone 10: `Skill::after_tool` -- called right
+                        // Milestone 10: `Skill::after_tool` (see
+                        // `call_after_tool_hook`'s doc) -- called right
                         // after this call's execution and bookkeeping have
                         // committed, on the success path only (never on a
                         // tool error, never on a skipped-redundant call
                         // above; a paged read reaches here with its
-                        // rewritten `args`, already in scope). Never fails
-                        // the step: a patch error is logged as a `System`
-                        // `note` and otherwise ignored. Writes straight to
-                        // `self.session.log` (not the local `entries`
-                        // buffer, which `step()` has already mostly
-                        // finished accumulating by the time `execute` runs)
-                        // -- the same convention `run_maintainer` and
-                        // `apply_trusted_patch`'s other callers use for a
-                        // harness-authored commit made after the step's own
-                        // patch/action have already committed.
-                        let (after_cur, _after_version) = self.session.state().await?;
-                        if let Some(hook_patch) = self.skill.after_tool(
-                            &after_cur.agent,
-                            &after_cur.harness,
-                            step,
-                            &name,
-                            &args,
-                            full.as_ref(),
-                        ) && let Err(e) =
-                            self.apply_after_tool_patch(hook_patch, "after_tool").await
-                        {
-                            let _ = self.session.log.append(system_entry(
-                                step,
-                                "note",
-                                serde_json::json!({
-                                    "text": format!(
-                                        "after_tool patch for `{name}` could not be applied: {e}"
-                                    )
-                                }),
-                            ));
-                        }
+                        // rewritten `args`, already in scope).
+                        self.call_after_tool_hook(step, &name, &args, full.as_ref())
+                            .await?;
 
                         Ok(Outcome::Continue)
                     }
@@ -2757,6 +2833,232 @@ where
         }
     }
 
+    /// Runs a `think` call (statie-spec.md's `think` tool): the session's
+    /// own handling for `Action::Tool { name: "think", .. }`, called from
+    /// `execute` before dispatch to `self.session.tools` (`think` is
+    /// registered there only so its schema/description render in the tool
+    /// list and an unconfigured session still returns a schema for the
+    /// empty-question error message below -- `statie_tools::Think::call`
+    /// itself always errors).
+    ///
+    /// A missing/empty `question` is treated exactly like another tool's
+    /// `ToolError::InvalidArgs`: same message shape, same loop-guard/
+    /// truncation path, `record_tool_call` still increments (the call was
+    /// recognized, just malformed) -- never a rejection. Otherwise: no
+    /// thinker configured -> a fixed "not configured" tool output; a
+    /// thinker configured -> its `think` call result (`Ok` -> "question:
+    /// .../answer:\n...", `Err` -> "think failed: ..."), either way a
+    /// successful tool-output observation, never a rejection. A `System`
+    /// entry with `event: "think"` is always logged, and
+    /// `HarnessState.last_think_step` is always set to this step.
+    async fn execute_think(
+        &mut self,
+        step: u64,
+        entries: &mut Vec<LogEntry>,
+        args: Value,
+        token: CancellationToken,
+    ) -> Result<Outcome, SessionError> {
+        let name = "think".to_string();
+        let question = args
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+
+        if question.is_empty() {
+            entries.push(system_entry(
+                step,
+                "tool_error",
+                serde_json::json!({"name": name, "reason": "invalid tool arguments: question must not be empty"}),
+            ));
+            let schema_str = self
+                .session
+                .tools
+                .get(&name)
+                .map(|t| render_schema_compact(&t.args_schema()))
+                .unwrap_or_else(|| "{}".to_string());
+            let mut message = format!(
+                "tool `think` rejected its arguments: question must not be empty. Expected \
+                 arguments (JSON schema): {schema_str}. Fix the arguments and call `think` again."
+            );
+
+            let current = (
+                name.clone(),
+                args.clone(),
+                "invalid tool arguments: question must not be empty".to_string(),
+            );
+            let prior_occurrences = self
+                .session
+                .recent_tool_calls
+                .iter()
+                .filter(|entry| **entry == current)
+                .count();
+            if prior_occurrences >= 2 {
+                let occurrence = prior_occurrences + 1;
+                message = format!(
+                    "[harness] This is occurrence #{occurrence} of `{name}` with identical \
+                     arguments and identical output within the last {TOOL_CALL_HISTORY} tool \
+                     calls; nothing has changed. Record what you learned in the workspace and \
+                     take a different action (if the work is finished, hand off with \
+                     `next_skill` or set the terminal field).\n\n{message}"
+                );
+            }
+            self.session.recent_tool_calls.push_back(current);
+            if self.session.recent_tool_calls.len() > TOOL_CALL_HISTORY {
+                self.session.recent_tool_calls.pop_front();
+            }
+
+            let (obs, _overflow) = Observation::truncate_with_report(
+                &crate::promptable::ToolOutputFull::new(message),
+                self.session.config.budgets.observation,
+                self.session.tokenizer.as_ref(),
+            );
+            self.session.pending_observation = Some(obs);
+            self.session.record_tool_call().await?;
+            return Ok(Outcome::Continue);
+        }
+
+        let thinker = self.session.thinker.clone();
+        let (system, user) = self
+            .session
+            .last_prompt
+            .clone()
+            .unwrap_or_else(|| (String::new(), String::new()));
+
+        let (text, configured, reasoning_chars, content_chars, answer_chars, prompt_tokens, error) =
+            match thinker {
+                None => (
+                    "`think` is not configured: set a `thinker` section in the config (see \
+                     README, Config). Decide from what you have."
+                        .to_string(),
+                    false,
+                    0usize,
+                    0usize,
+                    0usize,
+                    None::<u64>,
+                    None::<String>,
+                ),
+                Some(thinker) => {
+                    let input = ThinkInput {
+                        system: &system,
+                        user: &user,
+                        question,
+                    };
+                    match thinker.think(input, token.clone()).await {
+                        Ok(out) => {
+                            let answer_chars = out.answer.chars().count();
+                            let text = format!("question: {question}\nanswer:\n{}", out.answer);
+                            (
+                                text,
+                                true,
+                                out.reasoning_chars,
+                                out.content_chars,
+                                answer_chars,
+                                out.usage.map(|u| u.prompt_tokens),
+                                None,
+                            )
+                        }
+                        Err(e) => (
+                            format!("think failed: {e}"),
+                            true,
+                            0usize,
+                            0usize,
+                            0usize,
+                            None,
+                            Some(e.to_string()),
+                        ),
+                    }
+                }
+            };
+
+        entries.push(system_entry(
+            step,
+            "think",
+            serde_json::json!({
+                "question": question,
+                "configured": configured,
+                "reasoning_chars": reasoning_chars,
+                "content_chars": content_chars,
+                "answer_chars": answer_chars,
+                "prompt_tokens": prompt_tokens,
+                "error": error,
+            }),
+        ));
+
+        // `ToolOutput` entry, mirroring the generic tool success path (see
+        // `execute`'s `Some(Ok(full)) => { ... }` arm): logged with the raw
+        // output text, BEFORE the loop-guard prefix below is applied.
+        // `recall`/`filter_last_tool_call` read the last `ToolOutput` entry,
+        // so without this the model cannot filter or recall a long answer.
+        entries.push(LogEntry {
+            step,
+            kind: LogKind::ToolOutput,
+            ts: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "name": name,
+                "output": text,
+                "truncated": false,
+            }),
+            agent: None,
+        });
+
+        // Loop guard, same as every other tool's success path: identical
+        // (name, args, output) recurring within the recent-history window.
+        // `raw_output` keeps the un-prefixed text for `after_tool` below,
+        // which (like the generic path's `full`) must see the tool's actual
+        // output, not the loop-guard note prepended for the prompt.
+        let raw_output = text.clone();
+        let current = (name.clone(), args.clone(), text.clone());
+        let prior_occurrences = self
+            .session
+            .recent_tool_calls
+            .iter()
+            .filter(|entry| **entry == current)
+            .count();
+        let mut text = text;
+        if prior_occurrences >= 2 {
+            let occurrence = prior_occurrences + 1;
+            text = format!(
+                "[harness] This is occurrence #{occurrence} of `{name}` with identical \
+                 arguments and identical output within the last {TOOL_CALL_HISTORY} tool calls; \
+                 nothing has changed. Record what you learned in the workspace and take a \
+                 different action (if the work is finished, hand off with `next_skill` or set \
+                 the terminal field).\n\n{text}"
+            );
+        }
+        self.session.recent_tool_calls.push_back(current);
+        if self.session.recent_tool_calls.len() > TOOL_CALL_HISTORY {
+            self.session.recent_tool_calls.pop_front();
+        }
+
+        let (obs, _overflow) = Observation::truncate_with_report(
+            &crate::promptable::ToolOutputFull::new(text),
+            self.session.config.budgets.observation,
+            self.session.tokenizer.as_ref(),
+        );
+        self.session.pending_observation = Some(obs);
+
+        // Mirrors `tool_calls`'s own commit site: this call executed
+        // (configured or not), so it counts, and `last_think_step` records
+        // when.
+        let (cur, _version) = self.session.state().await?;
+        let mut harness = cur.harness;
+        harness.tool_calls += 1;
+        harness.last_think_step = Some(step);
+        self.session.store.set_harness(harness).await?;
+
+        // Milestone 10: `Skill::after_tool` (see `call_after_tool_hook`'s
+        // doc) -- `think` counts as a successfully executed tool call for
+        // this hook the same as any other (configured, unconfigured, and
+        // backend-error outputs alike; only the empty-question invalid-args
+        // path above never reaches here, matching the generic path never
+        // calling the hook on a tool error).
+        self.call_after_tool_hook(step, &name, &args, &raw_output)
+            .await?;
+
+        Ok(Outcome::Continue)
+    }
+
     fn reject(
         &mut self,
         mut entries: Vec<LogEntry>,
@@ -3035,6 +3337,48 @@ where
     /// one extra version, a `Patch` log entry), except the log entry also
     /// carries `"reason": reason` so it is distinguishable from commitment
     /// clearing and other harness-authored patches.
+    /// Milestone 10: `Skill::after_tool` -- called right after a tool call's
+    /// execution and bookkeeping have committed, on the success path only
+    /// (never on a tool error, never on a skipped-redundant call; a paged
+    /// read reaches here with its rewritten `args`). Never fails the step: a
+    /// patch error is logged as a `System` `note` and otherwise ignored.
+    /// Writes straight to `self.session.log` (not the local `entries`
+    /// buffer, which `step()` has already mostly finished accumulating by
+    /// the time `execute`/`execute_think` run) -- the same convention
+    /// `run_maintainer` and `apply_trusted_patch`'s other callers use for a
+    /// harness-authored commit made after the step's own patch/action have
+    /// already committed. Shared by the generic tool success path and
+    /// `execute_think` so the two call sites cannot drift.
+    async fn call_after_tool_hook(
+        &mut self,
+        step: u64,
+        name: &str,
+        args: &Value,
+        output: &str,
+    ) -> Result<(), SessionError> {
+        let (after_cur, _after_version) = self.session.state().await?;
+        if let Some(hook_patch) = self.skill.after_tool(
+            &after_cur.agent,
+            &after_cur.harness,
+            step,
+            name,
+            args,
+            output,
+        ) && let Err(e) = self.apply_after_tool_patch(hook_patch, "after_tool").await
+        {
+            let _ = self.session.log.append(system_entry(
+                step,
+                "note",
+                serde_json::json!({
+                    "text": format!(
+                        "after_tool patch for `{name}` could not be applied: {e}"
+                    )
+                }),
+            ));
+        }
+        Ok(())
+    }
+
     async fn apply_after_tool_patch(
         &mut self,
         raw: Value,
@@ -3510,6 +3854,34 @@ mod tests {
         let long_line = "x".repeat(500);
         let summary = summarize_verify_output(&long_line);
         assert_eq!(summary.chars().count(), 300);
+    }
+
+    #[test]
+    fn normalize_failure_summary_ignores_thread_ids_and_timings() {
+        let run = |tid: &str, secs: &str| {
+            format!(
+                "command: cargo test\nresult: fail (exit 101)\n--- failure summary ---\n\
+                 test result: ok. 0 passed; 0 failed; finished in {secs}\n\
+                 test two_items ... FAILED\n\
+                 thread 'two_items' ({tid}) panicked at tests/total.rs:6:5:\n\
+                 assertion `left == right` failed\n  left: 4491\n right: 4492\n--- stdout ---\n"
+            )
+        };
+        let a = normalize_failure_summary(&run("12100280", "0.00s"));
+        let b = normalize_failure_summary(&run("12100417", "0.01s"));
+        assert_eq!(
+            a, b,
+            "two runs of the same failing test must normalize equal"
+        );
+        assert!(
+            a.contains("left: 4491"),
+            "the assertion itself must survive: {a}"
+        );
+        assert!(!a.contains("12100280"), "thread id must be scrubbed: {a}");
+        assert!(a.contains("finished in Xs"), "timing must be scrubbed: {a}");
+        // A different assertion is still a different failure.
+        let c = normalize_failure_summary(&run("1", "0.00s").replace("4491", "4490"));
+        assert_ne!(a, c);
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod revert_file;
 mod search;
 mod shell;
 mod test_tool;
+mod think;
 mod write_file;
 
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub use revert_file::RevertFile;
 pub use search::Search;
 pub use shell::Shell;
 pub use test_tool::{TestTool, detect_test_command};
+pub use think::{Think, ThinkArgs};
 pub use write_file::WriteFile;
 
 fn default_shell_timeout_secs() -> u64 {
@@ -89,6 +91,7 @@ pub fn default_tools(cfg: &ToolConfig) -> ToolSet {
     tools.register(Arc::new(FilterLastToolCall {
         max_output_bytes: cfg.max_output_bytes,
     }));
+    tools.register(Arc::new(Think));
 
     if cfg.allow_shell {
         tools.register(Arc::new(Shell {
@@ -106,6 +109,8 @@ pub fn default_tools(cfg: &ToolConfig) -> ToolSet {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::*;
 
     #[test]
@@ -134,6 +139,7 @@ mod tests {
                 "search",
                 "shell",
                 "test",
+                "think",
                 "write_file"
             ]
         );
@@ -158,8 +164,47 @@ mod tests {
                 "recall",
                 "revert_file",
                 "search",
+                "think",
                 "write_file"
             ]
+        );
+    }
+
+    #[test]
+    fn default_tools_contains_think_with_required_question_arg() {
+        let cfg = ToolConfig::default();
+        let tools = default_tools(&cfg);
+        let think = tools.get("think").expect("think should be registered");
+        assert_eq!(think.name(), "think");
+
+        let schema = think.args_schema();
+        let value = schema.as_value();
+        let required = value
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("schema should have required");
+        assert_eq!(required, &vec![Value::String("question".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn think_call_returns_session_dispatch_error() {
+        let cfg = ToolConfig::default();
+        let tools = default_tools(&cfg);
+        let think = tools.get("think").expect("think should be registered");
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = statie_core::ToolCtx {
+            root: statie_core::SandboxRoot::new(dir.path()).unwrap(),
+            log: Arc::new(statie_core::MemoryLog::new()),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let err = think
+            .call(serde_json::json!({"question": "why?"}), &ctx)
+            .await
+            .expect_err("think's call must always fail");
+        assert!(
+            matches!(err, statie_core::ToolError::ExecutionFailed(ref m) if m == "`think` is run by the session, not the tool registry"),
+            "{err}"
         );
     }
 

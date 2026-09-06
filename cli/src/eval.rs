@@ -294,6 +294,9 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
     if let Some(m) = cfg.build_maintainer()? {
         session_a = session_a.with_maintainer(m);
     }
+    if let Some(t) = cfg.build_thinker()? {
+        session_a = session_a.with_thinker(t);
+    }
     session_a = session_a.with_working_set(cfg.working_set.into());
     session_a = session_a.with_guards(cfg.guards);
     let registry_a: Arc<dyn SkillRegistry<ToyWorkspace>> = Arc::new(ToyRegistry::new(steps));
@@ -393,6 +396,9 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
     );
     if let Some(m) = cfg.build_maintainer()? {
         session_a = session_a.with_maintainer(m);
+    }
+    if let Some(t) = cfg.build_thinker()? {
+        session_a = session_a.with_thinker(t);
     }
     session_a = session_a.with_working_set(cfg.working_set.into());
     session_a = session_a.with_guards(cfg.guards);

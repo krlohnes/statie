@@ -45,6 +45,8 @@ fn harness_state() -> HarnessState {
         tool_calls: 0,
         last_test_cmd: None,
         edits_since_test: 0,
+        last_think_step: None,
+        repeated_failure_step: None,
     }
 }
 

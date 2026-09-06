@@ -5,7 +5,8 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use statie_core::{
-    BoundedPrompt, Capabilities, Model, ModelError, RawOutput, Reasoning, Schema, StepSink, Usage,
+    BoundedPrompt, Capabilities, Model, ModelError, NullSink, RawOutput, Reasoning, Schema,
+    StepSink, Usage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -121,6 +122,14 @@ struct ChatMessage {
     content: Option<String>,
 }
 
+/// A free-text (no output schema) chat reply from `OllamaModel::chat_free`.
+pub struct FreeReply {
+    pub content: String,
+    pub thinking: String,
+    pub usage: Option<Usage>,
+    pub done_reason: Option<String>,
+}
+
 impl OllamaModel {
     pub fn new(cfg: OllamaConfig) -> Result<Self, ModelError> {
         let client = reqwest::Client::builder()
@@ -130,8 +139,80 @@ impl OllamaModel {
         Ok(OllamaModel { cfg, client })
     }
 
+    /// The context window this model was configured with (`OllamaConfig::
+    /// num_ctx`, sent on every request). Used by `ModelThinker::think`
+    /// (`statie-models::thinker`) to name the configured window in the error
+    /// message when a reasoning call exhausts it before producing content.
+    pub fn num_ctx(&self) -> u32 {
+        self.cfg.num_ctx
+    }
+
     fn chat_url(&self) -> String {
         format!("{}/api/chat", self.cfg.base_url.trim_end_matches('/'))
+    }
+
+    /// Builds the `/api/chat` request body shared by `step` and
+    /// `chat_free`: model, streaming, `think`, the two messages, and
+    /// `options` (with `num_ctx` always pinned last so it always wins). The
+    /// caller adds `format` on top when it wants one -- `chat_free` never
+    /// does.
+    fn base_body(&self, system: &str, user: &str, think: bool) -> Value {
+        let mut body = json!({
+            "model": self.cfg.model,
+            "stream": true,
+            "think": think,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+        });
+        let mut options = match &self.cfg.options {
+            Value::Object(map) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        options.insert("num_ctx".to_string(), json!(self.cfg.num_ctx));
+        body["options"] = Value::Object(options);
+        body
+    }
+
+    /// A free-text chat call: no output schema, no `format` key regardless
+    /// of `cfg.format`. Used by `ModelThinker` (`statie-models::thinker`) to
+    /// run a reasoning subagent call against the same Ollama server, with
+    /// native thinking on and nothing constraining the reply's shape.
+    /// Shares request construction (`base_body`), retry behavior
+    /// (`run_request_with_retries`), and the ndjson streaming parser
+    /// (`run_request`/`process_line`) with `step`.
+    pub async fn chat_free(
+        &self,
+        system: &str,
+        user: &str,
+        think: bool,
+        cancel: CancellationToken,
+    ) -> Result<FreeReply, ModelError> {
+        let body = self.base_body(system, user, think);
+
+        let request_text =
+            serde_json::to_string(&body).map_err(|e| ModelError::Io(e.to_string()))?;
+        tracing::debug!(
+            chars = request_text.chars().count(),
+            "ollama chat_free request"
+        );
+        tracing::trace!(body = %request_text, "ollama chat_free request body");
+
+        let mut sink = NullSink;
+        let result = tokio::select! {
+            result = self.run_request_with_retries(&body, &mut sink, &cancel) => result,
+            _ = cancel.cancelled() => Err(ModelError::Cancelled),
+        };
+
+        result.map(|(reasoning, content, usage, done_reason)| FreeReply {
+            content,
+            thinking: reasoning
+                .map(|r| r.as_ref().to_string())
+                .unwrap_or_default(),
+            usage,
+            done_reason,
+        })
     }
 }
 
@@ -152,28 +233,12 @@ impl Model for OllamaModel {
         sink: &mut dyn StepSink,
         cancel: CancellationToken,
     ) -> Result<RawOutput, ModelError> {
-        let mut body = json!({
-            "model": self.cfg.model,
-            "stream": true,
-            "think": self.cfg.think,
-            "messages": [
-                { "role": "system", "content": prompt.system() },
-                { "role": "user", "content": prompt.user() },
-            ],
-        });
+        let mut body = self.base_body(prompt.system(), prompt.user(), self.cfg.think);
         match self.cfg.format {
             OllamaFormat::Schema => body["format"] = schema.as_value().clone(),
             OllamaFormat::Json => body["format"] = json!("json"),
             OllamaFormat::None => {}
         }
-        // `num_ctx` is always sent and always wins over `options`, so the
-        // runner's context size never drifts between requests.
-        let mut options = match &self.cfg.options {
-            Value::Object(map) => map.clone(),
-            _ => serde_json::Map::new(),
-        };
-        options.insert("num_ctx".to_string(), json!(self.cfg.num_ctx));
-        body["options"] = Value::Object(options);
 
         let request_text =
             serde_json::to_string(&body).map_err(|e| ModelError::Io(e.to_string()))?;

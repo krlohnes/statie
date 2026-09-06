@@ -107,6 +107,29 @@ pub struct HarnessState {
     /// state persisted before this field existed still deserializes.
     #[serde(default)]
     pub edits_since_test: u32,
+    /// The harness step at which the most recent `think` tool call executed
+    /// (configured or not -- see `Session`'s `think` interception in
+    /// `core/src/session.rs`), set at the same call site as `tool_calls`.
+    /// `None` until one has. Harness-owned: patches cannot touch it.
+    /// `#[serde(default)]` so state persisted before this field existed
+    /// still deserializes.
+    #[serde(default)]
+    pub last_think_step: Option<u64>,
+    /// The harness step of the most recent `test` call whose failure was
+    /// identical to the previous run's -- i.e. the call at which
+    /// `Session::note_test_result` (`core/src/session.rs`) reported a
+    /// repeat (`repeated_failure_count >= 2`). Set at the same `test` call
+    /// site as `green_step`: `Some(step)` on a repeat, `None` on a pass, and
+    /// `None` on a fail with a fresh (non-repeating) summary. Harness-owned:
+    /// patches cannot touch it. Read by the coding skills' `implement`
+    /// validation (`skills/src/coding/mod.rs`) to run `think` once, ahead of
+    /// the model's own next edit, right after a failure has recurred
+    /// identically -- on a trap fixture where the acting model was
+    /// unanimous and wrong, it never called `think` on its own.
+    /// `#[serde(default)]` so state persisted before this field existed
+    /// still deserializes.
+    #[serde(default)]
+    pub repeated_failure_step: Option<u64>,
 }
 
 /// A guide pinned into the prompt's Pinned section, with a step-counted

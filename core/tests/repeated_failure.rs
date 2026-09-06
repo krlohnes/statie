@@ -696,3 +696,66 @@ async fn pass_clears_repeated_failure_memory() {
 // itself (private function, not exported) -- see
 // `normalize_failure_summary_*` in that file's `#[cfg(test)]` module.
 // =======================================================================
+
+// =======================================================================
+// (f) `HarnessState.repeated_failure_step` (harness-owned, committed
+// alongside `green_step` at the same `test` call site,
+// `core/src/session.rs`): `Some(step)` exactly on the `test` call whose
+// failure `note_test_result` reported as a repeat (`repeated_failure_count
+// >= 2`); `None` after a pass.
+// =======================================================================
+
+#[tokio::test]
+async fn repeated_failure_step_set_on_the_second_identical_fail_then_cleared_on_a_pass() {
+    let root = tempfile::tempdir().unwrap();
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), test_action("cargo test 1")), // step 1: fail
+        step_output(serde_json::json!({}), test_action("cargo test 2")), // step 2: fail (same, count 2)
+        step_output(serde_json::json!({}), test_action("cargo test 3")), // step 3: pass
+    ]);
+
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        tool_set(vec![
+            fail_output(SAME_SUMMARY),
+            fail_output(SAME_SUMMARY),
+            pass_output(),
+        ]),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+    let mut active = session.activate(Arc::new(RepeatSkill)).await.unwrap();
+
+    // Step 1: first fail -- not yet a repeat.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.repeated_failure_step, None,
+        "the first fail must not set repeated_failure_step"
+    );
+
+    // Step 2: second, identical fail -- repeated_failure_step must be set
+    // to this step's own number.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.repeated_failure_step,
+        Some(state.harness.step),
+        "the second identical fail must set repeated_failure_step to its own step"
+    );
+
+    // Step 3: a passing test call must clear it back to None.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec3).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.repeated_failure_step, None,
+        "a passing test call must clear repeated_failure_step"
+    );
+}

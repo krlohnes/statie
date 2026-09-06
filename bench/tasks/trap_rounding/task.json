@@ -1,0 +1,8 @@
+{
+  "name": "trap_rounding",
+  "prompt": "`cargo test` fails in tests/total.rs by one cent. Find the real bug and fix it so all tests pass. Do not change the tests.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/total.rs"],
+  "timeout_secs": 900,
+  "tags": ["rust", "runtime-bug", "trap"]
+}

@@ -40,6 +40,7 @@ const EXPECTED_TASKS: &[&str] = &[
     "add_struct_field",
     "new_module",
     "python_method",
+    "trap_rounding",
 ];
 
 /// `bench/tasks`, resolved relative to this crate's manifest dir so the
@@ -218,6 +219,11 @@ fn match_arms_fixture_fails_then_solution_passes() {
 #[test]
 fn rename_across_files_fixture_fails_then_solution_passes() {
     run_one("rename_across_files");
+}
+
+#[test]
+fn trap_rounding_fixture_fails_then_solution_passes() {
+    run_one("trap_rounding");
 }
 
 #[test]

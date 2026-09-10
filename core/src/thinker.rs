@@ -46,11 +46,15 @@ pub struct ThinkOutput {
     /// Characters of the full reply content, before extracting the answer.
     pub content_chars: usize,
     pub usage: Option<Usage>,
+    /// Number of reasoning chunks the backend made to produce this output
+    /// (`ModelThinker`'s chunked mode, see `statie-models::thinker`). `1`
+    /// for the unchunked path and for every backend that doesn't chunk.
+    pub chunks: u32,
 }
 
 impl ThinkOutput {
     /// A convenience constructor for tests: an answer with no reasoning, no
-    /// usage, and `content_chars` set to `text`'s own length.
+    /// usage, one chunk, and `content_chars` set to `text`'s own length.
     pub fn answer(text: impl Into<String>) -> Self {
         let answer = text.into();
         ThinkOutput {
@@ -58,6 +62,7 @@ impl ThinkOutput {
             answer,
             reasoning_chars: 0,
             usage: None,
+            chunks: 1,
         }
     }
 }

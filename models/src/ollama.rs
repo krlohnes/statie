@@ -153,10 +153,10 @@ impl OllamaModel {
 
     /// Builds the `/api/chat` request body shared by `step` and
     /// `chat_free`: model, streaming, `think`, the two messages, and
-    /// `options` (with `num_ctx` always pinned last so it always wins). The
-    /// caller adds `format` on top when it wants one -- `chat_free` never
-    /// does.
-    fn base_body(&self, system: &str, user: &str, think: bool) -> Value {
+    /// `options` (with `extra_options` merged in on top of `cfg.options`,
+    /// then `num_ctx` always pinned last so it always wins). The caller adds
+    /// `format` on top when it wants one -- `chat_free` never does.
+    fn base_body(&self, system: &str, user: &str, think: bool, extra_options: &Value) -> Value {
         let mut body = json!({
             "model": self.cfg.model,
             "stream": true,
@@ -170,6 +170,11 @@ impl OllamaModel {
             Value::Object(map) => map.clone(),
             _ => serde_json::Map::new(),
         };
+        if let Value::Object(extra) = extra_options {
+            for (k, v) in extra {
+                options.insert(k.clone(), v.clone());
+            }
+        }
         options.insert("num_ctx".to_string(), json!(self.cfg.num_ctx));
         body["options"] = Value::Object(options);
         body
@@ -179,9 +184,7 @@ impl OllamaModel {
     /// of `cfg.format`. Used by `ModelThinker` (`statie-models::thinker`) to
     /// run a reasoning subagent call against the same Ollama server, with
     /// native thinking on and nothing constraining the reply's shape.
-    /// Shares request construction (`base_body`), retry behavior
-    /// (`run_request_with_retries`), and the ndjson streaming parser
-    /// (`run_request`/`process_line`) with `step`.
+    /// Delegates to `chat_free_with` with no extra options.
     pub async fn chat_free(
         &self,
         system: &str,
@@ -189,7 +192,23 @@ impl OllamaModel {
         think: bool,
         cancel: CancellationToken,
     ) -> Result<FreeReply, ModelError> {
-        let body = self.base_body(system, user, think);
+        self.chat_free_with(system, user, think, json!({}), cancel)
+            .await
+    }
+
+    /// Like `chat_free`, but merges `extra_options` into the request's
+    /// `options` for this call only (e.g. `num_predict`, to cap one chunk of
+    /// a chunked reasoning pass -- see `ModelThinker`). `num_ctx` stays
+    /// pinned to `cfg.num_ctx` regardless of what `extra_options` contains.
+    pub async fn chat_free_with(
+        &self,
+        system: &str,
+        user: &str,
+        think: bool,
+        extra_options: Value,
+        cancel: CancellationToken,
+    ) -> Result<FreeReply, ModelError> {
+        let body = self.base_body(system, user, think, &extra_options);
 
         let request_text =
             serde_json::to_string(&body).map_err(|e| ModelError::Io(e.to_string()))?;
@@ -233,7 +252,7 @@ impl Model for OllamaModel {
         sink: &mut dyn StepSink,
         cancel: CancellationToken,
     ) -> Result<RawOutput, ModelError> {
-        let mut body = self.base_body(prompt.system(), prompt.user(), self.cfg.think);
+        let mut body = self.base_body(prompt.system(), prompt.user(), self.cfg.think, &json!({}));
         match self.cfg.format {
             OllamaFormat::Schema => body["format"] = schema.as_value().clone(),
             OllamaFormat::Json => body["format"] = json!("json"),

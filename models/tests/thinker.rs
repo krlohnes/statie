@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use statie_core::{ThinkError, ThinkInput, Thinker};
-use statie_models::{FreeReply, ModelThinker, OllamaConfig, OllamaFormat, OllamaModel};
+use statie_models::{
+    ChunkConfig, FreeReply, ModelThinker, OllamaConfig, OllamaFormat, OllamaModel,
+};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -450,4 +452,182 @@ async fn model_thinker_times_out() {
         .expect_err("timeout expected");
 
     assert!(matches!(err, ThinkError::Timeout), "got {err:?}");
+}
+
+/// Chunk 1 returns thinking only with `done_reason: "length"` (the model
+/// was still reasoning when the cap landed); the carry-over call summarizes
+/// it; chunk 2 restarts from the original prompt plus that summary and
+/// returns content with an `ANSWER:` marker. Checks the answer, `chunks ==
+/// 2`, summed `reasoning_chars`, that chunk 2's request carries "Reasoning
+/// so far" and the summary text with `think: true`, that the carry-over
+/// request has `think: false` and `num_predict: 600`, and that every
+/// request (including the carry-over) carries the same `num_ctx`.
+#[tokio::test]
+async fn chunked_thinker_carries_over_and_answers_on_second_chunk() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server = tokio::spawn(async move {
+        // Chunk 1: thinking only, done_reason length.
+        let (mut stream, _) = listener.accept().await.expect("accept 1");
+        let body1 = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"thinking":"chunk one reasoning trace"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"length"}"#,
+            ],
+        )
+        .await;
+
+        // Carry-over: thinking off, short summary.
+        let (mut stream, _) = listener.accept().await.expect("accept carry-over");
+        let body_carry = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"content":"SUMMARY_MARKER: established X, open Y, next check Z"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#,
+            ],
+        )
+        .await;
+
+        // Chunk 2: answers.
+        let (mut stream, _) = listener.accept().await.expect("accept 2");
+        let body2 = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"thinking":"chunk two reasoning"},"done":false}"#,
+                r#"{"message":{"content":"ANSWER:\nfix tax.rs line 3"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#,
+            ],
+        )
+        .await;
+
+        (body1, body_carry, body2)
+    });
+
+    let cfg = cfg_for(addr);
+    let model = Arc::new(OllamaModel::new(cfg).expect("build model"));
+    let thinker = ModelThinker::new(model, Duration::from_secs(5)).with_chunking(ChunkConfig {
+        chunk_tokens: 6000,
+        max_chunks: 4,
+        carry_over_chars: 1500,
+    });
+
+    let out = thinker
+        .think(
+            ThinkInput {
+                system: "sys",
+                user: "usr",
+                question: "what's wrong?",
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("think succeeds");
+
+    assert_eq!(out.answer, "fix tax.rs line 3");
+    assert_eq!(out.chunks, 2);
+    assert_eq!(
+        out.reasoning_chars,
+        "chunk one reasoning trace".chars().count() + "chunk two reasoning".chars().count()
+    );
+
+    let (body1_text, body_carry_text, body2_text) = server.await.expect("server task");
+
+    let body1: serde_json::Value = serde_json::from_str(&body1_text).expect("valid json");
+    assert_eq!(body1["think"], serde_json::json!(true));
+    assert_eq!(body1["options"]["num_predict"], serde_json::json!(6000));
+    assert_eq!(body1["options"]["num_ctx"], serde_json::json!(32768));
+
+    let body_carry: serde_json::Value = serde_json::from_str(&body_carry_text).expect("valid json");
+    assert_eq!(body_carry["think"], serde_json::json!(false));
+    assert_eq!(body_carry["options"]["num_predict"], serde_json::json!(600));
+    assert_eq!(body_carry["options"]["num_ctx"], serde_json::json!(32768));
+
+    let body2: serde_json::Value = serde_json::from_str(&body2_text).expect("valid json");
+    assert_eq!(body2["think"], serde_json::json!(true));
+    assert_eq!(body2["options"]["num_ctx"], serde_json::json!(32768));
+    let messages2 = body2["messages"].as_array().expect("messages array");
+    let user2 = messages2[1]["content"].as_str().expect("user content");
+    assert!(
+        user2.contains("Reasoning so far"),
+        "chunk 2 user message must carry the carry-over marker: {user2}"
+    );
+    assert!(
+        user2.contains("SUMMARY_MARKER"),
+        "chunk 2 user message must carry the carry-over summary text: {user2}"
+    );
+}
+
+/// When every chunk keeps hitting `done_reason: "length"` with no content,
+/// the thinker must give up after `max_chunks` with a named `Backend` error
+/// mentioning the chunk count.
+#[tokio::test]
+async fn chunked_thinker_exhausts_max_chunks() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let max_chunks = 2u32;
+
+    tokio::spawn(async move {
+        // Chunk 1: length, no content.
+        let (mut stream, _) = listener.accept().await.expect("accept 1");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[r#"{"message":{"content":""},"done":true,"done_reason":"length"}"#],
+        )
+        .await;
+
+        // Carry-over for chunk 1 -> 2.
+        let (mut stream, _) = listener.accept().await.expect("accept carry-over");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[r#"{"message":{"content":"summary"},"done":true,"done_reason":"stop"}"#],
+        )
+        .await;
+
+        // Chunk 2 (== max_chunks): length again, no content -- loop must
+        // stop here without a further carry-over call.
+        let (mut stream, _) = listener.accept().await.expect("accept 2");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[r#"{"message":{"content":""},"done":true,"done_reason":"length"}"#],
+        )
+        .await;
+    });
+
+    let cfg = cfg_for(addr);
+    let model = Arc::new(OllamaModel::new(cfg).expect("build model"));
+    let thinker = ModelThinker::new(model, Duration::from_secs(5)).with_chunking(ChunkConfig {
+        chunk_tokens: 6000,
+        max_chunks,
+        carry_over_chars: 1500,
+    });
+
+    let err = thinker
+        .think(
+            ThinkInput {
+                system: "sys",
+                user: "usr",
+                question: "q",
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("exhausted chunks should error");
+
+    match err {
+        ThinkError::Backend(msg) => {
+            assert!(
+                msg.contains(&max_chunks.to_string()),
+                "msg should name the chunk count: {msg}"
+            );
+        }
+        other => panic!("expected Backend, got {other:?}"),
+    }
 }

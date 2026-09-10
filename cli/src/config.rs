@@ -149,7 +149,21 @@ pub struct ThinkerConfig {
     /// differs from the last one, so every `think` call costs a reload each
     /// way (into this window, then back to `model.num_ctx` for the next
     /// acting-model step); acceptable because `think` fires rarely.
-    pub num_ctx: u32,
+    ///
+    /// `None` (the default) picks the window based on `chunked`: 32768 when
+    /// unchunked (the reasoning trace gets its own large window, at the cost
+    /// of that reload each way), or the session's own `model.num_ctx` when
+    /// `chunked` is true (the whole point of chunking is to fit inside the
+    /// window the acting model already runs in, so no reload is needed).
+    pub num_ctx: Option<u32>,
+    /// Runs `think` as a Markovian-Thinker chunked loop (Aghajohari et al.,
+    /// ICLR 2026) instead of one native-thinking call: fixed-size reasoning
+    /// chunks with a short summarized carry-over between them, so a long
+    /// trace fits inside the session's own context window rather than
+    /// needing a separate, larger one and the model reload that comes with
+    /// switching to it. Default `false` (today's unchunked behavior). When
+    /// `true`, built with `ChunkConfig::default()`.
+    pub chunked: bool,
 }
 
 impl Default for ThinkerConfig {
@@ -157,10 +171,15 @@ impl Default for ThinkerConfig {
         ThinkerConfig {
             model: None,
             timeout_secs: 600,
-            num_ctx: 32768,
+            num_ctx: None,
+            chunked: false,
         }
     }
 }
+
+/// The default `num_ctx` for an unchunked thinker: its own large window,
+/// separate from the acting model's.
+const UNCHUNKED_DEFAULT_NUM_CTX: u32 = 32768;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -518,9 +537,9 @@ impl Config {
     /// `build_model_from` returns for other backends): a `thinker.model`
     /// (or, absent that, top-level `model`) with any other backend is a
     /// named error. The resolved model config's `num_ctx` is overridden by
-    /// `thinker.num_ctx` -- the reasoning call gets its own context window,
-    /// separate from the acting model's pinned `model.num_ctx` (see
-    /// `ThinkerConfig::num_ctx`'s doc).
+    /// `self.effective_thinker_num_ctx()` -- see `ThinkerConfig::num_ctx`'s
+    /// doc. When `thinker.chunked` is true, the thinker is built with
+    /// `ChunkConfig::default()` (see `ModelThinker::with_chunking`).
     pub fn build_thinker(&self) -> anyhow::Result<Option<Arc<dyn Thinker>>> {
         let Some(t) = &self.thinker else {
             return Ok(None);
@@ -533,10 +552,25 @@ impl Config {
             );
         }
         let mut ollama_cfg = ollama_config(model_cfg);
-        ollama_cfg.num_ctx = t.num_ctx;
+        ollama_cfg.num_ctx = self.effective_thinker_num_ctx(t);
         let model = OllamaModel::new(ollama_cfg)?;
-        let thinker = ModelThinker::new(Arc::new(model), Duration::from_secs(t.timeout_secs));
+        let mut thinker = ModelThinker::new(Arc::new(model), Duration::from_secs(t.timeout_secs));
+        if t.chunked {
+            thinker = thinker.with_chunking(statie_models::ChunkConfig::default());
+        }
         Ok(Some(Arc::new(thinker)))
+    }
+
+    /// Resolves the `num_ctx` a thinker is built with: `thinker.num_ctx`
+    /// when the user set it explicitly, else 32768 when unchunked or the
+    /// session's own `model.num_ctx` when `thinker.chunked` is true (see
+    /// `ThinkerConfig::num_ctx`'s doc).
+    fn effective_thinker_num_ctx(&self, t: &ThinkerConfig) -> u32 {
+        t.num_ctx.unwrap_or(if t.chunked {
+            self.model.num_ctx
+        } else {
+            UNCHUNKED_DEFAULT_NUM_CTX
+        })
     }
 
     /// Resolves `self.store.path` and `self.session_log` against the
@@ -1331,21 +1365,29 @@ mod tests {
     #[test]
     fn thinker_section_parses_and_fills_in_defaults() {
         let cfg: Config = serde_json::from_str(r#"{"thinker":{"timeout_secs":30}}"#).unwrap();
-        let t = cfg.thinker.expect("thinker section should parse");
+        let t = cfg.thinker.clone().expect("thinker section should parse");
         assert_eq!(t.timeout_secs, 30);
         assert!(t.model.is_none());
-        assert_eq!(t.num_ctx, 32768, "thinker.num_ctx must default to 32768");
+        assert_eq!(t.num_ctx, None, "thinker.num_ctx must default to None");
+        assert!(!t.chunked, "thinker.chunked must default to false");
+        assert_eq!(
+            cfg.effective_thinker_num_ctx(&t),
+            32768,
+            "unchunked, effective num_ctx must default to 32768"
+        );
     }
 
     #[test]
     fn thinker_num_ctx_defaults_and_parses_explicit_value() {
         let cfg: Config = serde_json::from_str(r#"{"thinker":{}}"#).unwrap();
-        let t = cfg.thinker.expect("thinker section should parse");
-        assert_eq!(t.num_ctx, 32768);
+        let t = cfg.thinker.clone().expect("thinker section should parse");
+        assert_eq!(t.num_ctx, None);
+        assert_eq!(cfg.effective_thinker_num_ctx(&t), 32768);
 
         let cfg: Config = serde_json::from_str(r#"{"thinker":{"num_ctx":65536}}"#).unwrap();
-        let t = cfg.thinker.expect("thinker section should parse");
-        assert_eq!(t.num_ctx, 65536);
+        let t = cfg.thinker.clone().expect("thinker section should parse");
+        assert_eq!(t.num_ctx, Some(65536));
+        assert_eq!(cfg.effective_thinker_num_ctx(&t), 65536);
     }
 
     /// The thinker's `num_ctx` must win over the (possibly much smaller)
@@ -1364,12 +1406,59 @@ mod tests {
         let t = cfg.thinker.as_ref().expect("thinker section should parse");
         let model_cfg = t.model.as_ref().unwrap_or(&cfg.model);
         let mut ollama_cfg = ollama_config(model_cfg);
-        ollama_cfg.num_ctx = t.num_ctx;
+        ollama_cfg.num_ctx = cfg.effective_thinker_num_ctx(t);
         assert_eq!(
             ollama_cfg.num_ctx, 65536,
             "must carry the thinker's num_ctx, not the model's"
         );
         assert_ne!(ollama_cfg.num_ctx, cfg.model.num_ctx);
+    }
+
+    /// `thinker.chunked` with no explicit `num_ctx` must use the session's
+    /// own `model.num_ctx` -- the whole point of chunking is to fit inside
+    /// the window the acting model already runs in, avoiding the reload a
+    /// separate, larger unchunked window costs each way.
+    #[test]
+    fn thinker_chunked_without_explicit_num_ctx_uses_model_num_ctx() {
+        let text = serde_json::json!({
+            "model": {"backend": "ollama", "num_ctx": 16384},
+            "thinker": {"chunked": true}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let t = cfg.thinker.as_ref().expect("thinker section should parse");
+        assert!(t.chunked);
+        assert_eq!(cfg.effective_thinker_num_ctx(t), 16384);
+    }
+
+    /// `thinker.chunked` with an explicit `num_ctx` must still use that
+    /// explicit value, not the session's `model.num_ctx`.
+    #[test]
+    fn thinker_chunked_with_explicit_num_ctx_uses_explicit_value() {
+        let text = serde_json::json!({
+            "model": {"backend": "ollama", "num_ctx": 16384},
+            "thinker": {"chunked": true, "num_ctx": 20000}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let t = cfg.thinker.as_ref().expect("thinker section should parse");
+        assert_eq!(cfg.effective_thinker_num_ctx(t), 20000);
+    }
+
+    /// `build_thinker` with `chunked: true` must actually build a chunked
+    /// thinker whose configured `num_ctx` equals the model's -- an
+    /// end-to-end check of `build_thinker` + `effective_thinker_num_ctx`
+    /// together, not just the resolution helper in isolation.
+    #[test]
+    fn build_thinker_chunked_builds_with_model_num_ctx() {
+        let text = serde_json::json!({
+            "model": {"backend": "ollama", "num_ctx": 16384},
+            "thinker": {"chunked": true}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let thinker = cfg.build_thinker().unwrap();
+        assert!(thinker.is_some());
     }
 
     #[test]

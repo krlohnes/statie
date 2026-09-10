@@ -16,5 +16,5 @@ pub use maintainer::ModelMaintainer;
 pub use mock::{MockModel, MockTurn, RecordedPrompt};
 pub use ollama::{FreeReply, OllamaConfig, OllamaFormat, OllamaModel};
 pub use openai::{OpenAiCompatConfig, OpenAiCompatModel};
-pub use thinker::ModelThinker;
+pub use thinker::{ChunkConfig, ModelThinker};
 pub use thoughts::strip_thoughts;

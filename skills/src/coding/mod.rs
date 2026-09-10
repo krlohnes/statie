@@ -469,14 +469,32 @@ fn parse_think_output(output: &str) -> Option<(String, String)> {
 /// `CodingWorkspace::decision` from a `think` call (set) or a passing
 /// `test` call (cleared). Any other tool (`search`, `list_files`, `shell`,
 /// `recall`, `filter_last_tool_call`) returns `None` -- nothing to record.
+///
+/// `seen_enabled`/`decision_enabled` are `guards.seen_map`/`guards.
+/// decision_field` (`core/src/guards.rs`; BACKLOG.md item 2), threaded in
+/// from each skill's own field of the same name (see `PlanSkill::
+/// state_fields` and its siblings). `seen_enabled` off: the `read_file`/
+/// `edit_file`/`write_file`/`revert_file` branches below all return `None`
+/// instead of a `seen` patch -- the field is never written and stays
+/// whatever it already was (empty, for a session that never had the switch
+/// on). `decision_enabled` off: the `think` branch returns `None` instead of
+/// setting `decision` (the `think` tool still ran and its answer already
+/// reached the model as that call's own observation -- only the persistent
+/// copy is skipped), and the `test`-pass branch returns `None` instead of
+/// clearing it (nothing to clear -- it was never set).
 fn common_after_tool(
     ws: &CodingWorkspace,
     step: u64,
     name: &str,
     args: &serde_json::Value,
     output: &str,
+    seen_enabled: bool,
+    decision_enabled: bool,
 ) -> Option<Patch> {
     if name == "think" {
+        if !decision_enabled {
+            return None;
+        }
         let (question, answer) = parse_think_output(output)?;
         return Some(serde_json::json!({
             "decision": {
@@ -488,9 +506,13 @@ fn common_after_tool(
     }
 
     if name == "test" {
-        if ws.decision.is_some() && statie_core::is_pass(output) {
+        if decision_enabled && ws.decision.is_some() && statie_core::is_pass(output) {
             return Some(serde_json::json!({ "decision": null }));
         }
+        return None;
+    }
+
+    if !seen_enabled {
         return None;
     }
 
@@ -2015,6 +2037,12 @@ pub struct PlanSkill {
     /// rule audit"); defaults to `true` (today's behaviour). Set with
     /// [`PlanSkill::with_done_stays_done`].
     done_stays_done: bool,
+    /// `guards.seen_map` (`core/src/guards.rs`; BACKLOG.md item 2); defaults
+    /// to `true` (today's behaviour). Set with [`PlanSkill::state_fields`].
+    seen: bool,
+    /// `guards.decision_field`; see [`PlanSkill::seen`]. Set with
+    /// [`PlanSkill::state_fields`].
+    decision: bool,
 }
 
 impl Default for PlanSkill {
@@ -2023,6 +2051,8 @@ impl Default for PlanSkill {
             spec: OnceSpec::default(),
             delegates: Vec::new(),
             done_stays_done: true,
+            seen: true,
+            decision: true,
         }
     }
 }
@@ -2033,6 +2063,10 @@ pub struct ImplementSkill {
     delegates: Vec<String>,
     /// `guards.done_stays_done`; see [`PlanSkill::done_stays_done`].
     done_stays_done: bool,
+    /// `guards.seen_map`; see [`PlanSkill::seen`].
+    seen: bool,
+    /// `guards.decision_field`; see [`PlanSkill::seen`].
+    decision: bool,
 }
 
 impl Default for ImplementSkill {
@@ -2041,6 +2075,8 @@ impl Default for ImplementSkill {
             spec: OnceSpec::default(),
             delegates: Vec::new(),
             done_stays_done: true,
+            seen: true,
+            decision: true,
         }
     }
 }
@@ -2052,6 +2088,10 @@ pub struct ReviewSkill {
     delegates: Vec<String>,
     /// `guards.done_stays_done`; see [`PlanSkill::done_stays_done`].
     done_stays_done: bool,
+    /// `guards.seen_map`; see [`PlanSkill::seen`].
+    seen: bool,
+    /// `guards.decision_field`; see [`PlanSkill::seen`].
+    decision: bool,
 }
 
 impl Default for ReviewSkill {
@@ -2060,6 +2100,8 @@ impl Default for ReviewSkill {
             spec: OnceSpec::default(),
             delegates: Vec::new(),
             done_stays_done: true,
+            seen: true,
+            decision: true,
         }
     }
 }
@@ -2236,6 +2278,8 @@ impl PlanSkill {
             spec: OnceSpec::default(),
             delegates,
             done_stays_done: true,
+            seen: true,
+            decision: true,
         }
     }
 
@@ -2244,6 +2288,19 @@ impl PlanSkill {
     /// works: the rule audit").
     pub fn with_done_stays_done(mut self, enabled: bool) -> Self {
         self.done_stays_done = enabled;
+        self
+    }
+
+    /// Sets `guards.seen_map`/`guards.decision_field` (`core/src/
+    /// guards.rs`; both default `true`; BACKLOG.md item 2). `seen = false`:
+    /// `CodingWorkspace::seen` is never written by the harness (stays
+    /// empty). `decision = false`: `CodingWorkspace::decision` is never
+    /// written or cleared by the harness (the `think` tool still runs and
+    /// its answer still reaches the model as that call's own observation).
+    /// See `common_after_tool`'s doc for the exact per-branch effect.
+    pub fn state_fields(mut self, seen: bool, decision: bool) -> Self {
+        self.seen = seen;
+        self.decision = decision;
         self
     }
 }
@@ -2377,7 +2434,7 @@ impl Skill for PlanSkill {
         args: &serde_json::Value,
         output: &str,
     ) -> Option<Patch> {
-        common_after_tool(ws, step, name, args, output)
+        common_after_tool(ws, step, name, args, output, self.seen, self.decision)
     }
 
     /// A bare `done` (no `next_skill` set) in `plan` means "the plan is
@@ -2515,6 +2572,8 @@ impl ImplementSkill {
             spec: OnceSpec::default(),
             delegates,
             done_stays_done: true,
+            seen: true,
+            decision: true,
         }
     }
 
@@ -2523,6 +2582,14 @@ impl ImplementSkill {
     /// works: the rule audit").
     pub fn with_done_stays_done(mut self, enabled: bool) -> Self {
         self.done_stays_done = enabled;
+        self
+    }
+
+    /// Sets `guards.seen_map`/`guards.decision_field`; see
+    /// [`PlanSkill::state_fields`].
+    pub fn state_fields(mut self, seen: bool, decision: bool) -> Self {
+        self.seen = seen;
+        self.decision = decision;
         self
     }
 }
@@ -2686,7 +2753,7 @@ impl Skill for ImplementSkill {
         args: &serde_json::Value,
         output: &str,
     ) -> Option<Patch> {
-        common_after_tool(ws, step, name, args, output)
+        common_after_tool(ws, step, name, args, output, self.seen, self.decision)
     }
 
     fn silent_read_cap(&self) -> Option<u32> {
@@ -2809,6 +2876,8 @@ impl ReviewSkill {
             spec: OnceSpec::default(),
             delegates,
             done_stays_done: true,
+            seen: true,
+            decision: true,
         }
     }
 
@@ -2817,6 +2886,14 @@ impl ReviewSkill {
     /// works: the rule audit").
     pub fn with_done_stays_done(mut self, enabled: bool) -> Self {
         self.done_stays_done = enabled;
+        self
+    }
+
+    /// Sets `guards.seen_map`/`guards.decision_field`; see
+    /// [`PlanSkill::state_fields`].
+    pub fn state_fields(mut self, seen: bool, decision: bool) -> Self {
+        self.seen = seen;
+        self.decision = decision;
         self
     }
 }
@@ -2937,7 +3014,7 @@ impl Skill for ReviewSkill {
         args: &serde_json::Value,
         output: &str,
     ) -> Option<Patch> {
-        common_after_tool(ws, step, name, args, output)
+        common_after_tool(ws, step, name, args, output, self.seen, self.decision)
     }
 
     /// First strips every harness-owned key present in the raw patch (see
@@ -3038,8 +3115,10 @@ pub fn coding_skills() -> Vec<(
 ///
 /// `done_stays_done` defaults to `false` here (`coding_skills_configured`'s
 /// default path, the first bench battery's audit showed the switch off no
-/// worse -- see `plan_rules`'s doc); use `coding_skills_configured` directly
-/// to opt back in.
+/// worse -- see `plan_rules`'s doc); `seen_map`/`decision_field` default to
+/// `true` (today's behaviour, like every other guard -- see `core/src/
+/// guards.rs`); use `coding_skills_configured` directly to opt any of these
+/// back.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_with_delegates(
     delegates: Vec<String>,
@@ -3047,17 +3126,24 @@ pub fn coding_skills_with_delegates(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
 )> {
-    coding_skills_configured(delegates, false)
+    coding_skills_configured(delegates, false, true, true)
 }
 
-/// All four coding skills with both knobs: `delegates` as in
-/// [`coding_skills_with_delegates`], and `done_stays_done` =
-/// `guards.done_stays_done` (statie-spec.md "10. After it works: the rule
-/// audit") threaded into `plan`, `implement`, and `review`.
+/// All four coding skills with every knob: `delegates` as in
+/// [`coding_skills_with_delegates`]; `done_stays_done` = `guards.
+/// done_stays_done` (statie-spec.md "10. After it works: the rule audit");
+/// `seen`/`decision` = `guards.seen_map`/`guards.decision_field`
+/// (`core/src/guards.rs`; BACKLOG.md item 2) -- all threaded into `plan`,
+/// `implement`, and `review` via [`PlanSkill::with_done_stays_done`]/
+/// [`PlanSkill::state_fields`] and their siblings. `router` is unaffected by
+/// all three: it has no plan-step rules and no tools, so nothing in it reads
+/// any of them.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_configured(
     delegates: Vec<String>,
     done_stays_done: bool,
+    seen: bool,
+    decision: bool,
 ) -> Vec<(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
@@ -3067,19 +3153,26 @@ pub fn coding_skills_configured(
         (
             "plan".to_string(),
             Arc::new(
-                PlanSkill::with_delegates(delegates.clone()).with_done_stays_done(done_stays_done),
+                PlanSkill::with_delegates(delegates.clone())
+                    .with_done_stays_done(done_stays_done)
+                    .state_fields(seen, decision),
             ),
         ),
         (
             "implement".to_string(),
             Arc::new(
                 ImplementSkill::with_delegates(delegates.clone())
-                    .with_done_stays_done(done_stays_done),
+                    .with_done_stays_done(done_stays_done)
+                    .state_fields(seen, decision),
             ),
         ),
         (
             "review".to_string(),
-            Arc::new(ReviewSkill::with_delegates(delegates).with_done_stays_done(done_stays_done)),
+            Arc::new(
+                ReviewSkill::with_delegates(delegates)
+                    .with_done_stays_done(done_stays_done)
+                    .state_fields(seen, decision),
+            ),
         ),
     ]
 }

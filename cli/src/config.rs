@@ -866,6 +866,46 @@ mod tests {
             "done_stays_done defaults to false, unlike the other rules"
         );
         assert!(parsed.guards.commitment_read_cap);
+        assert!(parsed.guards.seen_map);
+        assert!(parsed.guards.decision_field);
+
+        // Round-trips through serialize -> deserialize unchanged.
+        let json = serde_json::to_string(&parsed).unwrap();
+        let round_tripped: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.guards, parsed.guards);
+    }
+
+    /// BACKLOG.md item 2: `Guards` deserialises as a whole, so `guards.
+    /// seen_map` picks up a config value the same way every other field
+    /// does -- no special-casing needed in `Config`'s own (de)serialization.
+    #[test]
+    fn guards_seen_map_false_parses_with_other_fields_at_default() {
+        let text = serde_json::json!({
+            "guards": {"seen_map": false}
+        })
+        .to_string();
+        let parsed: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.guards,
+            Guards {
+                seen_map: false,
+                ..Guards::default()
+            }
+        );
+        assert!(parsed.guards.redundant_reads);
+        assert!(parsed.guards.silent_reads);
+        assert!(parsed.guards.read_guard);
+        assert!(parsed.guards.redundant_verify);
+        assert!(
+            !parsed.guards.done_stays_done,
+            "done_stays_done defaults to false, unlike the other rules"
+        );
+        assert!(parsed.guards.commitment_read_cap);
+        assert!(
+            parsed.guards.decision_field,
+            "decision_field is a separate switch from seen_map and keeps its own default"
+        );
+        assert!(!parsed.guards.seen_map);
 
         // Round-trips through serialize -> deserialize unchanged.
         let json = serde_json::to_string(&parsed).unwrap();

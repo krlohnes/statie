@@ -52,6 +52,28 @@ pub struct Guards {
     /// commitment; instead the harness appends a short note to the
     /// observation saying the commitment is still pending.
     pub commitment_read_cap: bool,
+    /// `CodingWorkspace::seen` (milestone 10): the harness writes it from
+    /// `read_file`/`edit_file`/`write_file`/`revert_file` calls
+    /// (`common_after_tool` in `skills/src/coding/mod.rs`). Off: the field
+    /// is never written by the harness and stays empty for the life of the
+    /// session -- a model patch touching it is still stripped the same as
+    /// always (it remains harness-owned), there is just nothing for the
+    /// harness itself to write there. Added for BACKLOG.md item 2: running
+    /// the battery with this off isolates model-owned state (`files`,
+    /// `recent_summary`, `plan`) from harness-owned state so the two can be
+    /// measured against each other with the model, budgets, and window
+    /// fixed.
+    pub seen_map: bool,
+    /// `CodingWorkspace::decision` (milestone 10 / repeated-failure think):
+    /// the harness writes it from a `think` tool call's output and clears
+    /// it when a `test` call passes (`common_after_tool`). Off: neither
+    /// happens -- the field stays `null` for the life of the session. The
+    /// `think` tool itself is unaffected: it still runs (including the
+    /// automatic substitution in `implement_repeat_failure_thinks`) and its
+    /// answer still reaches the model as the tool call's own observation;
+    /// only the second, persistent copy in `decision` is switched off.
+    /// Added for BACKLOG.md item 2, same rationale as `seen_map`.
+    pub decision_field: bool,
 }
 
 impl Default for Guards {
@@ -63,6 +85,8 @@ impl Default for Guards {
             redundant_verify: true,
             done_stays_done: false,
             commitment_read_cap: true,
+            seen_map: true,
+            decision_field: true,
         }
     }
 }

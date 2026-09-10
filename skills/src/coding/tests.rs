@@ -2254,8 +2254,16 @@ fn seen_entry_reuses_an_existing_path_without_evicting() {
 fn after_tool_read_file_records_range_and_total() {
     let ws = CodingWorkspace::default();
     let output = "src/a.rs (250 lines, showing 1-100)\n";
-    let patch = common_after_tool(&ws, 7, "read_file", &json!({"path": "src/a.rs"}), output)
-        .expect("read_file should produce a seen patch");
+    let patch = common_after_tool(
+        &ws,
+        7,
+        "read_file",
+        &json!({"path": "src/a.rs"}),
+        output,
+        true,
+        true,
+    )
+    .expect("read_file should produce a seen patch");
     assert_eq!(
         patch,
         json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 100]], "edited": [], "step": 7}]})
@@ -2273,8 +2281,16 @@ fn after_tool_read_file_second_read_extends_the_range() {
         step: 7,
     });
     let output = "src/a.rs (250 lines, showing 101-200)\n";
-    let patch = common_after_tool(&ws, 9, "read_file", &json!({"path": "src/a.rs"}), output)
-        .expect("second read should produce a seen patch");
+    let patch = common_after_tool(
+        &ws,
+        9,
+        "read_file",
+        &json!({"path": "src/a.rs"}),
+        output,
+        true,
+        true,
+    )
+    .expect("second read should produce a seen patch");
     assert_eq!(
         patch,
         json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 200]], "edited": [], "step": 9}]})
@@ -2292,8 +2308,16 @@ fn after_tool_edit_file_records_edited_range() {
         step: 9,
     });
     let output = "edited src/a.rs: replaced 1 occurrence (lines 150-156)\n";
-    let patch = common_after_tool(&ws, 10, "edit_file", &json!({"path": "src/a.rs"}), output)
-        .expect("edit_file should produce a seen patch");
+    let patch = common_after_tool(
+        &ws,
+        10,
+        "edit_file",
+        &json!({"path": "src/a.rs"}),
+        output,
+        true,
+        true,
+    )
+    .expect("edit_file should produce a seen patch");
     assert_eq!(
         patch,
         json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 200]], "edited": [[150, 156]], "step": 10}]})
@@ -2314,6 +2338,8 @@ fn after_tool_write_file_replaces_the_entry() {
         "write_file",
         &json!({"path": "new.rs", "content": content}),
         "wrote 42 bytes to new.rs",
+        true,
+        true,
     )
     .expect("write_file should produce a seen patch");
     assert_eq!(
@@ -2334,8 +2360,16 @@ fn after_tool_revert_file_clears_both_ranges() {
     });
     let output =
         "reverted src/a.rs to its content from before this session's first edit (250 lines)";
-    let patch = common_after_tool(&ws, 11, "revert_file", &json!({"path": "src/a.rs"}), output)
-        .expect("revert_file should produce a seen patch");
+    let patch = common_after_tool(
+        &ws,
+        11,
+        "revert_file",
+        &json!({"path": "src/a.rs"}),
+        output,
+        true,
+        true,
+    )
+    .expect("revert_file should produce a seen patch");
     assert_eq!(
         patch,
         json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [], "edited": [], "step": 11}]})
@@ -2353,8 +2387,16 @@ fn after_tool_revert_file_removed_drops_the_entry() {
         step: 3,
     });
     let output = "removed new.rs; it did not exist before this session";
-    let patch = common_after_tool(&ws, 4, "revert_file", &json!({"path": "new.rs"}), output)
-        .expect("revert_file (removed) should still produce a seen patch");
+    let patch = common_after_tool(
+        &ws,
+        4,
+        "revert_file",
+        &json!({"path": "new.rs"}),
+        output,
+        true,
+        true,
+    )
+    .expect("revert_file (removed) should still produce a seen patch");
     assert_eq!(patch, json!({"seen": []}));
 }
 
@@ -2371,11 +2413,121 @@ fn after_tool_other_tools_produce_no_patch() {
         "think",
     ] {
         assert_eq!(
-            common_after_tool(&ws, 1, name, &json!({}), "irrelevant output"),
+            common_after_tool(&ws, 1, name, &json!({}), "irrelevant output", true, true),
             None,
             "tool `{name}` should never produce a patch for unrelated output"
         );
     }
+}
+
+// =======================================================================
+// `guards.seen_map` off (BACKLOG.md item 2, `core/src/guards.rs`):
+// `common_after_tool`'s `seen_enabled` parameter. With it `false`, every
+// tool that would otherwise write a `seen` patch (`read_file`/`edit_file`/
+// `write_file`/`revert_file`) returns `None` instead -- the field is never
+// written and stays whatever it already was (empty, for a session that
+// never had the switch on).
+// =======================================================================
+
+#[test]
+fn after_tool_seen_disabled_read_file_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "src/a.rs (250 lines, showing 1-100)\n";
+    assert_eq!(
+        common_after_tool(
+            &ws,
+            7,
+            "read_file",
+            &json!({"path": "src/a.rs"}),
+            output,
+            false,
+            true
+        ),
+        None,
+        "seen_enabled = false must suppress the seen patch a read_file would otherwise produce"
+    );
+}
+
+#[test]
+fn after_tool_seen_disabled_edit_file_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "edited src/a.rs: replaced 1 occurrence (lines 150-156)\n";
+    assert_eq!(
+        common_after_tool(
+            &ws,
+            10,
+            "edit_file",
+            &json!({"path": "src/a.rs"}),
+            output,
+            false,
+            true
+        ),
+        None
+    );
+}
+
+#[test]
+fn after_tool_seen_disabled_write_file_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let content = (1..=12)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(
+        common_after_tool(
+            &ws,
+            3,
+            "write_file",
+            &json!({"path": "new.rs", "content": content}),
+            "wrote 42 bytes to new.rs",
+            false,
+            true,
+        ),
+        None
+    );
+}
+
+#[test]
+fn after_tool_seen_disabled_revert_file_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output =
+        "reverted src/a.rs to its content from before this session's first edit (250 lines)";
+    assert_eq!(
+        common_after_tool(
+            &ws,
+            11,
+            "revert_file",
+            &json!({"path": "src/a.rs"}),
+            output,
+            false,
+            true
+        ),
+        None
+    );
+}
+
+#[test]
+fn after_tool_seen_disabled_does_not_affect_decision() {
+    // `seen_enabled = false` must not spill over into the (separate)
+    // `decision_field` switch: a `think` call with `decision_enabled = true`
+    // still sets `decision` even when `seen_enabled` is `false`.
+    let ws = CodingWorkspace::default();
+    let output = "question: why does the test fail?\nanswer:\nthe mock is stale.";
+    let patch = common_after_tool(
+        &ws,
+        7,
+        "think",
+        &json!({"question": "why does the test fail?"}),
+        output,
+        false,
+        true,
+    )
+    .expect("decision_enabled = true must still set decision when seen_enabled is false");
+    assert_eq!(
+        patch,
+        json!({"decision": {"question": "why does the test fail?", "answer": "the mock is stale.", "step": 7}})
+    );
 }
 
 // =======================================================================
@@ -2397,6 +2549,8 @@ fn after_tool_think_output_sets_decision() {
         "think",
         &json!({"question": "why does the test fail?"}),
         output,
+        true,
+        true,
     )
     .expect("a think conclusion should produce a decision patch");
     assert_eq!(
@@ -2410,8 +2564,16 @@ fn after_tool_think_output_over_1200_chars_is_truncated() {
     let ws = CodingWorkspace::default();
     let long_answer = "x".repeat(1300);
     let output = format!("question: what now?\nanswer:\n{long_answer}");
-    let patch = common_after_tool(&ws, 3, "think", &json!({"question": "what now?"}), &output)
-        .expect("a think conclusion should produce a decision patch");
+    let patch = common_after_tool(
+        &ws,
+        3,
+        "think",
+        &json!({"question": "what now?"}),
+        &output,
+        true,
+        true,
+    )
+    .expect("a think conclusion should produce a decision patch");
     let answer = patch["decision"]["answer"]
         .as_str()
         .expect("answer should be a string");
@@ -2429,7 +2591,15 @@ fn after_tool_think_not_configured_output_produces_no_patch() {
     let output = "`think` is not configured: set a `thinker` section in the config (see \
                   README, Config). Decide from what you have.";
     assert_eq!(
-        common_after_tool(&ws, 1, "think", &json!({"question": "q"}), output),
+        common_after_tool(
+            &ws,
+            1,
+            "think",
+            &json!({"question": "q"}),
+            output,
+            true,
+            true
+        ),
         None,
         "a not-configured think output must leave an existing decision unchanged (no patch)"
     );
@@ -2440,7 +2610,15 @@ fn after_tool_think_failed_output_produces_no_patch() {
     let ws = CodingWorkspace::default();
     let output = "think failed: subagent timed out";
     assert_eq!(
-        common_after_tool(&ws, 1, "think", &json!({"question": "q"}), output),
+        common_after_tool(
+            &ws,
+            1,
+            "think",
+            &json!({"question": "q"}),
+            output,
+            true,
+            true
+        ),
         None,
         "a think-failed output must leave an existing decision unchanged (no patch)"
     );
@@ -2457,7 +2635,7 @@ fn after_tool_test_pass_clears_an_existing_decision() {
         ..Default::default()
     };
     let output = "command: cargo test\nresult: pass\nexit: 0\n";
-    let patch = common_after_tool(&ws, 5, "test", &json!({}), output)
+    let patch = common_after_tool(&ws, 5, "test", &json!({}), output, true, true)
         .expect("a passing test should produce a clearing patch");
     assert_eq!(patch, json!({"decision": null}));
 }
@@ -2474,7 +2652,7 @@ fn after_tool_test_fail_leaves_an_existing_decision_alone() {
     };
     let output = "command: cargo test\nresult: fail (exit 1)\n";
     assert_eq!(
-        common_after_tool(&ws, 5, "test", &json!({}), output),
+        common_after_tool(&ws, 5, "test", &json!({}), output, true, true),
         None,
         "a failing test must leave an existing decision alone (no patch)"
     );
@@ -2485,9 +2663,80 @@ fn after_tool_test_pass_with_no_existing_decision_produces_no_patch() {
     let ws = CodingWorkspace::default();
     let output = "command: cargo test\nresult: pass\nexit: 0\n";
     assert_eq!(
-        common_after_tool(&ws, 5, "test", &json!({}), output),
+        common_after_tool(&ws, 5, "test", &json!({}), output, true, true),
         None,
         "there is nothing to clear when decision is already unset"
+    );
+}
+
+// =======================================================================
+// `guards.decision_field` off (BACKLOG.md item 2, `core/src/guards.rs`):
+// `common_after_tool`'s `decision_enabled` parameter. With it `false`, a
+// `think` output never sets `decision`, and a passing `test` with an
+// existing decision never clears it -- both return `None`. The `think`
+// tool itself is unaffected by this switch: it still runs and its answer
+// still reaches the model as that call's own observation, only the second,
+// persistent copy in `decision` is skipped.
+// =======================================================================
+
+#[test]
+fn after_tool_decision_disabled_think_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "question: why does the test fail?\nanswer:\nthe mock is stale.";
+    assert_eq!(
+        common_after_tool(
+            &ws,
+            7,
+            "think",
+            &json!({"question": "why does the test fail?"}),
+            output,
+            true,
+            false,
+        ),
+        None,
+        "decision_enabled = false must suppress the decision patch a think output would \
+         otherwise produce"
+    );
+}
+
+#[test]
+fn after_tool_decision_disabled_passing_test_with_existing_decision_produces_no_patch() {
+    let ws = CodingWorkspace {
+        decision: Some(Decision {
+            question: "why?".to_string(),
+            answer: "because.".to_string(),
+            step: 0,
+        }),
+        ..Default::default()
+    };
+    let output = "command: cargo test\nresult: pass\nexit: 0\n";
+    assert_eq!(
+        common_after_tool(&ws, 5, "test", &json!({}), output, true, false),
+        None,
+        "decision_enabled = false must leave an existing decision alone even on a passing test"
+    );
+}
+
+#[test]
+fn after_tool_decision_disabled_does_not_affect_seen() {
+    // `decision_enabled = false` must not spill over into the (separate)
+    // `seen_map` switch: a `read_file` call with `seen_enabled = true`
+    // still records `seen` even when `decision_enabled` is `false`.
+    let ws = CodingWorkspace::default();
+    let output = "src/a.rs (250 lines, showing 1-100)\n";
+    let patch = common_after_tool(
+        &ws,
+        7,
+        "read_file",
+        &json!({"path": "src/a.rs"}),
+        output,
+        true,
+        false,
+    )
+    .expect("seen_enabled = true must still record seen when decision_enabled is false");
+    assert_eq!(
+        patch,
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 100]], "edited": [], "step": 7}]})
     );
 }
 

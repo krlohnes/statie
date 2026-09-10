@@ -1350,3 +1350,7 @@ crates (types, traits, the session loop algorithm, and the type-level
 invariants) — including the design for the next milestone, on-demand
 guides and subagents as state composition — and
 [statie-spec.md](./statie-spec.md) for the original design plan it refines.
+[RELATED-WORK.md](./RELATED-WORK.md) collects the literature behind two of
+the design questions, structured thinking and state mutation over long
+context, with what each result means here. [BACKLOG.md](./BACKLOG.md) is
+the prioritised list of work and experiments drawn from it.

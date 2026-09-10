@@ -115,18 +115,28 @@ moves the metric it was built for. Ordered within each tier.
   traps, at what token cost.
 - **Depends on.** Item 3; a second arithmetic trap task.
 
-### 8. Budget and recency in the harness view, and the park-rate study
+### 8. The early-park stall becomes a `think`
+- **What.** When the model sends a second consecutive non-question
+  `ask_user` (the shape the continue-repeat cap parks on the third),
+  and no `think` has run since the last tool call, substitute `think`
+  with a question built from the state: "You had nothing to ask twice.
+  Given the task, the plan, and the last tool output, what is the next
+  concrete tool call and why?" Same once-per-streak rule as the
+  repeated-failure trigger.
+- **Why.** The park-rate study (DECISIONS.md D4): 6 of 9 parks in 96
+  runs happen before model call 15, most of them this shape, with no
+  test failure open, so the existing trigger never fires. Cuadron et
+  al.'s "premature disengagement" is the same failure named.
+- **Measure.** Park count on the battery (9 of 96 today); landing rate
+  unchanged or better.
+- **Depends on.** Nothing.
+
+### 8b. Budget and recency in the harness view (deferred)
 - **What.** Two lines in the harness view: tokens used of budget, and
-  the working set's oldest step. Separately, an analysis over existing
-  logs: `ask_user` park rate against step count and prompt size.
-- **Why.** VISTA's dashboard lifted a small model from 22.7 to 50.7%
-  with gains growing under context pressure. The context-rot follow-up
-  says the failure at length is premature termination, which is our
-  park.
-- **Measure.** Park rate before and after on the long tasks; the log
-  study is a README field note.
-- **Depends on.** Item 1 for the long tasks; the log study needs
-  nothing.
+  the working set's oldest step, per VISTA.
+- **Why deferred.** No late parks in 96 runs; peak prompt at park is
+  within 300 tokens of landed runs. Re-open if the long tasks show
+  parks that rise with length.
 
 ## P2: worth doing, weaker or narrower evidence
 

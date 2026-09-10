@@ -1233,6 +1233,89 @@ with the prompt (`done_reason: length`, no content). The trigger re-arms
 only after an edit since the last `think`, so a streak of repeats with
 nothing changed costs one call, not one per repeat.
 
+## Milestone 15: the first P0 batch (BACKLOG.md items 1, 3, 6, and the item 2 switches)
+
+Four units built in parallel by sub-agents and gated together
+(DECISIONS.md D5). None changes the step loop; each adds a primitive or
+a switch the next items are built on or measured with.
+
+### Long-horizon bench tasks (`bench/tasks/`)
+
+Three tasks join the battery, each meant to take 40 to 80 steps on a
+clean run (DECISIONS.md D3 calibrates them by running, not by design):
+
+- `multi_file_feature` (Rust, five modules): add `delete` and
+  `count_with_tag` to a small key-value store end to end, through the
+  query layer, with a new error variant; `tests/delete.rs` protected.
+- `refactor_signature` (Rust, seven modules): change `config::load`
+  from a panicking `&str -> Config` to `(&Path, &LoadOptions) ->
+  Result<Config, LoadError>` and update five callers plus two
+  unprotected test files; `tests/load.rs` protected.
+- `python_three_modules` (Python): a receipt shows dollars a hundred
+  times too large; the bug is a cents-versus-dollars formatter call in
+  `pricing.py`, but finding it needs `parser.py` and `formatter.py`
+  read too, and both of those are pinned by their own tests.
+
+`cli/tests/bench_tasks.rs` self-checks them like the rest: fixture
+fails, solution passes, protected files listed.
+
+### Worktree snapshot primitive (`tools/src/worktree.rs`)
+
+A library module, not a model-callable tool: the verification
+primitive for `try_fixes` (backlog 4) and trace-by-execution (backlog
+7). `snapshot(root)` commits the sandbox's current working tree
+(tracked, modified, and untracked, minus ignored) through a scratch
+`GIT_INDEX_FILE` under `.statie/tmp/`, `write-tree`, and `commit-tree`
+with HEAD as parent, so the real index and HEAD are never touched; a
+sandbox with no repository gets `git init` first. `candidate(&snap,
+edit)` adds a detached worktree at that commit under
+`.statie/worktrees/<sha>-<n>/` and applies one edit closure in it.
+`run_in(&cand, cmd, timeout, cap)` runs a shell command there with
+`CARGO_TARGET_DIR` defaulting to `.statie/target` (shared across
+candidates), process-group kill on timeout, output capped like the
+shell tool. `diff` commits the worktree's state as a child of the
+snapshot and diffs the two; `apply_to_sandbox` applies that diff with
+`git apply` (working tree only); `remove` tears the worktree down.
+`.statie/` goes in `.git/info/exclude`, never the tracked
+`.gitignore`. Tests (`tools/tests/worktree.rs`) prove HEAD, index, and
+`git status` are unchanged by a snapshot, untracked files are in it and
+ignored ones are not, a candidate's edit never reaches the sandbox
+until applied, a timed-out command leaves no process, and two
+candidates from one snapshot get distinct directories.
+
+### `guards.seen_map` and `guards.decision_field` (`core/src/guards.rs`)
+
+Two switches, both default `true`, threaded from the CLI config through
+`CodingRegistry::with_guards` and `coding_skills_configured` into each
+coding skill's `state_fields(seen, decision)`. With `seen_map` off,
+`common_after_tool` returns no patch for `read_file`, `edit_file`,
+`write_file`, or `revert_file`, so `seen` stays empty for the session;
+with `decision_field` off, a `think` call sets nothing and a passing
+`test` clears nothing. Both fields stay harness-owned (a model patch
+touching them is still stripped) and still render, empty, in the state
+view. Together with `maintainer` absent they make the model-owned arm
+of backlog item 2.
+
+### Bounded-window thinking (`models/src/thinker.rs`)
+
+`ModelThinker::with_chunking(ChunkConfig{chunk_tokens, max_chunks,
+carry_over_chars})` runs the reasoning call in chunks, the Markovian
+Thinker shape: each chunk is a `chat_free` call with `num_predict` set
+to the chunk budget and thinking on; if it ends with `done_reason:
+length` and no answer, a second call with thinking off and
+`num_predict` 600 asks for a short carry-over of the reasoning so far
+(`CARRY_OVER_INSTRUCTION`), and the next chunk's user prompt is the
+original plus "Reasoning so far (from a previous pass):" and that
+carry-over. The loop stops at the first chunk that produces content,
+or errors naming `max_chunks` after the last. `ThinkOutput.chunks`
+reports how many ran. The carry-over sees the whole chunk's thinking
+(`carry_over_chars` 24000, about a 6000-token chunk), not the tail: the
+first cut summarised the last 1500 characters and lost what the chunk
+established early. Config: `thinker.chunked` (default false) and
+`thinker.num_ctx` now optional; `Config::effective_thinker_num_ctx` is
+the explicit value, else the session model's `num_ctx` when chunked
+(no reload), else 32768.
+
 ## Testing conventions
 
 - Unit tests live beside code (`#[cfg(test)]`). Integration tests in `<crate>/tests/`.

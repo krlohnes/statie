@@ -1336,6 +1336,45 @@ either a default or a config knob:
   thinker and 1, 1, 2 of 2 with it, and the ordinary tasks did not
   move.
 
+- **Long tasks, first run (calibration).** Three tasks built to run
+  past eviction (BACKLOG.md item 1; DECISIONS.md D3): a five-module
+  Rust feature, a seven-module Rust signature refactor, and a Python
+  bug whose diagnosis needs three modules read. Two seeds each, the
+  build 7 thinker config, on a binary carrying the uncommitted `tests`
+  field. Steps here are model calls.
+
+  | task | seed | outcome | steps | edits | tool errors | peak prompt | seconds |
+  |---|---|---|---|---|---|---|---|
+  | multi_file_feature | 1 | parked (ask_user) | 7 | 0 | 0 | 6773 | 82 |
+  | multi_file_feature | 2 | parked (ask_user) | 8 | 0 | 0 | 7011 | 27 |
+  | python_three_modules | 1 | landed | 29 | 3 | 2 | 7234 | 99 |
+  | python_three_modules | 2 | landed | 65 | 9 | 11 | 8680 | 268 |
+  | refactor_signature | 1 | parked (ask_user) | 80 | 21 | 2 | 11408 | 888 |
+  | refactor_signature | 2 | timeout (1500 s) | 63 | 10 | 13 | 10651 | 1500 |
+
+  Three findings, each now a backlog item. The feature task never
+  started: after the baseline `test` both seeds committed to editing
+  `src/error.rs`, sent an `ask_user` stating what they would do next,
+  then two empty ones, and the continue-repeat cap parked them at call
+  7 and 8, the D4 shape exactly (the early-park trigger is in the next
+  batch). The Python task is what a long task should be: seed 1 fixed
+  the bug in 12 tool calls with its read of `pricing.py` already
+  evicted, then spent 34 steps on the review skill sending it back,
+  correctly, because two anchored inserts had left the file with a
+  duplicate import, a duplicate `TAX_RATE`, and two overlapping copies
+  of the fixed function; seed 2 landed in 65 steps with half its 16
+  edits refused. Across the battery 37 `edit_file` calls, 9 refused,
+  and the 28 that applied are where the damage was done: the insert
+  form used to mean replace (item 17). The refactor task got deep
+  (18 edits, 16 tests in seed 1) and then stalled two ways: seed 1
+  broke `tests/callers.rs` with an edit, could not repair it, and had
+  `write_file` refused by the 40-line cap although it had just printed
+  the file (item 15); seed 2 ran out of wall clock because four
+  `think` calls took 263 seconds each, three of them returning nothing
+  after exhausting the 32k window, asked the arithmetic-trace question
+  about a compile error (D9, items 6 and 18). Every other step in that
+  run averaged four to seven seconds.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

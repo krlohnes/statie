@@ -2,3 +2,4 @@
 /.statie/
 .DS_Store
 /bench-runs/
+/.claude/worktrees/

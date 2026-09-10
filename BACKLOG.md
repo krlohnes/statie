@@ -10,6 +10,7 @@ moves the metric it was built for. Ordered within each tier.
 ## P0: measure the directive, and the best-supported thinking pattern
 
 ### 1. Long-horizon bench tasks
+- **Status.** Built (d03e6c9); calibrated (D3 revised): python 2/2 landed past eviction, multi_file 0/2 early parks, refactor 0/2 (late park, think-timeout).
 - **What.** Two or three tasks that take 40 to 80 steps on a clean run:
   a multi-file feature with a test suite, a refactor that touches five
   or more files, a bug whose reproduction needs reading three modules.
@@ -24,6 +25,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing. Do first.
 
 ### 2. Harness-owned versus model-owned state, measured
+- **Status.** Switches built (c9fb618, plus `tests_field` with item 5); configs in `bench/configs/`. Battery not yet run.
 - **What.** Config toggles so the battery can run three arms with the
   model, budgets, and window fixed: (a) model-owned, maintainer off,
   `seen` and `decision` off, notes model-written; (b) current build;
@@ -40,6 +42,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Item 1.
 
 ### 3. Worktree snapshot primitive
+- **Status.** Built (c571ab8).
 - **What.** In the tools crate: snapshot the sandbox's working tree to a
   commit without touching the user's index or HEAD (temporary
   `GIT_INDEX_FILE`, `add -A`, `write-tree`, `commit-tree` with HEAD as
@@ -55,6 +58,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing. Can run in parallel with items 1 and 2.
 
 ### 4. Hypotheses and verify (`try_fixes`)
+- **Status.** Proposer (Fixer trait, ModelFixer, config) built; session verification loop in progress.
 - **What.** On the repeated-failure trigger: sample k (start at 3)
   thinking-off candidate fixes, each a concrete `edit_file`; apply each
   in its own worktree; run the test command; commit the passing one to
@@ -75,6 +79,7 @@ moves the metric it was built for. Ordered within each tier.
 ## P1: tools write more state, and the next two thinking patterns
 
 ### 5. `test` writes durable state
+- **Status.** Built, in the second gate.
 - **What.** A harness-owned `tests` field: `{cmd, pass, failing:
   [names], first_error, step}` written by `after_tool` on every `test`
   call. The model reads it instead of re-reading the observation after
@@ -88,6 +93,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing.
 
 ### 6. Bounded-window thinking for `think`
+- **Status.** Built (42a5206). Measuring on refactor_signature (D9).
 - **What.** When the reasoning call reaches a chunk budget (say 6k
   tokens) or `done_reason: length`, stop, ask for a short carry-over,
   and continue in a fresh context with the question plus the
@@ -116,6 +122,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Item 3; a second arithmetic trap task.
 
 ### 8. The early-park stall becomes a `think`
+- **Status.** In progress.
 - **What.** When the model sends a second consecutive non-question
   `ask_user` (the shape the continue-repeat cap parks on the third),
   and no `think` has run since the last tool call, substitute `think`
@@ -137,6 +144,79 @@ moves the metric it was built for. Ordered within each tier.
 - **Why deferred.** No late parks in 96 runs; peak prompt at park is
   within 300 tokens of landed runs. Re-open if the long tasks show
   parks that rise with length.
+
+### 15. `write_file` allowed after a full, recent read
+- **What.** The whole-file rewrite guard (`write_file` refuses an
+  existing file longer than a fixed line cap) consults `seen` instead:
+  a rewrite is allowed when the harness has recorded a `read_file` of
+  the whole file since the last edit of it, and refused with the
+  current note otherwise. The guard stops being a proxy for "you would
+  be writing it from memory" and checks the fact.
+- **Why.** Calibration run `refactor_signature` seed 1 parked at model
+  call 80 after 18 edits: the model had broken `tests/callers.rs` with
+  an anchored edit, could not repair it with `edit_file`, and had
+  `write_file` refused twice (62 lines, cap 40) although it had just
+  printed the whole file. It then looped `cat` and empty `ask_user`
+  until the cap parked it. `revert_file` was no way out: the original
+  is also over the cap. This is the directive applied to a guard: the
+  state knows what the model has read, so the guard should use it.
+- **Measure.** Late parks on the long tasks; `write_file` rejections;
+  landing on `refactor_signature`.
+- **Depends on.** Item 16 for reads made through `shell`.
+
+### 16. Shell reads become `read_file`
+- **What.** A `shell` command that is a pure read of one file (`cat`,
+  `head`, `tail`, `sed -n`) is substituted with the equivalent
+  `read_file` call, the way the think triggers substitute actions, with
+  a note. The read then pages, lands in `seen`, and counts for the
+  redundant-read and identical-skip guards.
+- **Why.** Both long Python runs and the refactor run read files with
+  `shell cat` (2, 7, and 8 shell calls), which bypasses `seen`, the
+  paging cap, and the guards built on them; the refactor run ended in a
+  `cat` loop no guard could see.
+- **Measure.** Shell calls that are reads, across the battery, before
+  and after; no change in landing.
+- **Depends on.** Nothing.
+
+### 17. `edit_file` stops silent corruption
+- **What.** Two checks in the edit tool. (a) An `after`/`before` insert
+  whose text contains a line that already exists in the file and looks
+  like a definition (an import, `fn`/`def`, `const`/`static`/`let` at
+  column 0, a struct field) is refused: "line N already defines this;
+  use old/new to replace it". (b) After any successful edit, if the
+  file's brace, bracket, or parenthesis balance changed, the tool output
+  ends with "this edit left braces unbalanced (+1 `}`)" so the model
+  sees it before the next `test`.
+- **Why.** Calibration runs: 37 `edit_file` calls, 9 refused (anchor
+  not found, text already present, missing `path`), 28 applied. Of the
+  applied ones, the insert form (23 of 37 calls) is used when the model
+  means replace, leaving the old code in place: both Python runs ended
+  with `pricing.py` holding a duplicate import, a duplicate `TAX_RATE`,
+  and two overlapping copies of the fixed function, which the tests
+  tolerated and the review skill had to send back for; the refactor run's
+  eighteen edits all applied and one left `tests/callers.rs` with an
+  unbalanced brace the model never repaired (the park in item 15).
+  Refusals with a reason are the shape this model recovers from;
+  silent success is the one it does not.
+- **Measure.** Duplicate-definition count in landed sandboxes; review
+  send-backs; edits per landed run; landing unchanged or better.
+- **Depends on.** Nothing. Do before the state-ownership arms, or every
+  arm pays the same tax.
+
+### 18. The repeated-failure question fits the failure
+- **What.** `REPEAT_FAILURE_QUESTION` becomes one of several, picked
+  from the normalised failure summary: a compile error ("read the
+  first error: name the file, the line, and the one edit that fixes
+  it; do not trace values"), an assertion with numbers (the current
+  arithmetic trace), a panic or exception without numbers ("name the
+  line that panics and the input that reaches it"), a timeout or hang.
+  Each caps the expected answer shape so the trace stops.
+- **Why.** DECISIONS.md D9: four thinks at 263 seconds each on a
+  compile-error refactor, three of them empty after exhausting a 32k
+  window, because the only question asks for an arithmetic trace.
+- **Measure.** `think` reasoning length, empty rate, and repeat count
+  after the think, per failure kind, on the battery.
+- **Depends on.** Nothing. Do with item 6's default switch.
 
 ## P2: worth doing, weaker or narrower evidence
 

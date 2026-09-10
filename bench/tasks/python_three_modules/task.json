@@ -1,0 +1,8 @@
+{
+  "name": "python_three_modules",
+  "prompt": "`python3 -m unittest -q` fails: the receipt built by report.py shows the wrong total (e.g. \"$9720.00\" instead of \"$97.20\" for a $97.20 order). Read parser.py, pricing.py, and formatter.py to find the real bug and fix it in the correct module -- do not change parser.py's `unit_price_cents` unit (it is documented and tested as whole cents) and do not change formatter.py's documented behavior (`format_cents` takes cents, `format_amount` takes dollars; both are used correctly elsewhere and are pinned by test_formatter.py). Do not modify any test file. All tests (test_parser.py, test_formatter.py, test_pricing.py, test_report.py) must pass afterward.",
+  "test_cmd": "python3 -m unittest -q",
+  "protected": ["test_report.py", "test_pricing.py"],
+  "timeout_secs": 1500,
+  "tags": ["python", "runtime-bug", "cross-module", "long-horizon"]
+}

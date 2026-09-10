@@ -1,0 +1,8 @@
+{
+  "name": "multi_file_feature",
+  "prompt": "This crate (src/error.rs, src/storage.rs, src/index.rs, src/query.rs, src/lib.rs) is a small key-value store: `Storage` owns key -> record data, `Index` is a tag -> keys secondary index kept in sync with it, `query` reads across both, and `Store` in lib.rs is the coordinating entry point. Add a `delete` operation end to end: `Store::delete(&mut self, key: &str) -> Result<(), StoreError>` must remove the record from `Storage`, remove that key from every tag it carried in `Index`, and return a new `StoreError::NotFound(String)` variant (holding the missing key) if the key does not exist -- without modifying storage or the index in that case. Also add `Store::count_with_tag(&self, tag: &str) -> usize` returning how many keys currently carry `tag`. Wire the deletion through the query layer the way the other operations are (do not just mutate storage and index directly from lib.rs). tests/delete.rs (protected) exercises all of this; the existing tests/basic.rs must keep passing unmodified. Verify with `cargo test`.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/delete.rs"],
+  "timeout_secs": 1500,
+  "tags": ["rust", "multi-file", "new-feature", "long-horizon"]
+}

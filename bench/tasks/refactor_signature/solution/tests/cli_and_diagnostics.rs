@@ -1,0 +1,50 @@
+use confapp::cli;
+use confapp::diagnostics;
+
+fn write_temp(name: &str, contents: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "refactor_signature_cli_diag_test_{name}_{}.conf",
+        std::process::id()
+    ));
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+#[test]
+fn cli_load_from_args_uses_second_arg_when_present() {
+    let path = write_temp("cli_arg", "name=svc-x\nport=10\n");
+    let args = vec!["prog".to_string(), path.to_string_lossy().into_owned()];
+    let cfg = cli::load_from_args(&args, "unused-default.conf").unwrap();
+    assert_eq!(cfg.name, "svc-x");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cli_load_from_args_falls_back_to_default_path() {
+    let path = write_temp("cli_default", "name=svc-y\nport=11\n");
+    let args = vec!["prog".to_string()];
+    let cfg = cli::load_from_args(&args, path.to_str().unwrap()).unwrap();
+    assert_eq!(cfg.name, "svc-y");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn diagnostics_summarize_all_reports_each_path_in_order() {
+    let path_a = write_temp("diag_a", "name=a\nport=1\n");
+    let path_b = write_temp("diag_b", "name=b\nport=2\n");
+    let paths = vec![path_a.as_path(), path_b.as_path()];
+    let summaries = diagnostics::summarize_all(&paths);
+    assert_eq!(summaries, vec!["a:1".to_string(), "b:2".to_string()]);
+    let _ = std::fs::remove_file(&path_a);
+    let _ = std::fs::remove_file(&path_b);
+}
+
+#[test]
+fn diagnostics_summarize_all_reports_error_for_bad_path() {
+    let bad = std::path::Path::new("/nonexistent/does-not-exist.conf");
+    let paths = vec![bad];
+    let summaries = diagnostics::summarize_all(&paths);
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].starts_with("error:"));
+}

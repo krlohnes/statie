@@ -13,6 +13,7 @@ mod search;
 mod shell;
 mod test_tool;
 mod think;
+mod worktree;
 mod write_file;
 
 use std::sync::Arc;
@@ -30,6 +31,10 @@ pub use search::Search;
 pub use shell::Shell;
 pub use test_tool::{TestTool, detect_test_command};
 pub use think::{Think, ThinkArgs};
+pub use worktree::{
+    Candidate, RunResult, Snapshot, WorktreeError, apply_to_sandbox, candidate, diff, remove,
+    run_in, run_in_with_env, snapshot,
+};
 pub use write_file::WriteFile;
 
 fn default_shell_timeout_secs() -> u64 {

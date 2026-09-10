@@ -48,8 +48,16 @@ pub struct ThinkOutput {
     pub usage: Option<Usage>,
     /// Number of reasoning chunks the backend made to produce this output
     /// (`ModelThinker`'s chunked mode, see `statie-models::thinker`). `1`
-    /// for the unchunked path and for every backend that doesn't chunk.
+    /// for the unchunked path and for every backend that doesn't chunk. When
+    /// `forced_answer` is `true`, this includes the forced, thinking-off
+    /// call that produced `answer`.
     pub chunks: u32,
+    /// `true` when `answer` came from the chunked loop's forced,
+    /// thinking-off call made after `chunks - 1` reasoning chunks were
+    /// exhausted without an `ANSWER:` (see `ModelThinker::think_chunked` in
+    /// `statie-models::thinker`), rather than from a chunk's own reply.
+    /// `false` for every other path.
+    pub forced_answer: bool,
 }
 
 impl ThinkOutput {
@@ -63,6 +71,7 @@ impl ThinkOutput {
             reasoning_chars: 0,
             usage: None,
             chunks: 1,
+            forced_answer: false,
         }
     }
 }

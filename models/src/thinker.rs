@@ -48,6 +48,12 @@ impl Default for ChunkConfig {
 /// summary, not another reasoning pass.
 const CARRY_OVER_NUM_PREDICT: u32 = 600;
 
+/// `num_predict` for the forced-answer call made after `ChunkConfig::max_chunks`
+/// reasoning chunks all ended without an `ANSWER:` (see
+/// `ModelThinker::think_forced_answer`): thinking is off, so this only needs
+/// to cover a short prose answer, not another reasoning pass.
+const FORCED_ANSWER_NUM_PREDICT: u32 = 700;
+
 const CARRY_OVER_INSTRUCTION: &str = "Summarize the reasoning so far in at most 10 lines: what \
                                        has been established, what is still open, and the next \
                                        step to check. Do not answer the question.";
@@ -186,6 +192,7 @@ impl Thinker for ModelThinker {
             content_chars: content.chars().count(),
             usage: reply.usage,
             chunks: 1,
+            forced_answer: false,
         })
     }
 }
@@ -249,10 +256,29 @@ impl ModelThinker {
                     content_chars: content.chars().count(),
                     usage: reply.usage,
                     chunks: chunk_idx,
+                    forced_answer: false,
                 });
             }
 
-            if reply.done_reason.as_deref() != Some("length") || chunk_idx == chunk_cfg.max_chunks {
+            let is_last_chunk = chunk_idx == chunk_cfg.max_chunks;
+            if reply.done_reason.as_deref() != Some("length") || is_last_chunk {
+                if is_last_chunk {
+                    // The last permitted chunk ended without an answer.
+                    // Rather than give up with nothing in hand, summarize
+                    // this final chunk's reasoning the same way the loop
+                    // does for every earlier chunk, then make one forced,
+                    // thinking-off call asking the model to answer from
+                    // that reasoning now.
+                    return self
+                        .think_forced_answer(
+                            original_user,
+                            &reply,
+                            chunk_cfg,
+                            total_reasoning_chars,
+                            cancel,
+                        )
+                        .await;
+                }
                 break;
             }
 
@@ -290,6 +316,93 @@ impl ModelThinker {
             "thinking exhausted {} chunks of {} tokens without answering",
             chunk_cfg.max_chunks, chunk_cfg.chunk_tokens
         )))
+    }
+
+    /// Called when `chunk_cfg.max_chunks` reasoning chunks have all ended
+    /// without an `ANSWER:`. Rather than return nothing, this makes ONE more
+    /// call, thinking off, capped at `FORCED_ANSWER_NUM_PREDICT` tokens: a
+    /// carry-over summary of the final chunk's reasoning (produced the same
+    /// way the loop's own carry-over step does) is folded into the original
+    /// prompt along with an instruction to answer now from the reasoning in
+    /// hand. Returns `Ok` with `forced_answer: true` if that call produces
+    /// non-empty content; otherwise returns the same exhausted-chunks
+    /// `Backend` error the loop would have returned, with its message
+    /// extended to say the forced answer was also empty.
+    async fn think_forced_answer(
+        &self,
+        original_user: &str,
+        last_reply: &crate::ollama::FreeReply,
+        chunk_cfg: ChunkConfig,
+        total_reasoning_chars: usize,
+        cancel: CancellationToken,
+    ) -> Result<ThinkOutput, ThinkError> {
+        // Carry over the final chunk's reasoning the same way the loop does
+        // for every earlier chunk, so the forced call sees it too.
+        let thinking_tail = tail_chars(&last_reply.thinking, chunk_cfg.carry_over_chars);
+        let carry_over_prompt = format!("{thinking_tail}\n\n{CARRY_OVER_INSTRUCTION}");
+        let carry_over_call = tokio::time::timeout(
+            self.timeout,
+            self.model.chat_free_with(
+                THINK_SYSTEM_PROMPT,
+                &carry_over_prompt,
+                false,
+                json!({ "num_predict": CARRY_OVER_NUM_PREDICT }),
+                cancel.clone(),
+            ),
+        )
+        .await;
+
+        let carry_over_reply = match carry_over_call {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => return Err(ThinkError::Backend(e.to_string())),
+            Err(_elapsed) => return Err(ThinkError::Timeout),
+        };
+        let summary = carry_over_reply.content.trim();
+
+        let forced_user = format!(
+            "{original_user}\n\nReasoning so far (from previous passes):\n{summary}\n\nYou are \
+             out of thinking budget. Answer now from the reasoning above. Reply with `ANSWER:` \
+             followed by your best conclusion in at most five sentences; if the reasoning did \
+             not reach a conclusion, say what the most likely cause is and the one thing to \
+             check next."
+        );
+
+        let forced_call = tokio::time::timeout(
+            self.timeout,
+            self.model.chat_free_with(
+                THINK_SYSTEM_PROMPT,
+                &forced_user,
+                false,
+                json!({ "num_predict": FORCED_ANSWER_NUM_PREDICT }),
+                cancel,
+            ),
+        )
+        .await;
+
+        let forced_reply = match forced_call {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => return Err(ThinkError::Backend(e.to_string())),
+            Err(_elapsed) => return Err(ThinkError::Timeout),
+        };
+
+        let content = forced_reply.content.trim();
+        if content.is_empty() {
+            return Err(ThinkError::Backend(format!(
+                "thinking exhausted {} chunks of {} tokens without answering, and the forced \
+                 answer was empty",
+                chunk_cfg.max_chunks, chunk_cfg.chunk_tokens
+            )));
+        }
+
+        let (answer, inline_reasoning_chars) = extract_answer_from_content(content);
+        Ok(ThinkOutput {
+            answer,
+            reasoning_chars: total_reasoning_chars + inline_reasoning_chars,
+            content_chars: content.chars().count(),
+            usage: forced_reply.usage,
+            chunks: chunk_cfg.max_chunks + 1,
+            forced_answer: true,
+        })
     }
 }
 

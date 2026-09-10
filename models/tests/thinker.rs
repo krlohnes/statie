@@ -563,8 +563,12 @@ async fn chunked_thinker_carries_over_and_answers_on_second_chunk() {
 }
 
 /// When every chunk keeps hitting `done_reason: "length"` with no content,
-/// the thinker must give up after `max_chunks` with a named `Backend` error
-/// mentioning the chunk count.
+/// the thinker must give up after `max_chunks` -- but only after a forced,
+/// thinking-off call attempts an answer from the reasoning gathered so far
+/// (BACKLOG.md item 6b). Here that forced call also returns empty content,
+/// so the final result must still be a named `Backend` error mentioning the
+/// chunk count, with its message extended to say the forced answer was also
+/// empty.
 #[tokio::test]
 async fn chunked_thinker_exhausts_max_chunks() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -591,12 +595,32 @@ async fn chunked_thinker_exhausts_max_chunks() {
         .await;
 
         // Chunk 2 (== max_chunks): length again, no content -- loop must
-        // stop here without a further carry-over call.
+        // stop here without a further per-chunk carry-over call.
         let (mut stream, _) = listener.accept().await.expect("accept 2");
         let _ = read_request_body(&mut stream).await;
         write_ndjson_response(
             &mut stream,
             &[r#"{"message":{"content":""},"done":true,"done_reason":"length"}"#],
+        )
+        .await;
+
+        // Carry-over for the final chunk (produced the same way as every
+        // earlier chunk's), feeding the forced call.
+        let (mut stream, _) = listener.accept().await.expect("accept final carry-over");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[r#"{"message":{"content":"final summary"},"done":true,"done_reason":"stop"}"#],
+        )
+        .await;
+
+        // Forced call: empty content, so the exhausted-chunks error must
+        // still fire.
+        let (mut stream, _) = listener.accept().await.expect("accept forced");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#],
         )
         .await;
     });
@@ -627,7 +651,128 @@ async fn chunked_thinker_exhausts_max_chunks() {
                 msg.contains(&max_chunks.to_string()),
                 "msg should name the chunk count: {msg}"
             );
+            assert!(
+                msg.contains("forced answer was empty"),
+                "msg should say the forced answer was empty: {msg}"
+            );
         }
         other => panic!("expected Backend, got {other:?}"),
     }
+}
+
+/// BACKLOG.md item 6b: when both permitted chunks end with `done_reason:
+/// "length"` and no content, the thinker must make one more call -- thinking
+/// off, `num_predict: 700` -- carrying over the final chunk's reasoning the
+/// same way the loop's own carry-over step does, and asking the model to
+/// answer now. When that forced call returns an `ANSWER:`, `think` must
+/// return it rather than erroring.
+#[tokio::test]
+async fn chunked_thinker_forces_answer_after_exhausting_chunks() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let max_chunks = 2u32;
+
+    let server = tokio::spawn(async move {
+        // Chunk 1: length, no content.
+        let (mut stream, _) = listener.accept().await.expect("accept 1");
+        let body1 = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"thinking":"chunk one reasoning"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"length"}"#,
+            ],
+        )
+        .await;
+
+        // Carry-over for chunk 1 -> 2.
+        let (mut stream, _) = listener.accept().await.expect("accept carry-over 1");
+        let body_carry1 = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[r#"{"message":{"content":"first summary"},"done":true,"done_reason":"stop"}"#],
+        )
+        .await;
+
+        // Chunk 2 (== max_chunks): length again, no content.
+        let (mut stream, _) = listener.accept().await.expect("accept 2");
+        let body2 = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"thinking":"chunk two reasoning"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"length"}"#,
+            ],
+        )
+        .await;
+
+        // Carry-over for the final (second) chunk.
+        let (mut stream, _) = listener.accept().await.expect("accept carry-over 2");
+        let body_carry2 = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[r#"{"message":{"content":"second summary"},"done":true,"done_reason":"stop"}"#],
+        )
+        .await;
+
+        // Forced call: answers.
+        let (mut stream, _) = listener.accept().await.expect("accept forced");
+        let body_forced = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"content":"ANSWER: fix the import in tax.rs"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#,
+            ],
+        )
+        .await;
+
+        (body1, body_carry1, body2, body_carry2, body_forced)
+    });
+
+    let cfg = cfg_for(addr);
+    let model = Arc::new(OllamaModel::new(cfg).expect("build model"));
+    let thinker = ModelThinker::new(model, Duration::from_secs(5)).with_chunking(ChunkConfig {
+        chunk_tokens: 6000,
+        max_chunks,
+        carry_over_chars: 1500,
+    });
+
+    let out = thinker
+        .think(
+            ThinkInput {
+                system: "sys",
+                user: "usr",
+                question: "what's wrong?",
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("forced answer should succeed");
+
+    assert_eq!(out.answer, "fix the import in tax.rs");
+    assert!(out.forced_answer, "forced_answer should be true");
+
+    let (_body1, _body_carry1, _body2, _body_carry2, body_forced_text) =
+        server.await.expect("server task");
+
+    let body_forced: serde_json::Value =
+        serde_json::from_str(&body_forced_text).expect("valid json");
+    assert_eq!(body_forced["think"], serde_json::json!(false));
+    assert_eq!(
+        body_forced["options"]["num_predict"],
+        serde_json::json!(700)
+    );
+    let messages_forced = body_forced["messages"].as_array().expect("messages array");
+    let user_forced = messages_forced[1]["content"]
+        .as_str()
+        .expect("user content");
+    assert!(
+        user_forced.contains("out of thinking budget"),
+        "forced request user content must mention the thinking budget: {user_forced}"
+    );
+    assert!(
+        user_forced.contains("second summary"),
+        "forced request user content must carry the second (final chunk's) carry-over text: {user_forced}"
+    );
 }

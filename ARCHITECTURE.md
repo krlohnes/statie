@@ -1314,7 +1314,180 @@ first cut summarised the last 1500 characters and lost what the chunk
 established early. Config: `thinker.chunked` (default false) and
 `thinker.num_ctx` now optional; `Config::effective_thinker_num_ctx` is
 the explicit value, else the session model's `num_ctx` when chunked
-(no reload), else 32768.
+(no reload), else 32768. `chunked` defaults to `true` since the
+calibration battery (DECISIONS.md D9). When the last permitted chunk
+ends without an answer, the loop makes one more thinking-off call
+(`num_predict` 700) from a carry-over of that final chunk, telling the
+model it is out of budget and must reply `ANSWER:` in five sentences
+or name the likeliest cause and the one thing to check; the output
+carries `forced_answer: true` and `chunks` = `max_chunks + 1`. Only an
+empty forced reply is still the "exhausted N chunks" error.
+
+## Milestone 16: `tests` written by the test tool (BACKLOG.md item 5)
+
+`CodingWorkspace.tests: Option<TestRecord{cmd, pass, failing: [names],
+first_error, step}>`, harness-owned like `seen` and `decision` (a model
+patch touching it is stripped with the same note), written whole by
+`common_after_tool` on every successful `test` call and never merged: a
+passing run still writes the record, with `pass: true` and no names, so
+the model can see the last green command and step after eviction.
+`failing_test_names` reads cargo's `test <name> ... FAILED` lines (and
+skips the `failures:` list that repeats them), unittest's `FAIL:`/`ERROR:
+<name> (<module.Class>)`, and pytest's `FAILED <path>::<name>`, first
+appearance order, deduped, eight at most; `first_error_line` is the
+first line starting with an error marker (`error[`, `error:`, `thread
+'`, `panicked at`, `assertion`, `AssertionError`, `Error:`, `FAILED`,
+`FAIL:`, `Traceback`), capped at 200 characters. `guards.tests_field`
+(default `true`) switches the write off; it rides the same
+`state_fields(seen, decision, tests)` path as the other two switches
+and is off in the model-owned arm of the state-ownership experiment.
+One consequence: like a `read_file` with its `seen` patch, every
+`test` call now commits two harness versions, the action's own and
+the after-tool record's, so `harness.step` read back after a test is
+one past `green_step` and `repeated_failure_step`; nothing in the
+harness compares those for equality (they are only checked for
+presence), and the tests that asserted equality now assert the
+offset.
+
+## Milestone 17: hypotheses and verify (`try_fixes`), and the early-park think
+
+### `try_fixes` (BACKLOG.md item 4)
+
+Two halves. The proposer: `Fixer` (`core/src/fixer.rs`) with
+`propose(FixInput{system, user, failure, k}) -> FixOutput{candidates:
+Vec<CandidateEdit{path, old, new, rationale}>}`; `ModelFixer`
+(`models/src/fixer.rs`) makes `k` sequential calls with thinking off,
+Ollama's plain JSON mode (`chat_json_with`), temperature 0.7,
+`num_predict` 1200, and seed `base + i` so the samples differ, each
+asking for one candidate, and unions the parsed results
+(`parse_candidates` tolerates fences and prose, drops empty or
+no-op edits, dedupes). Config `fixer: {model?, timeout_secs, k (3),
+num_ctx?}`, absent by default. The verifier: `CandidateRunner` in
+core (snapshot, candidate, run, apply, remove over a sandbox root)
+implemented by `WorktreeRunner` over the milestone 15 primitive, with
+a mock for core tests. `Session::execute_try_fixes` intercepts the
+`try_fixes` tool like `think`: with no failing test on record it says
+so; otherwise it builds `FixInput` from the step's own prompt and the
+normalised failure summary, proposes, snapshots the sandbox once, and
+for each candidate in order applies the edit in its own worktree
+(anchor missing or ambiguous is a loser), runs `last_test_cmd` there,
+and applies the first passing diff to the sandbox, reporting the rest
+as losers with their first error line or "not tried". None passing
+falls back to `think` with the losers in the question. `HarnessState`
+gains `try_fixes_available` and `last_try_fixes_step`; a `try_fixes`
+also sets `last_think_step`, so the once-per-streak rule is shared,
+and a winner bumps `edits_since_test` so the model confirms with
+`test`. The repeated-failure trigger substitutes `try_fixes` when
+available, else `think`; `common_after_tool` writes `decision` from
+its output minus the diff so the losers survive eviction.
+
+### The early-park think (BACKLOG.md item 8)
+
+`HarnessState.consecutive_non_question_asks` counts the streak of
+`ask_user` actions whose message has no `?`, read from the model's raw
+action before `validate` can rewrite it, reset by anything else.
+`implement_early_park_thinks` runs right after the repeated-failure
+trigger in `implement`: on the second consecutive non-question ask,
+with no `think` since the last recorded tool call, it substitutes
+`think` with `EARLY_PARK_QUESTION` ("what is the next concrete tool
+call and why") through the shared `substitute_think` helper, one step
+before the continue-repeat cap would park the run. The calibration
+battery showed this shape on both seeds of the feature task and one
+of the maintainer-off Python runs.
+
+## Milestone 18: `edit_file` refuses silent corruption (BACKLOG.md item 17)
+
+Two checks in `tools/src/edit_file.rs`. An `after`/`before` insert is
+refused when any line of the text to insert already exists in the
+file, byte-for-byte after trailing-space trim, and
+`looks_like_definition` holds for it (an import, a `fn`/`def`/`class`,
+a `struct`/`enum`/`impl`/`trait`/`type`/`mod`, a `const`/`static`, a
+column-0 `let`, a four-space-indented struct field, or a column-0
+all-caps assignment): "line N of <path> already has `<line>`; your
+insert would duplicate it. Use old/new to replace the existing code
+instead." After any applied edit, `bracket_balance` (a scanner that
+skips string and char literals and line and block comments) compares
+the file's net `{}`, `[]`, and `()` balance before and after; a change
+appends "note: this edit changed the file's brace balance (+1 `{`);
+check the edited region before running tests." A file already
+unbalanced before an edit that does not change the imbalance gets no
+note. The calibration battery motivated both: 23 of 37 edits used the
+insert form, and the applied ones left duplicate imports, a duplicate
+constant, two overlapping copies of a function, and one unbalanced
+test file.
+
+## Milestone 19: the repeated-failure question fits the failure (BACKLOG.md item 18)
+
+`HarnessState.last_failure_summary` (600 characters, harness-owned)
+holds the normalised summary of the most recent failing `test`, set
+beside `repeated_failure_step` and cleared on a pass. In the coding
+skill, `classify_failure` reads it into a `FailureKind`: compile
+error (`error[E…]`, an `error:` line with `-->` or `could not
+compile`, Python's `SyntaxError`/`NameError`/`ImportError`/
+`ModuleNotFoundError`/`IndentationError`) first, then timeout, then
+assertion (an assertion keyword or `left:`/`right:`/`expected` plus a
+digit), then panic (`panicked at`, `Traceback`, `Exception`), else
+other. `repeat_failure_question(kind)` picks the question the
+repeated-failure trigger passes to `think`: the arithmetic trace for
+assertions (unchanged), "read the first error only … the one edit"
+for compile errors, "the line that panics and the input that reaches
+it" for panics, "the loop or wait that does not finish" for timeouts,
+and "the single most likely cause and the one edit" otherwise. The
+`try_fixes` branch is unaffected. Motivation in DECISIONS.md D9: the
+trace question asked about a compile error ran the model out of a 32k
+window three times in four.
+
+## Milestone 20: shell reads become `read_file` (BACKLOG.md item 16)
+
+`shell_read_as_read_file(cmd)` in the coding skill recognises a
+single-file, pipe-free, redirect-free read (`cat`, `cat -n`, `nl`,
+`head`, `head -n N`, `tail` and `tail -n N` as plain reads, `sed -n
+'A,Bp'` as offset A and limit B-A+1; a quoted path without spaces; no
+globs, no `|`, `>`, `<`, `;`, `&&`, `||`, `$(`, or backticks) and
+every coding skill's `validate` substitutes the equivalent `read_file`
+call through the shared `substitute_action` helper with a note
+("`shell <cmd>` was a plain read, so the harness ran it as
+`read_file` instead … Use `read_file` directly next time"). The read
+then pages, lands in `seen`, and counts for the redundant-read and
+identical-skip guards. Motivation: the calibration runs read files
+with `shell cat` two to eight times each and one ended in a `cat`
+loop no guard could see.
+
+## Milestone 21: `write_file` allowed after a full read since the last edit (BACKLOG.md item 15)
+
+`SeenFile` gains `read_step`, the step of the entry's most recent
+`read_file` (`write_file` and `revert_file` clear it; `edit_file`
+leaves it). `write_file_confirmed_by_seen(seen, path)` is true when
+the coalesced read ranges cover every line and either nothing has
+been edited or the entry's latest change was that read (`read_step ==
+step`): the whole file has been read since the last edit of it. Each
+coding skill's `validate` strips any model-supplied
+`confirmed_full_read` from a `write_file` call and sets it when the
+rule holds; the tool skips its 40-line cap on that flag, which is
+hidden from the rendered schema. The refusal text now ends "If you
+have read the whole file since your last edit of it, the harness
+allows the rewrite automatically." The first cut of this unit used
+"no edits recorded" and was rejected at review because it still
+refused the motivating case, a full re-read after a breaking edit.
+
+## Milestone 22: `probe`, trace by execution (BACKLOG.md item 7; DECISIONS.md D11)
+
+`tools/src/probe.rs`: a registry tool `probe {code, lang?}` for the
+`implement` skill. It snapshots the sandbox, adds a worktree, writes
+the snippet there (Rust: `tests/__statie_probe.rs` wrapping the code
+in a `#[test]` with `use <crate>::*`, the crate name read from
+`Cargo.toml`; Python: `__statie_probe.py`), runs it (`cargo test
+--test __statie_probe -- --nocapture` or `python3 __statie_probe.py`)
+with the shell timeout and output cap, removes the worktree on every
+path, and returns `probe (<lang>): exit <code>` followed by what the
+snippet printed, cargo's own chatter stripped and compile errors kept
+verbatim. `lang` defaults from the sandbox (`Cargo.toml` means Rust,
+`.py` files mean Python, neither is an error); a snippet over 4000
+characters is refused before anything runs. The assertion-kind
+repeated-failure question now ends "If the values are not obvious,
+use `probe` to print them instead of computing them." The sandbox is
+never touched; the tests prove `git status` is unchanged and no probe
+file or worktree remains.
 
 ## Testing conventions
 

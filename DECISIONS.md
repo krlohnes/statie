@@ -102,6 +102,26 @@ holds the resulting design; this file holds why.
 - **Check.** A battery from a previous day can be re-run from its
   config file alone.
 
+## D7. The gate's cost is macOS, not cargo
+- **Observation, not a decision.** Every freshly linked test binary
+  waits on `syspolicyd` (Gatekeeper's notarization check, which goes
+  to the network and logs "Error checking with notarization daemon")
+  before its first instruction runs: one to two minutes per binary on
+  a quiet machine, sixteen minutes for one binary while three builds
+  ran at once. The workspace gate has 85 test binaries, so it takes
+  about three hours wall-clock while the tests themselves take under
+  five minutes of CPU. The fix is outside this repo: granting the
+  terminal the "Developer Tools" privacy permission (or `spctl
+  developer-mode enable-terminal`) exempts it from the check. Until
+  then, batches are gated together, never one unit at a time. The
+  early-park agent, building in its own worktree at the same time as
+  two builds in the main checkout, also saw the machine run out of
+  memory (under a gigabyte free of 32) with rustc blocked in dyld
+  loading a proc-macro dylib for twenty minutes at a stretch, so
+  concurrent from-scratch builds are limited to one worktree at a time.
+  (This entry was lost once to a sub-agent's `git stash` conflict and
+  restored; agents are told not to touch git, and D5 now says why.)
+
 ## D8. One battery at a time on the model host
 - **Decision.** The model host is a single local GPU (one 4090). Only
   one battery runs at a time, tasks sequential within it, and nothing
@@ -133,6 +153,49 @@ holds the resulting design; this file holds why.
 - **Ruled out.** Raising `thinker.num_ctx` again (a 65k window would
   reload the model and still not bound the trace) and raising the task
   timeout to hide the cost.
-- **Check.** `think` wall time and empty-answer rate on the same task
-  with `thinker.chunked` on (bench-runs/chunked_refactor), and the
-  repeat count after the question is failure-shaped.
+- **Result so far.** Chunked on the same task, seed 1: three `think`
+  calls at 128 seconds each (half the unchunked cost, no reload), and
+  all three empty: "exhausted 4 chunks of 6000 tokens without
+  answering". Chunking bounds the cost; it does not make a wrong
+  question answerable. So two follow-ups: the chunk loop ends with a
+  forced, thinking-off answer from the last carry-over so a `think`
+  never returns nothing (item 6b), and the question is shaped by the
+  failure (item 18).
+- **Result, trap.** `trap_rounding` chunked: 2 of 2 landed; the one
+  `think` that fired answered in 46 seconds (14k characters of
+  reasoning, one chunk) against 100 to 250 seconds unchunked with the
+  reload. Chunked is the default from here (`thinker.chunked: true`);
+  the empty-answer problem is the question's, handled by 6b and 18.
+- **Check.** Empty-answer rate on the battery after 6b and 18; no
+  loss on the trap.
+
+## D10. Units that share files commit together
+- **Decision.** D1 (one commit per backlog item) holds when a unit's
+  files are its own. When concurrent units edit the same files
+  (`core/src/session.rs`, `skills/src/coding/mod.rs`, the
+  `HarnessState` literals), they commit as one batch commit whose
+  message lists the items, with the separable units (the edit_file
+  checks, the forced answer) still committed on their own.
+- **Why.** Splitting a shared file's hunks by item after the fact is
+  slow and error-prone, and the second gate covers the batch as a
+  whole; per-item bisectability is worth less than a commit that
+  matches what was gated.
+- **Check.** Every commit compiles and passes the gate on its own.
+
+## D11. Trace by execution is a general `probe`, not harness instrumentation
+- **Decision.** Backlog item 7 is built as a `probe` tool: the model
+  writes a short snippet (a Rust test body or a Python module), the
+  harness runs it against the real code in an isolated worktree and
+  returns what it printed. The harness does not try to instrument the
+  call path itself or pick expressions from the model's hints.
+- **Why.** PAL and LDB's result is that the model decomposes well and
+  computes badly; the cheapest way to honour it is to let the model
+  decompose into prints and let the machine compute. Harness-generated
+  instrumentation is language- and framework-specific and would need
+  the test's setup reproduced; a snippet needs neither. The worktree
+  primitive already isolates it, and `try_fixes` showed the shape.
+- **Ruled out.** A `trace {exprs}` tool that rewrites the failing test
+  with prints (fragile across test frameworks).
+- **Check.** Diagnosis on the arithmetic traps with `probe` available
+  against `think` alone, and how often the model reaches for it
+  unprompted.

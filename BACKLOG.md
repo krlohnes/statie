@@ -58,7 +58,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing. Can run in parallel with items 1 and 2.
 
 ### 4. Hypotheses and verify (`try_fixes`)
-- **Status.** Proposer (Fixer trait, ModelFixer, config) built; session verification loop in progress.
+- **Status.** Built (proposer, runner, session, trigger); in the second gate.
 - **What.** On the repeated-failure trigger: sample k (start at 3)
   thinking-off candidate fixes, each a concrete `edit_file`; apply each
   in its own worktree; run the test command; commit the passing one to
@@ -79,7 +79,7 @@ moves the metric it was built for. Ordered within each tier.
 ## P1: tools write more state, and the next two thinking patterns
 
 ### 5. `test` writes durable state
-- **Status.** Built, in the second gate.
+- **Status.** Built; in the second gate. Field note: the model tried to patch `tests` 3 times per Python run and got the harness-owned note.
 - **What.** A harness-owned `tests` field: `{cmd, pass, failing:
   [names], first_error, step}` written by `after_tool` on every `test`
   call. The model reads it instead of re-reading the observation after
@@ -93,7 +93,14 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing.
 
 ### 6. Bounded-window thinking for `think`
-- **Status.** Built (42a5206). Measuring on refactor_signature (D9).
+- **Status.** Built (42a5206). Measured on refactor_signature seed 1:
+  128 s per think against 263 s unchunked; seeds 1 and 2 together 0 of
+  4 answered (four chunks exhausted), 0 of 2 landed either way. On
+  the trap: 2 of 2 landed, the one think answered in 46 s. On the
+  original eight (build 8): 16 of 16 landed, 3 of 3 thinks answered
+  in 22 to 97 s. Chunked is now the default; 6b built. Follow-up 6b: when the last chunk ends without an
+  answer, make one more thinking-off call from the carry-over that
+  must produce `ANSWER:`; a `think` should never return nothing.
 - **What.** When the reasoning call reaches a chunk budget (say 6k
   tokens) or `done_reason: length`, stop, ask for a short carry-over,
   and continue in a fresh context with the question plus the
@@ -107,6 +114,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing.
 
 ### 7. Trace by execution
+- **Status.** Built as the general `probe` tool (D11; patch in .claude/item7.diff, on top of item 15). Second trap task `trap_interest` built (a six-month amortisation whose interest truncates twice; the decoy is a `.max(0)` guard pinned by its own test). Measurement after the third gate.
 - **What.** For an assertion failure with numbers: the model names the
   expressions to watch; the harness writes a temporary test (or
   instruments the functions on the call path) in a worktree, runs it,
@@ -122,7 +130,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Item 3; a second arithmetic trap task.
 
 ### 8. The early-park stall becomes a `think`
-- **Status.** In progress.
+- **Status.** Built in a worktree, merged; in the second gate.
 - **What.** When the model sends a second consecutive non-question
   `ask_user` (the shape the continue-repeat cap parks on the third),
   and no `think` has run since the last tool call, substitute `think`
@@ -146,6 +154,7 @@ moves the metric it was built for. Ordered within each tier.
   parks that rise with length.
 
 ### 15. `write_file` allowed after a full, recent read
+- **Status.** Built (patch in .claude/item15.diff, on top of item 16). First cut rejected at review: its rule ("no edits recorded") still refused the motivating case; corrected with `read_step` on `seen`.
 - **What.** The whole-file rewrite guard (`write_file` refuses an
   existing file longer than a fixed line cap) consults `seen` instead:
   a rewrite is allowed when the harness has recorded a `read_file` of
@@ -165,6 +174,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Item 16 for reads made through `shell`.
 
 ### 16. Shell reads become `read_file`
+- **Status.** Built in a worktree (patch in .claude/item16.diff, on top of item 18); applies after the second batch commits.
 - **What.** A `shell` command that is a pure read of one file (`cat`,
   `head`, `tail`, `sed -n`) is substituted with the equivalent
   `read_file` call, the way the think triggers substitute actions, with
@@ -179,6 +189,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing.
 
 ### 17. `edit_file` stops silent corruption
+- **Status.** Built; in the second gate.
 - **What.** Two checks in the edit tool. (a) An `after`/`before` insert
   whose text contains a line that already exists in the file and looks
   like a definition (an import, `fn`/`def`, `const`/`static`/`let` at
@@ -204,6 +215,7 @@ moves the metric it was built for. Ordered within each tier.
   arm pays the same tax.
 
 ### 18. The repeated-failure question fits the failure
+- **Status.** Built in a worktree (patch in .claude/item18.diff); applies after the second batch commits.
 - **What.** `REPEAT_FAILURE_QUESTION` becomes one of several, picked
   from the normalised failure summary: a compile error ("read the
   first error: name the file, the line, and the one edit that fixes
@@ -230,6 +242,13 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Items 1, 2, 8.
 
 ### 10. Maintainer sweep
+- **Status.** First data point (maintainer off, thinker on, old
+  unchunked binary): Python long task 1 of 2 (14 steps and 45 s on the
+  landing seed, against 29 steps with the maintainer; the other seed
+  parked in the early-ask shape at call 9); trap 1 of 2 (the miss timed
+  out on three consecutive 284-second thinks that exhausted the 32k
+  window, two of them the model's own calls). Too noisy to call; the
+  sweep proper waits for the gated build with chunked thinking.
 - **What.** Maintainer on versus off, and the notes budget at 200, 400,
   800, on the long tasks.
 - **Why.** The trained systems say the updater matters most; the

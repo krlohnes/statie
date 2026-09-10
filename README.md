@@ -118,7 +118,12 @@ statie would actually use and where it came from.
 | `thinker.model` | object | the top-level `model` | Same shape as `model`; must be an Ollama backend. The `think` flag and `format` are overridden for this call (thinking on, no format). |
 | `thinker.timeout_secs` | integer | `600` | Per-call timeout; a timeout comes back as a `think failed` observation, never a rejection. Thinking runs long on this model (a minute is typical on a 26b Gemma). |
 | `thinker.num_ctx` | integer or absent | `32768` unchunked, `model.num_ctx` chunked | The reasoning call's own context window, separate from the pinned `model.num_ctx`. Native thinking runs 8k to 11k tokens on this model; in a 16k window shared with a 5k prompt it hit the limit and answered nothing. Ollama reloads the model when `num_ctx` changes, so each `think` costs a reload each way; it fires rarely. |
-| `thinker.chunked` | bool | `false` | Runs the reasoning call as a loop of bounded chunks (Markovian Thinker shape): 6000 tokens of thinking per chunk, a thinking-off carry-over between chunks, at most four chunks. Lets `think` run inside the session's own `num_ctx` with no model reload. |
+| `thinker.chunked` | bool | `true` | Runs the reasoning call as a loop of bounded chunks (Markovian Thinker shape): 6000 tokens of thinking per chunk, a thinking-off carry-over between chunks, at most four chunks, then a forced thinking-off answer. Lets `think` run inside the session's own `num_ctx` with no model reload; on the trap it answered in 46 seconds against 100 to 250 unchunked. `false` restores the single unbounded call in its own 32k window. |
+| `fixer` | object or absent | absent | The `try_fixes` tool's proposer (BACKLOG.md item 4). When present, a `try_fixes` call (or the repeated-failure trigger, which prefers it to `think` when a fixer is attached) samples `k` candidate edits with thinking off, verifies each in its own git worktree against the last failing test command, applies the one that passes, and records the losers in `decision`; none passing falls back to `think` with the losers in the question. |
+| `fixer.model` | object | the top-level `model` | Same shape as `model`; must be an Ollama backend. |
+| `fixer.timeout_secs` | integer | `600` | Per-candidate-call timeout. |
+| `fixer.k` | integer | `3` | Candidates sampled per call, one model call each at temperature 0.7 and a different seed. |
+| `fixer.num_ctx` | integer or absent | `model.num_ctx` | Window for the proposer calls; thinking is off and output short, so the session window suffices. |
 | `guards.redundant_reads` | bool | `true` | Rule-audit switch (spec section 10): an identical read since the last edit is skipped and its earlier result shown. `false` re-runs it. |
 | `guards.silent_reads` | bool | `true` | Consecutive reads whose patch wrote nothing are rejected at the cap. `false` never rejects on that ground. |
 | `guards.read_guard` | bool | `true` | Fourth read of one path with no edit between gets a note. `false` disables the note. |
@@ -127,6 +132,7 @@ statie would actually use and where it came from.
 | `guards.commitment_read_cap` | bool | `true` | Reads against a set `next` beyond the cap are rejected. `false` lets them run and appends a "still pending" note instead. |
 | `guards.seen_map` | bool | `true` | The harness writes `seen` from file tool calls. `false` leaves it empty for the session (the model still cannot write it). One half of the model-owned arm in the state-ownership experiment. |
 | `guards.decision_field` | bool | `true` | The harness writes `decision` from a `think` call and clears it on a passing `test`. `false` does neither; the `think` tool itself still runs. The other half of that arm. |
+| `guards.tests_field` | bool | `true` | The harness writes `tests` (`{cmd, pass, failing, first_error, step}`) on every `test` call, replaced whole. `false` never writes it. Off in the model-owned arm. |
 | `max_autonomous_steps` | integer | `200` | Safety cap on consecutive autonomous steps (`Outcome::Continue`) before a run stops on its own. |
 
 ## Commands
@@ -231,6 +237,7 @@ for the prompt (the full output stays in the session log).
 | `revert_file` | restore a file to its content from before this session's first `edit_file`/`write_file` of it (a file created this session is removed); the backup lives in `.statie/orig/`, is taken on first modification, cleared on a fresh start, kept on `--resume` |
 | `recall` | search the session log (never the model's reasoning) |
 | `think` | ask a reasoning subagent a question; it sees the caller's whole prompt, thinks with no tools and no schema, and returns a conclusion, which the harness also writes into the workspace's `decision` field (harness-owned, cleared when a test passes). Needs a `thinker` config section; available to `plan`, `implement`, and `review` |
+| `try_fixes` | propose `k` candidate edits for the last failing test with thinking off, verifies each in its own git worktree, apply the one that passes, and report the losers with their first error line (optional `k`; needs a `fixer` section; the repeated-failure trigger prefers it to `think` when one is attached) |
 
 The coding skills: `router` decides where to go, `plan` explores and writes
 a step list, `implement` works the plan with `edit_file`/`write_file` and
@@ -1374,6 +1381,49 @@ either a default or a config knob:
   after exhausting the 32k window, asked the arithmetic-trace question
   about a compile error (D9, items 6 and 18). Every other step in that
   run averaged four to seven seconds.
+
+  The same task re-run with `thinker.chunked` on: seed 1 parked at 79
+  steps, seed 2 at 57 (a read loop on `src/server.rs`), four `think`
+  calls at 128 seconds each, all four empty after their four chunks.
+  Chunking halved the cost of a think and removed the reload; it did
+  not make the arithmetic-trace question answerable on a compile
+  error, which is item 18's job, and the chunk loop now ends with a
+  forced answer so a think never returns nothing (item 6b).
+
+  On the rounding trap, where the question fits, chunked thinking kept
+  the win: 2 of 2 landed, one `think` fired (seed 2), answered in 46
+  seconds after 14k characters of reasoning, against 100 to 250
+  seconds with a reload each way unchunked. `thinker.chunked` is now
+  the default.
+
+  A first maintainer-off pair on the same binary (backlog item 10):
+  the Python task landed one seed in 14 steps and 45 seconds, less
+  than half the maintainer-on run, and parked the other at call 9 in
+  the early-ask shape; the trap landed one seed and timed out the
+  other on three consecutive 284-second `think` calls, all empty
+  after exhausting the 32k window, two of them the model's own. Not
+  enough to call, but it says where the wall clock goes: thinks that
+  do not end.
+
+- **Eighth build, chunked thinker on the original eight.** The same
+  sixteen runs as build 7, on the binary carrying the uncommitted
+  second batch (`tests` field, `try_fixes` listed but no fixer
+  configured, edit_file checks not yet in) with `thinker.chunked` on.
+
+  | build | landed | done | median steps | rejections | tool errors | mean peak prompt | max peak | minutes |
+  |---|---|---|---|---|---|---|---|---|
+  | build 7, thinker on | 15/16 | 15 | 15 | 5 | 14 | 6358 | 8378 | 22 |
+  | build 8, chunked thinker | 16/16 | 16 | 14 | 1 | 11 | 6470 | 8175 | 35 |
+
+  First clean sweep. Three `think` calls in sixteen runs, all on the
+  trap, all answered: 64 and 97 seconds on seed 1 (26k and 47k
+  characters of reasoning, so two and three chunks with carry-over)
+  and 22 seconds on seed 2. Rejections fell from 5 to 1. The minutes
+  column is not the thinker: the trap's second seed spent 858 seconds
+  on 26 steps with a 22-second think, and the Rust tasks' `cargo test`
+  inside the sandbox links a fresh test binary after every edit, each
+  vetted by macOS before it runs (DECISIONS.md D7). The Python task
+  runs took 24 to 26 seconds end to end.
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

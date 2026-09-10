@@ -185,9 +185,13 @@ async fn bare_done_with_green_and_complete_plan_hands_off_to_review() {
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec2).unwrap();
     let (state, _version) = active.session().state().await.unwrap();
+    // The passing `test` sets `green_step` to its own step; the harness then
+    // commits one more version for the `tests` record `common_after_tool`
+    // writes on every `test` call (BACKLOG.md item 5), so the counter read
+    // back here is one past it.
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        Some(state.harness.step - 1),
         "setup: the test call must have passed"
     );
 
@@ -486,9 +490,13 @@ async fn bare_done_with_maintainer_next_and_three_step_plan_hands_off_to_review(
         "the passing test step itself is an ordinary tool call: {outcome2:?}"
     );
     let (state, _version) = active.session().state().await.unwrap();
+    // The passing `test` sets `green_step` to its own step; the harness then
+    // commits one more version for the `tests` record `common_after_tool`
+    // writes on every `test` call (BACKLOG.md item 5), so the counter read
+    // back here is one past it.
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        Some(state.harness.step - 1),
         "green_step must be committed on the harness after the passing test"
     );
 
@@ -637,9 +645,13 @@ async fn plan_handoff_clears_next_skill_so_implement_bare_done_still_hands_off()
         "got {outcome2:?}; the test call must have executed"
     );
     let (state, _version) = active.session().state().await.unwrap();
+    // The passing `test` sets `green_step` to its own step; the harness then
+    // commits one more version for the `tests` record `common_after_tool`
+    // writes on every `test` call (BACKLOG.md item 5), so the counter read
+    // back here is one past it.
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        Some(state.harness.step - 1),
         "setup: the test call must have passed"
     );
 

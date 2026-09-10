@@ -43,6 +43,7 @@ mod augmenter;
 mod bm25;
 mod delegate;
 mod error;
+mod fixer;
 mod green;
 mod guards;
 mod log;
@@ -70,6 +71,11 @@ pub use bm25::{Bm25Index, tokenize};
 pub use delegate::{CancelToken, ChildRequest, ChildRunner, InboxItem as ChildInboxItem};
 pub use error::{
     LogError, ModelError, ParseError, PatchError, SandboxError, SessionError, StoreError, ToolError,
+};
+pub use fixer::{
+    CandidateEdit, CandidateRunResult, CandidateRunner, FIX_SYSTEM_PROMPT, FixCall, FixError,
+    FixInput, FixOutput, Fixer, MockCandidateRunner, MockFixer, MockRunStep, RunnerCandidate,
+    RunnerEdit, RunnerError, RunnerSnapshot, parse_candidates,
 };
 pub use green::{
     CheckpointFile, GREEN_CHECKPOINT_FILE_CAP, GreenCheckpoint, Snapshot, edited_paths, is_pass,

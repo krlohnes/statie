@@ -297,7 +297,8 @@ async fn implement_done_with_passing_test_still_hands_off_to_review() {
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "green_step must be set after the passing test"
     );
 
@@ -624,7 +625,8 @@ async fn review_approval_with_passing_test_still_approves() {
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "green_step must be set after the passing test"
     );
 
@@ -753,7 +755,8 @@ async fn review_approval_with_filtered_pass_continues_instead_of_approving() {
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "green_step must be set after the passing test"
     );
     assert!(
@@ -807,7 +810,8 @@ async fn review_approval_with_unfiltered_pass_still_approves() {
     let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec1).unwrap();
     let (state, _version) = active.session().state().await.unwrap();
-    assert_eq!(state.harness.green_step, Some(state.harness.step));
+    // one past: the `tests` record commits its own version after every `test` call
+    assert_eq!(state.harness.green_step, Some(state.harness.step - 1));
     assert!(
         !state.harness.green_filtered,
         "an unfiltered passing run must leave green_filtered false"
@@ -914,7 +918,8 @@ async fn implement_done_with_filtered_pass_still_hands_off_to_review() {
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "green_step must be set after the passing test"
     );
     assert!(

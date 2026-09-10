@@ -227,17 +227,25 @@ async fn repeat_failure_substitutes_think_once_then_lets_the_next_edit_through()
     let (name2, _args2) = last_action(&log);
     assert_eq!(name2, "write_file");
 
-    // Step 3: fail again, identical -- repeated_failure_step must be set to
-    // this step's own number.
+    // Step 3: fail again, identical -- repeated_failure_step must be set.
+    // (Not asserted equal to `state.harness.step` here: a harness-authored
+    // `after_tool` patch -- e.g. `CodingWorkspace::tests`, BACKLOG.md item
+    // 5 -- commits as its own extra step via `apply_after_tool_patch`, so
+    // the harness step counter can already have moved past the step that
+    // set `repeated_failure_step` by the time state is read back.)
     let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome3 = log.append_record(rec3).unwrap();
     assert!(matches!(outcome3, Outcome::Continue), "got {outcome3:?}");
     let (state, _v) = active.session().state().await.unwrap();
+    // The failing `test` step sets it to its own number; the harness then
+    // commits one more version for the `tests` record `common_after_tool`
+    // writes on every `test` call (BACKLOG.md item 5), so the counter read
+    // back here is exactly one past it.
     let repeat_step = state
         .harness
         .repeated_failure_step
         .expect("the second identical fail must set repeated_failure_step");
-    assert_eq!(repeat_step, state.harness.step);
+    assert_eq!(repeat_step + 1, state.harness.step);
     assert!(!any_rejected(&log));
 
     // Step 4: the model sends another write_file -- must be substituted for
@@ -405,16 +413,22 @@ async fn repeat_failure_substitutes_think_for_an_idle_test_rerun() {
     );
 
     // Step 2: fail again, identical, nothing edited -- repeated_failure_step
-    // must be set to this step's own number.
+    // must be set. (Not asserted equal to `state.harness.step` here: see
+    // the comment on the analogous assertion in `repeat_failure_
+    // substitutes_think_once_then_lets_the_next_edit_through`, above.)
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome2 = log.append_record(rec2).unwrap();
     assert!(matches!(outcome2, Outcome::Continue), "got {outcome2:?}");
     let (state, _v) = active.session().state().await.unwrap();
+    // The failing `test` step sets it to its own number; the harness then
+    // commits one more version for the `tests` record `common_after_tool`
+    // writes on every `test` call (BACKLOG.md item 5), so the counter read
+    // back here is exactly one past it.
     let repeat_step = state
         .harness
         .repeated_failure_step
         .expect("the second identical fail must set repeated_failure_step");
-    assert_eq!(repeat_step, state.harness.step);
+    assert_eq!(repeat_step + 1, state.harness.step);
     assert_eq!(state.harness.edits_since_test, 0);
     assert!(!any_rejected(&log));
 

@@ -23,7 +23,8 @@ impl CodingRegistry {
     /// The four coding skills with the rule-audit switches applied
     /// (`guards.done_stays_done`; statie-spec.md "10. After it works: the
     /// rule audit"; `guards.seen_map`/`guards.decision_field`; BACKLOG.md
-    /// item 2). `Guards::default()` gives exactly [`CodingRegistry::new`].
+    /// item 2; `guards.tests_field`; BACKLOG.md item 5). `Guards::default()`
+    /// gives exactly [`CodingRegistry::new`].
     pub fn with_guards(guards: Guards) -> Self {
         CodingRegistry {
             skills: coding_skills_configured(
@@ -31,6 +32,7 @@ impl CodingRegistry {
                 guards.done_stays_done,
                 guards.seen_map,
                 guards.decision_field,
+                guards.tests_field,
             ),
         }
     }

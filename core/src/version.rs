@@ -130,6 +130,56 @@ pub struct HarnessState {
     /// still deserializes.
     #[serde(default)]
     pub repeated_failure_step: Option<u64>,
+    /// Whether a `Fixer` is attached to this session (`Session::
+    /// with_fixer`, BACKLOG.md item 4) -- true exactly when `try_fixes` can
+    /// actually propose and verify candidates, mirroring how `thinker`
+    /// being `None` makes every `think` call report itself unconfigured.
+    /// Read by the coding skills' `implement_repeat_failure_thinks`
+    /// (`skills/src/coding/mod.rs`) to decide whether the repeated-failure
+    /// trigger substitutes `try_fixes` (when true) or `think` (when false,
+    /// today's behaviour). Not persisted across a store round-trip in the
+    /// usual sense -- it is set fresh from the attached `Fixer` every time
+    /// `HarnessState` is constructed for a new activation, the same as
+    /// `active_tools`. `#[serde(default)]` so state persisted before this
+    /// field existed still deserializes (as `false`, matching a session
+    /// with no fixer attached).
+    #[serde(default)]
+    pub try_fixes_available: bool,
+    /// The harness step at which the most recent `try_fixes` tool call
+    /// executed (fixer configured or not, proposer error or not -- see
+    /// `Session`'s `try_fixes` interception in `core/src/session.rs`), set
+    /// at the same call site as `tool_calls`. `None` until one has.
+    /// Harness-owned: patches cannot touch it. A `try_fixes` call also sets
+    /// `last_think_step` to the same step, so the once-per-streak repeated-
+    /// failure gate (`last_think_step` vs `repeated_failure_step`) applies
+    /// whichever of `think`/`try_fixes` fired most recently.
+    /// `#[serde(default)]` so state persisted before this field existed
+    /// still deserializes.
+    #[serde(default)]
+    pub last_try_fixes_step: Option<u64>,
+    /// How many consecutive `ask_user` actions the model has sent, ending in
+    /// this committed step, whose `message` contains no `?` -- i.e. an empty
+    /// or non-question `ask_user`, the shape `skills/src/coding/mod.rs`'s
+    /// `ask_user_empty_note`/`ask_user_statement_note` convert to
+    /// `Action::Continue`. Set from the model's raw parsed action, BEFORE
+    /// `Skill::validate` runs and can rewrite that action (`core/src/
+    /// session.rs`'s `step`, right before committing `next_harness`): `0`
+    /// unless this step's own action was a non-question `ask_user`, in which
+    /// case it is the previous committed value plus one -- so it counts a
+    /// streak the way `repeated_failure_step` counts a streak of identical
+    /// test failures, not just "was the last one this shape". Any other
+    /// action (a tool call, a real question containing `?`, `done`, `yield`,
+    /// a delegate) resets it to `0`. Harness-owned: patches cannot touch it.
+    /// Read by the coding skills' `implement` validation (`skills/src/
+    /// coding/mod.rs`'s early-park trigger) to convert the SECOND
+    /// consecutive non-question `ask_user` into a `think` call before the
+    /// continue-repeat cap parks the run on the third (DECISIONS.md D4:
+    /// six of nine parks in a 96-run study happened this way, before model
+    /// call 15, with no test failure open, so `repeated_failure_step` never
+    /// fires). `#[serde(default)]` so state persisted before this field
+    /// existed still deserializes.
+    #[serde(default)]
+    pub consecutive_non_question_asks: u32,
 }
 
 /// A guide pinned into the prompt's Pinned section, with a step-counted

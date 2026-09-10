@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use statie_core::{
     Action, CommittedState, HarnessState, ParsedOutput, RawOutput, Report, ReportOutcome,
@@ -10,9 +10,9 @@ use statie_patch::JsonMergePatch;
 
 use super::{
     CodingWorkspace, Decision, FileNote, ImplementSkill, PlanSkill, PlanStep, ReviewSkill,
-    RouterSkill, SeenFile, StepStatus, coding_skills, coding_skills_with_delegates,
-    common_after_tool, count_lines, has_named_handoff, merge_range, parse_edit_header,
-    parse_revert_lines, seen_entry,
+    RouterSkill, SeenFile, StepStatus, TestRecord, coding_skills, coding_skills_with_delegates,
+    common_after_tool, count_lines, failing_test_names, first_error_line, has_named_handoff,
+    merge_range, parse_edit_header, parse_revert_lines, seen_entry,
 };
 
 fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
@@ -32,6 +32,9 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             edits_since_test: 0,
             last_think_step: None,
             repeated_failure_step: None,
+            try_fixes_available: false,
+            last_try_fixes_step: None,
+            consecutive_non_question_asks: 0,
         },
         agent,
     }
@@ -1337,6 +1340,7 @@ fn tools_exact_per_skill() {
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
             "think".to_string(),
+            "try_fixes".to_string(),
         ])
     );
 
@@ -2262,6 +2266,7 @@ fn after_tool_read_file_records_range_and_total() {
         output,
         true,
         true,
+        true,
     )
     .expect("read_file should produce a seen patch");
     assert_eq!(
@@ -2287,6 +2292,7 @@ fn after_tool_read_file_second_read_extends_the_range() {
         "read_file",
         &json!({"path": "src/a.rs"}),
         output,
+        true,
         true,
         true,
     )
@@ -2316,6 +2322,7 @@ fn after_tool_edit_file_records_edited_range() {
         output,
         true,
         true,
+        true,
     )
     .expect("edit_file should produce a seen patch");
     assert_eq!(
@@ -2338,6 +2345,7 @@ fn after_tool_write_file_replaces_the_entry() {
         "write_file",
         &json!({"path": "new.rs", "content": content}),
         "wrote 42 bytes to new.rs",
+        true,
         true,
         true,
     )
@@ -2368,6 +2376,7 @@ fn after_tool_revert_file_clears_both_ranges() {
         output,
         true,
         true,
+        true,
     )
     .expect("revert_file should produce a seen patch");
     assert_eq!(
@@ -2395,6 +2404,7 @@ fn after_tool_revert_file_removed_drops_the_entry() {
         output,
         true,
         true,
+        true,
     )
     .expect("revert_file (removed) should still produce a seen patch");
     assert_eq!(patch, json!({"seen": []}));
@@ -2402,22 +2412,55 @@ fn after_tool_revert_file_removed_drops_the_entry() {
 
 #[test]
 fn after_tool_other_tools_produce_no_patch() {
+    // `test` is deliberately excluded here: with `tests_enabled = true` it
+    // now always produces a `tests` patch (BACKLOG.md item 5, see
+    // `after_tool_test_*` below); `tests_enabled = false` and no existing
+    // `decision` covers the "nothing at all" case for `test` explicitly in
+    // `after_tool_test_disabled_and_no_decision_produces_no_patch`.
     let ws = CodingWorkspace::default();
     for name in [
         "search",
         "list_files",
         "shell",
-        "test",
         "recall",
         "filter_last_tool_call",
         "think",
     ] {
         assert_eq!(
-            common_after_tool(&ws, 1, name, &json!({}), "irrelevant output", true, true),
+            common_after_tool(
+                &ws,
+                1,
+                name,
+                &json!({}),
+                "irrelevant output",
+                true,
+                true,
+                true
+            ),
             None,
             "tool `{name}` should never produce a patch for unrelated output"
         );
     }
+}
+
+#[test]
+fn after_tool_test_disabled_and_no_decision_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    assert_eq!(
+        common_after_tool(
+            &ws,
+            1,
+            "test",
+            &json!({}),
+            "irrelevant output",
+            true,
+            true,
+            false
+        ),
+        None,
+        "with tests_enabled = false and no existing decision, `test` should produce no patch \
+         at all"
+    );
 }
 
 // =======================================================================
@@ -2441,6 +2484,7 @@ fn after_tool_seen_disabled_read_file_produces_no_patch() {
             &json!({"path": "src/a.rs"}),
             output,
             false,
+            true,
             true
         ),
         None,
@@ -2460,6 +2504,7 @@ fn after_tool_seen_disabled_edit_file_produces_no_patch() {
             &json!({"path": "src/a.rs"}),
             output,
             false,
+            true,
             true
         ),
         None
@@ -2483,6 +2528,7 @@ fn after_tool_seen_disabled_write_file_produces_no_patch() {
             "wrote 42 bytes to new.rs",
             false,
             true,
+            true,
         ),
         None
     );
@@ -2501,6 +2547,7 @@ fn after_tool_seen_disabled_revert_file_produces_no_patch() {
             &json!({"path": "src/a.rs"}),
             output,
             false,
+            true,
             true
         ),
         None
@@ -2521,6 +2568,7 @@ fn after_tool_seen_disabled_does_not_affect_decision() {
         &json!({"question": "why does the test fail?"}),
         output,
         false,
+        true,
         true,
     )
     .expect("decision_enabled = true must still set decision when seen_enabled is false");
@@ -2551,11 +2599,109 @@ fn after_tool_think_output_sets_decision() {
         output,
         true,
         true,
+        true,
     )
     .expect("a think conclusion should produce a decision patch");
     assert_eq!(
         patch,
         json!({"decision": {"question": "why does the test fail?", "answer": "the mock is stale.", "step": 7}})
+    );
+}
+
+// =======================================================================
+// BACKLOG.md item 4: `common_after_tool`'s `try_fixes` handling of
+// `CodingWorkspace::decision` -- `try_fixes` is intercepted by
+// `core::Session::execute_try_fixes` the same way `think` is, so this is
+// unit-tested directly for the same reason as the `think` tests just above.
+// =======================================================================
+
+#[test]
+fn after_tool_try_fixes_winner_output_sets_decision() {
+    let ws = CodingWorkspace::default();
+    let output = "try_fixes: 3 candidates; candidate 2 passed `cargo test` and was applied\n\
+                  applied: src/tax.rs — use the 2024 bracket\n\
+                  diff --git a/src/tax.rs b/src/tax.rs\n\
+                  -old line\n\
+                  +new line\n\
+                  losers:\n\
+                  1. src/tax.rs — try a different bracket -> assertion `left == right` failed\n\
+                  3. src/tax.rs — a third guess -> not tried";
+    let patch = common_after_tool(&ws, 9, "try_fixes", &json!({}), output, true, true, true)
+        .expect("a try_fixes winner output should produce a decision patch");
+    let decision = patch.get("decision").expect("decision key present");
+    assert_eq!(
+        decision.get("question").and_then(Value::as_str),
+        Some("try_fixes: cargo test")
+    );
+    let answer = decision
+        .get("answer")
+        .and_then(Value::as_str)
+        .expect("answer should be a string");
+    assert!(
+        answer.contains("candidate 2 passed `cargo test` and was applied"),
+        "answer should keep the verdict line: {answer}"
+    );
+    assert!(
+        answer.contains("applied: src/tax.rs — use the 2024 bracket"),
+        "answer should keep the applied line: {answer}"
+    );
+    assert!(
+        !answer.contains("diff --git"),
+        "answer should drop the diff block: {answer}"
+    );
+    assert!(
+        answer.contains("losers:") && answer.contains("assertion `left == right` failed"),
+        "answer should keep the losers block: {answer}"
+    );
+    assert_eq!(decision.get("step").and_then(Value::as_u64), Some(9));
+}
+
+#[test]
+fn after_tool_try_fixes_none_passed_output_sets_decision() {
+    let ws = CodingWorkspace::default();
+    let output = "try_fixes: 2 candidates; none passed `cargo test`\n\
+                  1. src/tax.rs — guess 1 -> assertion failed: left != right\n\
+                  2. src/tax.rs — guess 2 -> error: cannot find value `x`\n\
+                  think:\n\
+                  the real bug is in a third file";
+    let patch = common_after_tool(&ws, 4, "try_fixes", &json!({}), output, true, true, true)
+        .expect("a try_fixes none-passed output should produce a decision patch");
+    let decision = patch.get("decision").expect("decision key present");
+    assert_eq!(
+        decision.get("question").and_then(Value::as_str),
+        Some("try_fixes: cargo test")
+    );
+    let answer = decision
+        .get("answer")
+        .and_then(Value::as_str)
+        .expect("answer should be a string");
+    assert!(answer.contains("none passed `cargo test`"));
+    assert!(answer.contains("think:\nthe real bug is in a third file"));
+    assert_eq!(decision.get("step").and_then(Value::as_u64), Some(4));
+}
+
+#[test]
+fn after_tool_try_fixes_not_configured_output_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "`try_fixes` is not configured: set a `fixer` section in the config (see \
+                  README, Config). Decide from what you have.";
+    assert_eq!(
+        common_after_tool(&ws, 1, "try_fixes", &json!({}), output, true, true, true),
+        None,
+        "a not-configured try_fixes output must leave an existing decision unchanged (no patch)"
+    );
+}
+
+#[test]
+fn after_tool_try_fixes_decision_disabled_produces_no_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "try_fixes: 1 candidates; none passed `cargo test`\n\
+                  1. src/tax.rs — guess 1 -> assertion failed";
+    assert_eq!(
+        common_after_tool(&ws, 1, "try_fixes", &json!({}), output, true, false, true),
+        None,
+        "decision_enabled = false must suppress the decision patch a try_fixes output would \
+         otherwise produce"
     );
 }
 
@@ -2570,6 +2716,7 @@ fn after_tool_think_output_over_1200_chars_is_truncated() {
         "think",
         &json!({"question": "what now?"}),
         &output,
+        true,
         true,
         true,
     )
@@ -2598,6 +2745,7 @@ fn after_tool_think_not_configured_output_produces_no_patch() {
             &json!({"question": "q"}),
             output,
             true,
+            true,
             true
         ),
         None,
@@ -2617,6 +2765,7 @@ fn after_tool_think_failed_output_produces_no_patch() {
             &json!({"question": "q"}),
             output,
             true,
+            true,
             true
         ),
         None,
@@ -2626,6 +2775,9 @@ fn after_tool_think_failed_output_produces_no_patch() {
 
 #[test]
 fn after_tool_test_pass_clears_an_existing_decision() {
+    // `tests_enabled = false` isolates this test to the `decision`-clearing
+    // half of a `test` call (see `after_tool_test_pass_*` below,
+    // BACKLOG.md item 5, for the `tests` half).
     let ws = CodingWorkspace {
         decision: Some(Decision {
             question: "why?".to_string(),
@@ -2635,7 +2787,7 @@ fn after_tool_test_pass_clears_an_existing_decision() {
         ..Default::default()
     };
     let output = "command: cargo test\nresult: pass\nexit: 0\n";
-    let patch = common_after_tool(&ws, 5, "test", &json!({}), output, true, true)
+    let patch = common_after_tool(&ws, 5, "test", &json!({}), output, true, true, false)
         .expect("a passing test should produce a clearing patch");
     assert_eq!(patch, json!({"decision": null}));
 }
@@ -2652,7 +2804,7 @@ fn after_tool_test_fail_leaves_an_existing_decision_alone() {
     };
     let output = "command: cargo test\nresult: fail (exit 1)\n";
     assert_eq!(
-        common_after_tool(&ws, 5, "test", &json!({}), output, true, true),
+        common_after_tool(&ws, 5, "test", &json!({}), output, true, true, false),
         None,
         "a failing test must leave an existing decision alone (no patch)"
     );
@@ -2663,7 +2815,7 @@ fn after_tool_test_pass_with_no_existing_decision_produces_no_patch() {
     let ws = CodingWorkspace::default();
     let output = "command: cargo test\nresult: pass\nexit: 0\n";
     assert_eq!(
-        common_after_tool(&ws, 5, "test", &json!({}), output, true, true),
+        common_after_tool(&ws, 5, "test", &json!({}), output, true, true, false),
         None,
         "there is nothing to clear when decision is already unset"
     );
@@ -2692,6 +2844,7 @@ fn after_tool_decision_disabled_think_produces_no_patch() {
             output,
             true,
             false,
+            true,
         ),
         None,
         "decision_enabled = false must suppress the decision patch a think output would \
@@ -2701,6 +2854,8 @@ fn after_tool_decision_disabled_think_produces_no_patch() {
 
 #[test]
 fn after_tool_decision_disabled_passing_test_with_existing_decision_produces_no_patch() {
+    // `tests_enabled = false` isolates this to the `decision` half; see
+    // `after_tool_test_pass_*` for the `tests_enabled` switch's own tests.
     let ws = CodingWorkspace {
         decision: Some(Decision {
             question: "why?".to_string(),
@@ -2711,7 +2866,7 @@ fn after_tool_decision_disabled_passing_test_with_existing_decision_produces_no_
     };
     let output = "command: cargo test\nresult: pass\nexit: 0\n";
     assert_eq!(
-        common_after_tool(&ws, 5, "test", &json!({}), output, true, false),
+        common_after_tool(&ws, 5, "test", &json!({}), output, true, false, false),
         None,
         "decision_enabled = false must leave an existing decision alone even on a passing test"
     );
@@ -2732,6 +2887,7 @@ fn after_tool_decision_disabled_does_not_affect_seen() {
         output,
         true,
         false,
+        true,
     )
     .expect("seen_enabled = true must still record seen when decision_enabled is false");
     assert_eq!(
@@ -2805,6 +2961,346 @@ fn model_patch_touching_seen_is_stripped_and_noted() {
                 .to_string()
         ]
     );
+}
+
+#[test]
+fn model_patch_touching_tests_is_stripped_and_noted() {
+    let skill = ImplementSkill::new();
+    let cur_ws = CodingWorkspace {
+        tests: Some(TestRecord {
+            cmd: "cargo test".to_string(),
+            pass: true,
+            failing: vec![],
+            first_error: None,
+            step: 1,
+        }),
+        ..CodingWorkspace::default()
+    };
+    let cur = committed(cur_ws.clone());
+
+    let content = json!({
+        "patch": {
+            "tests": {"cmd": "sh -c true", "pass": false, "failing": ["x"], "first_error": null, "step": 99},
+            "plan": [{"id": 1, "text": "do the thing", "status": "done"}],
+        },
+        "action": {"type": "tool", "name": "list_files", "args": {}},
+    });
+    let step =
+        parse_and_validate(&skill, &cur, content).expect("patch should be kept, not rejected");
+
+    assert_eq!(
+        step.patch().next().tests,
+        cur_ws.tests,
+        "`tests` must be left unchanged by the dropped patch"
+    );
+    assert_eq!(
+        step.patch().next().plan.len(),
+        1,
+        "the real plan-step change must land"
+    );
+    assert_eq!(
+        step.notes(),
+        &[
+            "`tests` is kept by the harness; that part of your patch was dropped and the rest \
+             was kept."
+                .to_string()
+        ]
+    );
+}
+
+// =======================================================================
+// `CodingWorkspace::tests` (BACKLOG.md item 5): `failing_test_names`/
+// `first_error_line` (pure functions) and `common_after_tool`'s `tests`
+// patch.
+// =======================================================================
+
+#[test]
+fn failing_test_names_cargo_single_failure() {
+    let output = "command: cargo test\nresult: fail (exit 101)\n--- failure summary ---\n\
+                  test tests::adds ... FAILED\n\nfailures:\n\n---- tests::adds stdout ----\n\
+                  thread 'tests::adds' panicked at src/lib.rs:5:5:\nassertion failed\n\n\
+                  failures:\n    tests::adds\n\ntest result: FAILED. 0 passed; 1 failed\n";
+    assert_eq!(failing_test_names(output), vec!["tests::adds".to_string()]);
+}
+
+#[test]
+fn failing_test_names_cargo_three_failures_with_failures_list() {
+    let output = "command: cargo test\nresult: fail (exit 101)\n--- failure summary ---\n\
+                  test tests::a ... FAILED\ntest tests::b ... FAILED\ntest tests::c ... FAILED\n\n\
+                  failures:\n    tests::a\n    tests::b\n    tests::c\n\n\
+                  test result: FAILED. 0 passed; 3 failed\n";
+    assert_eq!(
+        failing_test_names(output),
+        vec![
+            "tests::a".to_string(),
+            "tests::b".to_string(),
+            "tests::c".to_string()
+        ],
+        "the `failures:` list's plain names must not duplicate the `... FAILED` names"
+    );
+}
+
+#[test]
+fn failing_test_names_cargo_compile_error_no_tests_run() {
+    let output = "command: cargo test\nresult: fail (exit 101)\n--- failure summary ---\n\
+                  error[E0433]: failed to resolve: use of undeclared crate\n \
+                  --> src/lib.rs:3:5\n";
+    assert_eq!(
+        failing_test_names(output),
+        Vec::<String>::new(),
+        "a compile error with no tests run has no failing test names"
+    );
+}
+
+#[test]
+fn failing_test_names_unittest_fail_and_error() {
+    let output = "command: python -m unittest\nresult: fail (exit 1)\n\
+                  --- failure summary ---\n\
+                  FAIL: test_adds (mymod.MyTest)\nERROR: test_setup (mymod.OtherTest)\n";
+    assert_eq!(
+        failing_test_names(output),
+        vec![
+            "mymod.MyTest.test_adds".to_string(),
+            "mymod.OtherTest.test_setup".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn failing_test_names_pytest() {
+    let output = "command: pytest\nresult: fail (exit 1)\n--- failure summary ---\n\
+                  FAILED tests/test_x.py::test_adds - AssertionError\n\
+                  FAILED tests/test_y.py::test_other\n";
+    assert_eq!(
+        failing_test_names(output),
+        vec![
+            "tests/test_x.py::test_adds".to_string(),
+            "tests/test_y.py::test_other".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn failing_test_names_all_pass_is_empty() {
+    let output = "command: cargo test\nresult: pass\n\n(12 passing test lines omitted)\n\
+                  test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+    assert_eq!(failing_test_names(output), Vec::<String>::new());
+}
+
+#[test]
+fn failing_test_names_caps_at_eight_and_dedupes() {
+    let mut output = String::from("command: cargo test\nresult: fail (exit 101)\n");
+    for i in 0..12 {
+        output.push_str(&format!("test tests::t{i} ... FAILED\n"));
+    }
+    // A repeat of an already-collected name must not grow the cap-limited
+    // vec or count twice.
+    output.push_str("test tests::t0 ... FAILED\n");
+    let names = failing_test_names(&output);
+    assert_eq!(names.len(), 8, "at most 8 names: {names:?}");
+    assert_eq!(
+        names,
+        vec![
+            "tests::t0",
+            "tests::t1",
+            "tests::t2",
+            "tests::t3",
+            "tests::t4",
+            "tests::t5",
+            "tests::t6",
+            "tests::t7"
+        ]
+    );
+}
+
+#[test]
+fn first_error_line_cargo_panic() {
+    let output = "command: cargo test\nresult: fail (exit 101)\n--- failure summary ---\n\
+                  thread 'tests::adds' (0x1234) panicked at src/lib.rs:5:5:\n\
+                  assertion `left == right` failed\n  left: 3\n right: 4\n";
+    assert_eq!(
+        first_error_line(output),
+        Some("thread 'tests::adds' (0x1234) panicked at src/lib.rs:5:5:".to_string())
+    );
+}
+
+#[test]
+fn first_error_line_rustc_error() {
+    let output = "command: cargo build\nresult: fail (exit 101)\n--- failure summary ---\n\
+                  error[E0433]: failed to resolve: use of undeclared crate or module `foo`\n \
+                  --> src/lib.rs:3:5\n";
+    assert_eq!(
+        first_error_line(output),
+        Some(
+            "error[E0433]: failed to resolve: use of undeclared crate or module `foo`".to_string()
+        )
+    );
+}
+
+#[test]
+fn first_error_line_pytest_traceback() {
+    let output = "command: pytest\nresult: fail (exit 1)\n--- failure summary ---\n\
+                  Traceback (most recent call last):\n  File \"test_x.py\", line 3\n\
+                  AssertionError: expected 1, got 2\n";
+    assert_eq!(
+        first_error_line(output),
+        Some("Traceback (most recent call last):".to_string())
+    );
+}
+
+#[test]
+fn first_error_line_caps_at_200_chars_with_ellipsis() {
+    let long = "error: ".to_string() + &"x".repeat(300);
+    let output = format!("command: cargo build\nresult: fail (exit 1)\n{long}\n");
+    let line = first_error_line(&output).expect("should find the error line");
+    assert_eq!(line.chars().count(), 201, "200 chars + the trailing …");
+    assert!(line.ends_with('…'));
+    assert!(line.starts_with("error: "));
+}
+
+#[test]
+fn first_error_line_all_pass_is_none() {
+    let output = "command: cargo test\nresult: pass\n\ntest result: ok. 3 passed; 0 failed\n";
+    assert_eq!(first_error_line(output), None);
+}
+
+#[test]
+fn after_tool_test_pass_writes_tests_record() {
+    let ws = CodingWorkspace::default();
+    let output = "command: cargo test\nresult: pass\nexit: 0\n";
+    let patch = common_after_tool(
+        &ws,
+        5,
+        "test",
+        &json!({"cmd": "cargo test"}),
+        output,
+        true,
+        true,
+        true,
+    )
+    .expect("a test call should always write a tests patch when tests_enabled");
+    assert_eq!(
+        patch,
+        json!({
+            "tests": {
+                "cmd": "cargo test",
+                "pass": true,
+                "failing": [],
+                "first_error": null,
+                "step": 5,
+            }
+        })
+    );
+}
+
+#[test]
+fn after_tool_test_fail_writes_tests_record_with_names_and_error() {
+    let ws = CodingWorkspace::default();
+    let output = "command: cargo test\nresult: fail (exit 101)\n--- failure summary ---\n\
+                  test tests::adds ... FAILED\n\nfailures:\n    tests::adds\n\n\
+                  ---- tests::adds stdout ----\n\
+                  thread 'tests::adds' panicked at src/lib.rs:5:5:\n\
+                  assertion `left == right` failed\n\n\
+                  test result: FAILED. 0 passed; 1 failed\n";
+    let patch = common_after_tool(
+        &ws,
+        7,
+        "test",
+        &json!({"cmd": "cargo test"}),
+        output,
+        true,
+        true,
+        true,
+    )
+    .expect("a failing test call should write a tests patch");
+    assert_eq!(
+        patch,
+        json!({
+            "tests": {
+                "cmd": "cargo test",
+                "pass": false,
+                "failing": ["tests::adds"],
+                "first_error": "thread 'tests::adds' panicked at src/lib.rs:5:5:",
+                "step": 7,
+            }
+        })
+    );
+}
+
+#[test]
+fn after_tool_test_disabled_writes_no_tests_patch() {
+    let ws = CodingWorkspace::default();
+    let output = "command: cargo test\nresult: pass\nexit: 0\n";
+    assert_eq!(
+        common_after_tool(
+            &ws,
+            5,
+            "test",
+            &json!({"cmd": "cargo test"}),
+            output,
+            true,
+            true,
+            false
+        ),
+        None,
+        "tests_enabled = false must suppress the tests patch entirely when there is no \
+         existing decision to clear either"
+    );
+}
+
+#[test]
+fn after_tool_test_pass_clears_decision_and_writes_tests_in_one_patch() {
+    let ws = CodingWorkspace {
+        decision: Some(Decision {
+            question: "why?".to_string(),
+            answer: "because.".to_string(),
+            step: 0,
+        }),
+        ..Default::default()
+    };
+    let output = "command: cargo test\nresult: pass\nexit: 0\n";
+    let patch = common_after_tool(
+        &ws,
+        5,
+        "test",
+        &json!({"cmd": "cargo test"}),
+        output,
+        true,
+        true,
+        true,
+    )
+    .expect("both decision-clearing and tests should apply");
+    assert_eq!(
+        patch,
+        json!({
+            "decision": null,
+            "tests": {
+                "cmd": "cargo test",
+                "pass": true,
+                "failing": [],
+                "first_error": null,
+                "step": 5,
+            }
+        })
+    );
+}
+
+#[test]
+fn after_tool_test_uses_command_alias_when_cmd_absent() {
+    let ws = CodingWorkspace::default();
+    let output = "command: pytest\nresult: pass\nexit: 0\n";
+    let patch = common_after_tool(
+        &ws,
+        2,
+        "test",
+        &json!({"command": "pytest"}),
+        output,
+        true,
+        true,
+        true,
+    )
+    .expect("a test call should write a tests patch");
+    assert_eq!(patch["tests"]["cmd"], json!("pytest"));
 }
 
 // ---------------------------------------------------------------------
@@ -3024,6 +3520,59 @@ fn repeat_failure_thinks_fires_for_edit_file_with_no_prior_think() {
     // The patch (empty here) survives untouched.
     let (patch, _action, _acks) = step.into_parts();
     assert_eq!(patch.next().recent_summary, "");
+}
+
+// =======================================================================
+// BACKLOG.md item 4: with `try_fixes_available`, the trigger substitutes
+// `try_fixes {}` instead of `think`; without it, `think` as before.
+// =======================================================================
+
+#[test]
+fn repeat_failure_thinks_substitutes_try_fixes_when_available() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+    cur.harness.try_fixes_available = true;
+
+    let step = parse_and_validate(&skill, &cur, edit_file_turn_content())
+        .expect("the substituted try_fixes call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "try_fixes" && args == &json!({})
+        ),
+        "expected a substituted `try_fixes {{}}` call, got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        &[REPEAT_THINK_NOTE.to_string()],
+        "the note text is unchanged by which tool it substitutes"
+    );
+}
+
+#[test]
+fn repeat_failure_thinks_substitutes_think_when_try_fixes_unavailable() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+    cur.harness.try_fixes_available = false;
+
+    let step = parse_and_validate(&skill, &cur, edit_file_turn_content())
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "think"
+                    && args == &json!({"question": super::REPEAT_FAILURE_QUESTION})
+        ),
+        "expected a substituted `think` call when no fixer is attached, got {:?}",
+        step.action()
+    );
 }
 
 #[test]
@@ -3433,4 +3982,220 @@ fn repeat_failure_thinks_does_not_fire_for_a_real_question_ask_user() {
         step.action()
     );
     assert!(step.notes().is_empty());
+}
+
+// ---------------------------------------------------------------------
+// `implement_early_park_thinks` (DECISIONS.md D4, BACKLOG.md item 8): the
+// SECOND consecutive non-question `ask_user`, with no repeated test
+// failure open, is substituted for `think` one strike before
+// `CONTINUE_REPEAT_CAP` (`core/src/session.rs`) would park the run on the
+// third.
+// ---------------------------------------------------------------------
+
+/// The exact note `implement_early_park_thinks` attaches.
+const EARLY_PARK_THINK_NOTE: &str = "you sent ask_user with nothing to ask twice in a row, so \
+     the harness asked the reasoning subagent before a third repeat could park the run (its \
+     conclusion is below, and in `decision`). Act on it.";
+
+/// The second consecutive non-question `ask_user`
+/// (`consecutive_non_question_asks >= 1`, meaning the previous step was
+/// already one) with no repeated test failure open and no `think` call
+/// having run: must fire.
+#[test]
+fn early_park_thinks_fires_on_the_second_consecutive_non_question_ask() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_non_question_asks = 1;
+    cur.harness.repeated_failure_step = None;
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "ask_user", "message": "I will look at tax.rs next"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "think"
+                    && args == &json!({"question": super::EARLY_PARK_QUESTION})
+        ),
+        "expected a substituted `think` call, got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        &[EARLY_PARK_THINK_NOTE.to_string()],
+        "the early-park think note must be attached"
+    );
+}
+
+/// The FIRST non-question `ask_user`
+/// (`consecutive_non_question_asks == 0`, meaning the previous step was
+/// NOT one) must not fire -- only the second in a row does.
+#[test]
+fn early_park_thinks_does_not_fire_on_the_first_non_question_ask() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_non_question_asks = 0;
+    cur.harness.repeated_failure_step = None;
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "ask_user", "message": "I will look at tax.rs next"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    // `ask_user_statement_note` (via `premature_done_note`'s fallthrough)
+    // still converts a non-question `ask_user` into `Continue` -- just not
+    // the `think` substitution.
+    assert!(
+        matches!(step.action(), statie_core::Action::Continue { .. }),
+        "expected a plain Continue conversion (not think), got {:?}",
+        step.action()
+    );
+    if let statie_core::Action::Continue { note } = step.action() {
+        assert_ne!(
+            note, EARLY_PARK_THINK_NOTE,
+            "must not use the early-park note on the first non-question ask"
+        );
+    }
+}
+
+/// A real question (contains `?`) must never be substituted, even with
+/// `consecutive_non_question_asks >= 1` -- the field only ever climbs from
+/// a non-question `ask_user` in the first place (`core/src/session.rs`),
+/// but the trigger itself must also refuse to act on a real question.
+#[test]
+fn early_park_thinks_does_not_fire_when_the_message_contains_a_question_mark() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_non_question_asks = 1;
+    cur.harness.repeated_failure_step = None;
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "ask_user", "message": "Which file should I fix?"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::AskUser { message } if message == "Which file should I fix?"),
+        "a real question must not be substituted, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+/// When a `think` call has already run and no tool call (`seen` entry) has
+/// landed since it, the trigger must not fire again -- "once per streak",
+/// the same rule `implement_repeat_failure_thinks` enforces with
+/// `last_think_step`.
+#[test]
+fn early_park_thinks_does_not_fire_when_a_think_already_ran_since_the_last_tool_call() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_non_question_asks = 1;
+    cur.harness.repeated_failure_step = None;
+    cur.harness.last_think_step = Some(5);
+    // No `seen` entry past step 5: nothing has been edited/read since the
+    // last `think` call.
+    cur.agent.seen = vec![SeenFile {
+        path: "a.rs".to_string(),
+        step: 5,
+        ..Default::default()
+    }];
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "ask_user", "message": "I will look at tax.rs next"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    assert!(
+        !matches!(step.action(), statie_core::Action::Tool { name, .. } if name == "think"),
+        "must not substitute think again with nothing new since the last think call, got {:?}",
+        step.action()
+    );
+}
+
+/// Once a tool call has landed after the last `think` call (a fresh `seen`
+/// entry past `last_think_step`), the trigger re-arms for the next stuck
+/// streak.
+#[test]
+fn early_park_thinks_fires_again_after_a_tool_call_resets_the_streak() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_non_question_asks = 1;
+    cur.harness.repeated_failure_step = None;
+    cur.harness.last_think_step = Some(5);
+    // A `seen` entry past step 5: a tool call has landed since the last
+    // `think` call, so the trigger re-arms.
+    cur.agent.seen = vec![SeenFile {
+        path: "a.rs".to_string(),
+        step: 8,
+        ..Default::default()
+    }];
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "ask_user", "message": "I will look at tax.rs next"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "think"
+                    && args == &json!({"question": super::EARLY_PARK_QUESTION})
+        ),
+        "expected a substituted `think` call after the streak reset, got {:?}",
+        step.action()
+    );
+    assert_eq!(step.notes(), &[EARLY_PARK_THINK_NOTE.to_string()]);
+}
+
+/// When a repeated test failure is ALSO open, `implement_repeat_failure_
+/// thinks` takes precedence (it runs first in `ImplementSkill::validate`)
+/// -- the substituted action is still `think` with `REPEAT_FAILURE_
+/// QUESTION`, not `EARLY_PARK_QUESTION`, and `implement_early_park_thinks`
+/// never gets a chance to act (the action is no longer `AskUser` by the
+/// time it would run).
+#[test]
+fn repeat_failure_trigger_takes_precedence_over_early_park_when_both_conditions_hold() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_non_question_asks = 1;
+    cur.harness.repeated_failure_step = Some(10);
+    cur.harness.last_think_step = None;
+
+    let content = json!({
+        "patch": {},
+        "action": {"type": "ask_user", "message": "I will look at tax.rs next"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("the substituted think call must not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "think"
+                    && args == &json!({"question": super::REPEAT_FAILURE_QUESTION})
+        ),
+        "the repeat-failure trigger must take precedence, got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        &[ASK_USER_THINK_NOTE.to_string()],
+        "the repeat-failure note must be attached, not the early-park one"
+    );
 }

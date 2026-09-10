@@ -126,6 +126,11 @@ pub struct CodingWorkspace {
     /// the harness when a test passes.
     #[serde(default)]
     pub decision: Option<Decision>,
+    /// The harness's own record of the most recent `test` call, replaced
+    /// whole on every one (BACKLOG.md item 5). Read it; you cannot patch
+    /// it.
+    #[serde(default)]
+    pub tests: Option<TestRecord>,
 }
 
 /// One entry of `CodingWorkspace::seen` (milestone 10): what the harness
@@ -168,6 +173,33 @@ pub struct Decision {
     /// The subagent's conclusion (truncated to 1200 chars with a trailing
     /// " …[truncated]" marker if longer).
     pub answer: String,
+    /// Harness step at which it was recorded.
+    pub step: u64,
+}
+
+/// One entry of `CodingWorkspace::tests` (BACKLOG.md item 5): the harness's
+/// own record of the most recent `test` tool call, written by
+/// `common_after_tool` and replaced whole (no merging) on every successful
+/// `test` call -- a passing run still writes one (`pass: true`, empty
+/// `failing`, `first_error: None`) so the model can see the last green
+/// command and step.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TestRecord {
+    /// The command that ran, from the call's own `cmd` arg (`command` is
+    /// also accepted, matching `tools/src/test_tool.rs`'s `TestArgs`
+    /// alias). Empty when the call omitted it and let the tool
+    /// auto-detect one -- `common_after_tool` reads only the call's own
+    /// args, not the tool's `command: ...` output header.
+    pub cmd: String,
+    /// Whether the run passed (`statie_core::is_pass(output)`).
+    pub pass: bool,
+    /// Failing test names, in output order, deduped, at most 8.
+    #[serde(default)]
+    pub failing: Vec<String>,
+    /// The first recognized error line, trimmed and capped at 200 chars
+    /// (with a trailing `…` when cut).
+    #[serde(default)]
+    pub first_error: Option<String>,
     /// Harness step at which it was recorded.
     pub step: u64,
 }
@@ -264,16 +296,18 @@ fn common_commitment(ws: &CodingWorkspace) -> Option<Commitment> {
 /// "9. Context maintenance"), `reports` (written by `absorb_report` after
 /// a `delegate` action), `seen` (milestone 10, written by `Skill::
 /// after_tool` after a `read_file`/`edit_file`/`write_file`/`revert_file`
-/// call), and `decision` (written by `Skill::after_tool` from a `think`
-/// call's output, cleared on a passing `test`; see `common_after_tool`) are
-/// never model-patchable. Checked uniformly by `validate_default` against
-/// every action.
+/// call), `decision` (written by `Skill::after_tool` from a `think`
+/// call's output, cleared on a passing `test`; see `common_after_tool`),
+/// and `tests` (BACKLOG.md item 5, written by `Skill::after_tool` on every
+/// successful `test` call) are never model-patchable. Checked uniformly by
+/// `validate_default` against every action.
 fn common_harness_owned_fields() -> Vec<String> {
     vec![
         "notes".to_string(),
         "reports".to_string(),
         "seen".to_string(),
         "decision".to_string(),
+        "tests".to_string(),
     ]
 }
 
@@ -463,25 +497,229 @@ fn parse_think_output(output: &str) -> Option<(String, String)> {
     Some((question.to_string(), rest.to_string()))
 }
 
+/// Parses a `try_fixes` tool's output (`core/src/session.rs`'s
+/// `execute_try_fixes`/`finish_try_fixes`) into a `decision`-shaped
+/// `(question, answer)`: `question` is `"try_fixes: <cmd>"`, `<cmd>`
+/// extracted from the first line's backtick-quoted command (present in
+/// both the winner shape, "...candidate N passed `<cmd>` and was
+/// applied", and the none-passed shape, "...none passed `<cmd>`");
+/// `answer` is the output with the winner's diff block removed -- every
+/// line between the "applied: <path> — <rationale>" line and the next
+/// "losers:" line (or, with no losers, the end of the text), since the
+/// diff itself can be up to 2000 chars and `decision` need only carry the
+/// verdict, not the patch. Returns `None` when the first line carries no
+/// backtick-quoted command (the "not configured"/"no failing test"/"no
+/// candidates"/"try_fixes failed: ..." shapes, none of which name a
+/// command in backticks) -- those leave `decision` untouched, the same as
+/// `think`'s own not-configured/failed shapes leave it untouched via
+/// `parse_think_output` returning `None`.
+fn parse_try_fixes_output(output: &str) -> Option<(String, String)> {
+    let first_line = output.lines().next()?;
+    // Only the two real-verdict shapes start with "try_fixes: <N> candidate"
+    // (winner: "try_fixes: N candidates; candidate M passed `<cmd>` and was
+    // applied"; none-passed: "try_fixes: N candidates; none passed
+    // `<cmd>`"). The "not configured"/"no failing test"/"no candidates"/
+    // "try_fixes failed: ..." shapes all start with "try_fixes: " too but
+    // never with a digit right after, and some carry unrelated backtick-
+    // quoted text of their own (e.g. "`try_fixes` is not configured: set a
+    // `fixer` section...") that a bare "first backtick pair" scan would
+    // misread as a command -- so this checks the shape before ever looking
+    // for a backtick.
+    let rest = first_line.strip_prefix("try_fixes: ")?;
+    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let start = first_line.find('`')?;
+    let after_backtick = &first_line[start + 1..];
+    let end = after_backtick.find('`')?;
+    let cmd = &after_backtick[..end];
+    if cmd.is_empty() {
+        return None;
+    }
+    let question = format!("try_fixes: {cmd}");
+
+    // Drop every line between "applied: ..." and the next "losers:" line
+    // (or end of text) -- the diff block, present only in the winner shape.
+    let mut answer_lines: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in output.lines() {
+        if line.starts_with("applied: ") {
+            answer_lines.push(line);
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if line == "losers:" {
+                skipping = false;
+            } else {
+                continue;
+            }
+        }
+        answer_lines.push(line);
+    }
+    Some((question, answer_lines.join("\n")))
+}
+
+/// At most this many failing test names are kept by [`failing_test_names`]
+/// (`CodingWorkspace::tests`'s `failing`, BACKLOG.md item 5).
+const FAILING_NAMES_CAP: usize = 8;
+
+/// Extracts failing test names from a `test` tool's output (`tools/src/
+/// test_tool.rs`'s `format_result`, so cargo's own noise-stripping and
+/// failure-summary extraction have already run), in first-appearance
+/// order, deduped, capped at [`FAILING_NAMES_CAP`]. Recognizes:
+/// - cargo: `test <name> ... FAILED` lines, name as printed (e.g.
+///   `tests::adds`); the `failures:` section's plain `    <name>` list
+///   lines name the same tests, so they're skipped rather than duplicated
+///   (any line already collected, or that looks like the `failures:`
+///   header itself, is not treated as a second name source).
+/// - Python `unittest`: `FAIL: <name> (<module.Class>)` / `ERROR: <name>
+///   (<module.Class>)` -> `<module.Class>.<name>`.
+/// - `pytest`: `FAILED <path>::<name>` -> `<path>::<name>`.
+///
+/// An all-passing run (no recognized failure line) returns an empty vec.
+fn failing_test_names(output: &str) -> Vec<String> {
+    fn push(name: String, seen: &mut std::collections::HashSet<String>, names: &mut Vec<String>) {
+        if names.len() >= FAILING_NAMES_CAP {
+            return;
+        }
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    let mut in_failures_list = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+
+        if trimmed == "failures:" {
+            // Cargo's `failures:\n    name\n    name\n\ntest result: ...`
+            // section repeats names already collected from `... FAILED`
+            // lines above -- track it so the plain-name lines inside are
+            // skipped, not treated as a second (duplicate) source.
+            in_failures_list = true;
+            continue;
+        }
+        if in_failures_list {
+            if trimmed.is_empty() || trimmed.starts_with("test result:") {
+                in_failures_list = false;
+            }
+            // Either way, this line is part of (or the boundary of) the
+            // `failures:` list -- never a new source of names.
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("test ")
+            && let Some(name) = rest.strip_suffix(" ... FAILED")
+        {
+            push(name.to_string(), &mut seen, &mut names);
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("FAILED ") {
+            // pytest: `FAILED <path>::<name>[ - <reason>]`
+            let name = rest.split(" - ").next().unwrap_or(rest).trim();
+            if !name.is_empty() {
+                push(name.to_string(), &mut seen, &mut names);
+            }
+            continue;
+        }
+
+        for prefix in ["FAIL: ", "ERROR: "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                // unittest: `FAIL: <name> (<module.Class>)` / `ERROR:
+                // <name> (<module.Class>)` -> `<module.Class>.<name>`.
+                if let Some(open) = rest.rfind(" (")
+                    && rest.ends_with(')')
+                {
+                    let name = rest[..open].trim();
+                    let module_class = &rest[open + 2..rest.len() - 1];
+                    if !name.is_empty() && !module_class.is_empty() {
+                        push(format!("{module_class}.{name}"), &mut seen, &mut names);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    names
+}
+
+/// Longer than this, [`first_error_line`]'s result is truncated with a
+/// trailing `…` (`CodingWorkspace::tests`'s `first_error`, BACKLOG.md item
+/// 5).
+const FIRST_ERROR_CAP: usize = 200;
+
+/// Markers [`first_error_line`] recognizes, checked against a trimmed
+/// line's start.
+const FIRST_ERROR_MARKERS: [&str; 9] = [
+    "error[",
+    "error:",
+    "thread '",
+    "panicked at",
+    "assertion",
+    "AssertionError",
+    "Error:",
+    "FAILED",
+    "FAIL:",
+];
+
+/// Finds the first line of `output` (after trimming) that starts with one
+/// of [`FIRST_ERROR_MARKERS`] or `Traceback`, trims it, and caps it at
+/// [`FIRST_ERROR_CAP`] chars (with a trailing `…` when cut). `None` if no
+/// line matches (e.g. an all-passing run, or a shape with no recognized
+/// error line at all).
+fn first_error_line(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let matches = trimmed.starts_with("Traceback")
+            || FIRST_ERROR_MARKERS.iter().any(|m| trimmed.starts_with(m));
+        if !matches {
+            continue;
+        }
+        if trimmed.chars().count() <= FIRST_ERROR_CAP {
+            return Some(trimmed.to_string());
+        }
+        let capped: String = trimmed.chars().take(FIRST_ERROR_CAP).collect();
+        return Some(format!("{capped}…"));
+    }
+    None
+}
+
 /// `Skill::after_tool` shared by `plan`/`implement`/`review`: maintains
 /// `CodingWorkspace::seen` from a successfully executed `read_file`,
-/// `edit_file`, `write_file`, or `revert_file` call, and
-/// `CodingWorkspace::decision` from a `think` call (set) or a passing
-/// `test` call (cleared). Any other tool (`search`, `list_files`, `shell`,
-/// `recall`, `filter_last_tool_call`) returns `None` -- nothing to record.
+/// `edit_file`, `write_file`, or `revert_file` call; `CodingWorkspace::
+/// decision` from a `think` call (set), a `try_fixes` call (set, BACKLOG.md
+/// item 4 -- see `parse_try_fixes_output`; a `try_fixes` whose losers
+/// survive in `decision` are not retried the way a `think` conclusion
+/// isn't) or a passing `test` call (cleared); and `CodingWorkspace::tests`
+/// from every `test` call (replaced whole, BACKLOG.md item 5). Any other
+/// tool (`search`, `list_files`, `shell`, `recall`, `filter_last_tool_call`)
+/// returns `None` -- nothing to record.
 ///
-/// `seen_enabled`/`decision_enabled` are `guards.seen_map`/`guards.
-/// decision_field` (`core/src/guards.rs`; BACKLOG.md item 2), threaded in
-/// from each skill's own field of the same name (see `PlanSkill::
-/// state_fields` and its siblings). `seen_enabled` off: the `read_file`/
-/// `edit_file`/`write_file`/`revert_file` branches below all return `None`
-/// instead of a `seen` patch -- the field is never written and stays
-/// whatever it already was (empty, for a session that never had the switch
-/// on). `decision_enabled` off: the `think` branch returns `None` instead of
-/// setting `decision` (the `think` tool still ran and its answer already
-/// reached the model as that call's own observation -- only the persistent
-/// copy is skipped), and the `test`-pass branch returns `None` instead of
-/// clearing it (nothing to clear -- it was never set).
+/// `seen_enabled`/`decision_enabled`/`tests_enabled` are `guards.seen_map`/
+/// `guards.decision_field`/`guards.tests_field` (`core/src/guards.rs`;
+/// BACKLOG.md items 2 and 5), threaded in from each skill's own field of
+/// the same name (see `PlanSkill::state_fields` and its siblings).
+/// `seen_enabled` off: the `read_file`/`edit_file`/`write_file`/
+/// `revert_file` branches below all return `None` instead of a `seen`
+/// patch -- the field is never written and stays whatever it already was
+/// (empty, for a session that never had the switch on). `decision_enabled`
+/// off: the `think` branch returns `None` instead of setting `decision`
+/// (the `think` tool still ran and its answer already reached the model as
+/// that call's own observation -- only the persistent copy is skipped),
+/// and the `test`-pass branch contributes no `decision: null` key instead
+/// of clearing it (nothing to clear -- it was never set). `tests_enabled`
+/// off: a `test` call writes no `tests` patch at all; the `decision`-
+/// clearing half of a `test` call is independent of it and still applies
+/// when `decision_enabled` is on.
+// Three switches ride beside the five call facts; a struct for them would
+// cost more than it saves at the fourteen call sites.
+#[allow(clippy::too_many_arguments)]
 fn common_after_tool(
     ws: &CodingWorkspace,
     step: u64,
@@ -490,6 +728,7 @@ fn common_after_tool(
     output: &str,
     seen_enabled: bool,
     decision_enabled: bool,
+    tests_enabled: bool,
 ) -> Option<Patch> {
     if name == "think" {
         if !decision_enabled {
@@ -505,11 +744,56 @@ fn common_after_tool(
         }));
     }
 
-    if name == "test" {
-        if decision_enabled && ws.decision.is_some() && statie_core::is_pass(output) {
-            return Some(serde_json::json!({ "decision": null }));
+    if name == "try_fixes" {
+        if !decision_enabled {
+            return None;
         }
-        return None;
+        let (question, answer) = parse_try_fixes_output(output)?;
+        return Some(serde_json::json!({
+            "decision": {
+                "question": question,
+                "answer": truncate_decision_answer(&answer),
+                "step": step,
+            }
+        }));
+    }
+
+    if name == "test" {
+        let mut patch = serde_json::Map::new();
+
+        if decision_enabled && ws.decision.is_some() && statie_core::is_pass(output) {
+            patch.insert("decision".to_string(), serde_json::Value::Null);
+        }
+
+        if tests_enabled {
+            let cmd = args
+                .get("cmd")
+                .or_else(|| args.get("command"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let pass = statie_core::is_pass(output);
+            let (failing, first_error) = if pass {
+                (Vec::new(), None)
+            } else {
+                (failing_test_names(output), first_error_line(output))
+            };
+            patch.insert(
+                "tests".to_string(),
+                serde_json::json!({
+                    "cmd": cmd,
+                    "pass": pass,
+                    "failing": failing,
+                    "first_error": first_error,
+                    "step": step,
+                }),
+            );
+        }
+
+        if patch.is_empty() {
+            return None;
+        }
+        return Some(serde_json::Value::Object(patch));
     }
 
     if !seen_enabled {
@@ -843,21 +1127,28 @@ pub const REPEAT_FAILURE_QUESTION: &str = "The test failed the same way after my
 /// question to the user, or `done` are all left alone; `plan`/`review` never
 /// call this function at all.
 ///
-/// Effect: the action is replaced with `Action::Tool { name: "think", args:
-/// {"question": REPEAT_FAILURE_QUESTION} }`. For the edit and `test` shapes,
-/// the raw patch is left exactly as the model sent it (the model's action
-/// was already a tool call, so there is no `done`/`next_skill` to strip);
-/// for the `ask_user` shape, `next_skill` is stripped from the raw patch
-/// first, the same as `ask_user_empty_note`/`ask_user_statement_note` do,
-/// since a stray `next_skill` left over from an `ask_user` step would make
-/// `core/src/session.rs`'s step 7.5 reject the now-non-`Done` step. The
-/// session runs this `think` call like any other (`core/src/session.rs`'s
-/// `Active::execute` intercepts `name == "think"` before dispatch), which
-/// writes `CodingWorkspace::decision` (`common_after_tool`'s `think`
-/// handling) from its answer -- so the model's NEXT step sees the
-/// subagent's conclusion in both the tool observation and `decision`, and
-/// can act on it instead of repeating the same wrong edit, the same idle
-/// test rerun, or the same unanswerable non-question a third time.
+/// Effect: the action is replaced with `Action::Tool { name: "try_fixes",
+/// args: {} }` when `cur.harness.try_fixes_available` (a `Fixer` is
+/// attached, BACKLOG.md item 4), else `Action::Tool { name: "think", args:
+/// {"question": REPEAT_FAILURE_QUESTION} }` exactly as before. For the edit
+/// and `test` shapes, the raw patch is left exactly as the model sent it
+/// (the model's action was already a tool call, so there is no `done`/
+/// `next_skill` to strip); for the `ask_user` shape, `next_skill` is
+/// stripped from the raw patch first, the same as `ask_user_empty_note`/
+/// `ask_user_statement_note` do, since a stray `next_skill` left over from
+/// an `ask_user` step would make `core/src/session.rs`'s step 7.5 reject
+/// the now-non-`Done` step. The session runs this call like any other
+/// (`core/src/session.rs`'s `Active::execute` intercepts `name == "think"`/
+/// `name == "try_fixes"` before dispatch): a `think` call writes
+/// `CodingWorkspace::decision` (`common_after_tool`'s `think` handling)
+/// from its answer, and a `try_fixes` call either applies a verified fix
+/// outright (bumping `edits_since_test`) or falls back to its own `think`
+/// call when none pass (writing `decision` the same way) -- so the model's
+/// NEXT step sees the subagent's conclusion in both the tool observation
+/// and (when it came from `think`, directly or as `try_fixes`'s fallback)
+/// `decision`, and can act on it instead of repeating the same wrong edit,
+/// the same idle test rerun, or the same unanswerable non-question a third
+/// time.
 ///
 /// A patch that fails to deserialize/apply is not relevant here (this
 /// function never inspects the merged workspace) -- always returns a note
@@ -905,18 +1196,7 @@ fn implement_repeat_failure_thinks(
         }
     }
 
-    if matches!(shape, Shape::NonQuestionAsk)
-        && let Some(obj) = out.patch_mut().0.as_object_mut()
-    {
-        obj.remove("next_skill");
-    }
-
-    out.set_action(statie_core::Action::Tool {
-        name: "think".to_string(),
-        args: serde_json::json!({"question": REPEAT_FAILURE_QUESTION}),
-    });
-
-    Some(match shape {
+    let note = match shape {
         Shape::Edit => "your last edit did not change the test failure, so the harness asked the \
              reasoning subagent first (its conclusion is below, and in `decision`). Act on \
              it: if it names a different cause, fix that; if it agrees with you, make your \
@@ -932,7 +1212,160 @@ fn implement_repeat_failure_thinks(
              the reasoning subagent (its conclusion is below, and in `decision`). Act on it."
                 .to_string()
         }
-    })
+    };
+
+    // BACKLOG.md item 4: with a `Fixer` attached (`Session::with_fixer`,
+    // `HarnessState::try_fixes_available`), the trigger samples and
+    // verifies candidate fixes instead of a single reasoning trace: it
+    // applies a verified fix outright and falls back to `think` itself
+    // when none pass (`core::Session::execute_try_fixes`). Without a fixer
+    // the substitution is `think`, as before.
+    if cur.harness.try_fixes_available {
+        if matches!(shape, Shape::NonQuestionAsk)
+            && let Some(obj) = out.patch_mut().0.as_object_mut()
+        {
+            obj.remove("next_skill");
+        }
+        out.set_action(statie_core::Action::Tool {
+            name: "try_fixes".to_string(),
+            args: serde_json::json!({}),
+        });
+        return Some(note);
+    }
+
+    Some(substitute_think(
+        out,
+        REPEAT_FAILURE_QUESTION,
+        note,
+        matches!(shape, Shape::NonQuestionAsk),
+    ))
+}
+
+/// The question the harness asks `think` on the model's behalf when
+/// [`implement_early_park_thinks`] fires.
+pub const EARLY_PARK_QUESTION: &str = "You sent ask_user twice with nothing to ask. Given the \
+     task, the plan, and the last tool output, what is the next concrete tool call and why? Name \
+     the tool, its arguments, and what you expect to see.";
+
+/// `implement`-only, `ImplementSkill::validate`'s sibling of
+/// `implement_repeat_failure_thinks`: DECISIONS.md D4's park-rate study over
+/// 96 bench runs found 6 of 9 parks happen before model call 15, most of
+/// them the model sending an empty or non-question `ask_user` three times
+/// running until `CONTINUE_REPEAT_CAP` (`core/src/session.rs`) parks the
+/// run -- with no test failure ever open, so `implement_repeat_failure_thinks`
+/// never sees it (that trigger requires `cur.harness.repeated_failure_step`
+/// to be `Some`). This trigger catches the SECOND consecutive non-question
+/// `ask_user` instead of waiting for a third, substituting `think` the same
+/// way, so the model has the reasoning subagent's answer in hand before the
+/// cap would otherwise park it on the very next repeat.
+///
+/// Fires when all of these hold:
+/// - `out.action()` is `Action::AskUser { message }` with no `?` in
+///   `message` -- the same shape `ask_user_empty_note`/
+///   `ask_user_statement_note` convert to `Continue`, and
+///   `implement_repeat_failure_thinks` converts to `think` when a repeat is
+///   open. This function runs only when that one does NOT fire (see
+///   `ImplementSkill::validate`'s ordering), so the two never both act on
+///   the same step.
+/// - `cur.harness.consecutive_non_question_asks >= 1`: the PREVIOUS
+///   committed step was already a non-question `ask_user` (`core/src/
+///   session.rs`'s `step`, which increments this counter from the model's
+///   raw parsed action before `validate` runs) -- so this step is the
+///   second in the streak, one short of the cap's third-strike park.
+/// - No `think` has run since the last tool call: `cur.harness.
+///   last_think_step` is `None`, or `Some(s)` with `s` at or before the
+///   step of the most recent entry in `cur.agent.seen` (the harness's
+///   per-path tool-call record, `CodingWorkspace::seen`) -- i.e. every
+///   `seen` entry's `step` is `<= s`. Unlike `implement_repeat_failure_
+///   thinks` (which requires a fresh EDIT since the last `think`), any
+///   recorded tool call re-arms this trigger, since there is no repeated
+///   test failure here for an edit to have failed to fix -- the shape this
+///   catches is "nothing to ask" twice running with no tool call in
+///   between at all, and a tool call in between is exactly what breaks that
+///   streak (see `HarnessState::consecutive_non_question_asks`'s own doc).
+///   `seen` only records `read_file`/`edit_file`/`write_file`/
+///   `revert_file` (`common_after_tool`'s `think`-less branch), so a `test`
+///   or a prior `think` call between the two asks would not appear there --
+///   but a `test`/`think` in between also means `consecutive_non_question_
+///   asks` itself would already be back at `0` (`core/src/session.rs`
+///   resets it on any non-ask_user action), so the `>= 1` gate above already
+///   excludes that case; the `seen` check here exists purely to enforce
+///   "once per streak" against the `think` call THIS function itself just
+///   substituted, the same role `implement_repeat_failure_thinks`'s
+///   `last_think_step` check plays.
+///
+/// Effect: same substitution mechanism as `implement_repeat_failure_thinks`
+/// (`substitute_think`), replacing the action with `Action::Tool { name:
+/// "think", args: {"question": EARLY_PARK_QUESTION} }` and stripping a
+/// stray `next_skill` from the raw patch. The substituted `think` step
+/// itself sets `last_think_step` (`core/src/session.rs`'s `execute_think`),
+/// so the trigger cannot fire again until a real tool call happens and adds
+/// a fresh `seen` entry after it.
+fn implement_early_park_thinks(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    let is_non_question_ask = matches!(
+        out.action(),
+        statie_core::Action::AskUser { message } if !message.contains('?')
+    );
+    if !is_non_question_ask {
+        return None;
+    }
+
+    if cur.harness.consecutive_non_question_asks < 1 {
+        return None;
+    }
+
+    // "Once per streak": a `think` call already ran and no tool call has
+    // landed since it (no `seen` entry past that step) -- calling `think`
+    // again would just ask the same question with nothing new to answer.
+    if let Some(think_step) = cur.harness.last_think_step {
+        let tool_call_since = cur.agent.seen.iter().any(|f| f.step > think_step);
+        if !tool_call_since {
+            return None;
+        }
+    }
+
+    let note = "you sent ask_user with nothing to ask twice in a row, so the harness asked the \
+         reasoning subagent before a third repeat could park the run (its conclusion is below, \
+         and in `decision`). Act on it."
+        .to_string();
+
+    Some(substitute_think(out, EARLY_PARK_QUESTION, note, true))
+}
+
+/// Shared substitution mechanism for both `implement_repeat_failure_thinks`
+/// and `implement_early_park_thinks`: replaces `out`'s action with `Action::
+/// Tool { name: "think", args: {"question": question} }` and returns `note`
+/// as the step's attached note -- the same path both triggers use, so a
+/// substituted call is logged, prompted, and picked up by `common_after_tool`
+/// (writing `CodingWorkspace::decision`) identically no matter which trigger
+/// fired it.
+///
+/// `strip_next_skill_if_ask_user` is `true` for the callers substituting an
+/// `ask_user` (empty or non-question): a stray `next_skill` left over from
+/// that `ask_user` would otherwise make `core/src/session.rs`'s step 7.5
+/// reject the now-non-`Done` step, the same reason `ask_user_empty_note`/
+/// `ask_user_statement_note` strip it. The edit/idle-test shapes pass
+/// `false`: the model's action was already a tool call, so there is no
+/// `next_skill` to strip.
+fn substitute_think(
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+    question: &str,
+    note: String,
+    strip_next_skill_if_ask_user: bool,
+) -> String {
+    if strip_next_skill_if_ask_user && let Some(obj) = out.patch_mut().0.as_object_mut() {
+        obj.remove("next_skill");
+    }
+
+    out.set_action(statie_core::Action::Tool {
+        name: "think".to_string(),
+        args: serde_json::json!({"question": question}),
+    });
+
+    note
 }
 
 /// Applies `out`'s raw patch to `cur` the same way `strip_malformed_next`
@@ -2043,6 +2476,9 @@ pub struct PlanSkill {
     /// `guards.decision_field`; see [`PlanSkill::seen`]. Set with
     /// [`PlanSkill::state_fields`].
     decision: bool,
+    /// `guards.tests_field` (BACKLOG.md item 5); see [`PlanSkill::seen`].
+    /// Set with [`PlanSkill::state_fields`].
+    tests: bool,
 }
 
 impl Default for PlanSkill {
@@ -2053,6 +2489,7 @@ impl Default for PlanSkill {
             done_stays_done: true,
             seen: true,
             decision: true,
+            tests: true,
         }
     }
 }
@@ -2067,6 +2504,8 @@ pub struct ImplementSkill {
     seen: bool,
     /// `guards.decision_field`; see [`PlanSkill::seen`].
     decision: bool,
+    /// `guards.tests_field` (BACKLOG.md item 5); see [`PlanSkill::seen`].
+    tests: bool,
 }
 
 impl Default for ImplementSkill {
@@ -2077,6 +2516,7 @@ impl Default for ImplementSkill {
             done_stays_done: true,
             seen: true,
             decision: true,
+            tests: true,
         }
     }
 }
@@ -2092,6 +2532,8 @@ pub struct ReviewSkill {
     seen: bool,
     /// `guards.decision_field`; see [`PlanSkill::seen`].
     decision: bool,
+    /// `guards.tests_field` (BACKLOG.md item 5); see [`PlanSkill::seen`].
+    tests: bool,
 }
 
 impl Default for ReviewSkill {
@@ -2102,6 +2544,7 @@ impl Default for ReviewSkill {
             done_stays_done: true,
             seen: true,
             decision: true,
+            tests: true,
         }
     }
 }
@@ -2280,6 +2723,7 @@ impl PlanSkill {
             done_stays_done: true,
             seen: true,
             decision: true,
+            tests: true,
         }
     }
 
@@ -2291,16 +2735,19 @@ impl PlanSkill {
         self
     }
 
-    /// Sets `guards.seen_map`/`guards.decision_field` (`core/src/
-    /// guards.rs`; both default `true`; BACKLOG.md item 2). `seen = false`:
-    /// `CodingWorkspace::seen` is never written by the harness (stays
-    /// empty). `decision = false`: `CodingWorkspace::decision` is never
-    /// written or cleared by the harness (the `think` tool still runs and
-    /// its answer still reaches the model as that call's own observation).
-    /// See `common_after_tool`'s doc for the exact per-branch effect.
-    pub fn state_fields(mut self, seen: bool, decision: bool) -> Self {
+    /// Sets `guards.seen_map`/`guards.decision_field`/`guards.tests_field`
+    /// (`core/src/guards.rs`; all default `true`; BACKLOG.md items 2 and
+    /// 5). `seen = false`: `CodingWorkspace::seen` is never written by the
+    /// harness (stays empty). `decision = false`: `CodingWorkspace::
+    /// decision` is never written or cleared by the harness (the `think`
+    /// tool still runs and its answer still reaches the model as that
+    /// call's own observation). `tests = false`: `CodingWorkspace::tests`
+    /// is never written by the harness (stays `null`). See
+    /// `common_after_tool`'s doc for the exact per-branch effect.
+    pub fn state_fields(mut self, seen: bool, decision: bool, tests: bool) -> Self {
         self.seen = seen;
         self.decision = decision;
+        self.tests = tests;
         self
     }
 }
@@ -2434,7 +2881,16 @@ impl Skill for PlanSkill {
         args: &serde_json::Value,
         output: &str,
     ) -> Option<Patch> {
-        common_after_tool(ws, step, name, args, output, self.seen, self.decision)
+        common_after_tool(
+            ws,
+            step,
+            name,
+            args,
+            output,
+            self.seen,
+            self.decision,
+            self.tests,
+        )
     }
 
     /// A bare `done` (no `next_skill` set) in `plan` means "the plan is
@@ -2574,6 +3030,7 @@ impl ImplementSkill {
             done_stays_done: true,
             seen: true,
             decision: true,
+            tests: true,
         }
     }
 
@@ -2585,11 +3042,12 @@ impl ImplementSkill {
         self
     }
 
-    /// Sets `guards.seen_map`/`guards.decision_field`; see
-    /// [`PlanSkill::state_fields`].
-    pub fn state_fields(mut self, seen: bool, decision: bool) -> Self {
+    /// Sets `guards.seen_map`/`guards.decision_field`/`guards.tests_field`;
+    /// see [`PlanSkill::state_fields`].
+    pub fn state_fields(mut self, seen: bool, decision: bool, tests: bool) -> Self {
         self.seen = seen;
         self.decision = decision;
+        self.tests = tests;
         self
     }
 }
@@ -2667,6 +3125,7 @@ impl Skill for ImplementSkill {
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
             "think".to_string(),
+            "try_fixes".to_string(),
         ]
     }
 
@@ -2753,7 +3212,16 @@ impl Skill for ImplementSkill {
         args: &serde_json::Value,
         output: &str,
     ) -> Option<Patch> {
-        common_after_tool(ws, step, name, args, output, self.seen, self.decision)
+        common_after_tool(
+            ws,
+            step,
+            name,
+            args,
+            output,
+            self.seen,
+            self.decision,
+            self.tests,
+        )
     }
 
     fn silent_read_cap(&self) -> Option<u32> {
@@ -2777,7 +3245,17 @@ impl Skill for ImplementSkill {
     /// -- so an `ask_user` it replaces is already `Tool { name: "think",
     /// .. }` by the time `premature_done_note`'s fallthrough to
     /// `ask_user_empty_note`/`ask_user_statement_note` would otherwise see
-    /// and re-convert it. Then `implement_done_not_ours_strip`: whenever the
+    /// and re-convert it. Then `implement_early_park_thinks`
+    /// (DECISIONS.md D4): a SECOND consecutive non-question `ask_user`, with
+    /// no repeated test failure open (so the function above did not already
+    /// fire) and no `think` since the last recorded tool call, is replaced
+    /// with a `think` call the same way, one strike before
+    /// `CONTINUE_REPEAT_CAP` (`core/src/session.rs`) would otherwise park
+    /// the run on the third. Runs immediately after
+    /// `implement_repeat_failure_thinks` for the same reason: an `ask_user`
+    /// it replaces must already be `Tool { name: "think", .. }` before the
+    /// `done`/`ask_user` chain below can see it. Then
+    /// `implement_done_not_ours_strip`: whenever the
     /// raw patch would commit
     /// `done: true`, that key is removed before any of the conversions below
     /// run -- `done` is never `implement`'s to set, only `review`'s (see
@@ -2823,6 +3301,12 @@ impl Skill for ImplementSkill {
         let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let strip_note = strip_malformed_next(&cur.agent, &mut out);
         let repeat_think_note = implement_repeat_failure_thinks(cur, &mut out);
+        // Only reachable when `implement_repeat_failure_thinks` did not
+        // already fire: that function replaces a matching `ask_user` action
+        // with `Action::Tool { name: "think", .. }`, so `out.action()` is no
+        // longer `AskUser` by the time this runs whenever it already
+        // substituted -- the two never both act on the same step.
+        let early_park_think_note = implement_early_park_thinks(cur, &mut out);
         let not_ours_note = implement_done_not_ours_strip(&cur.agent, &mut out);
         let mut extra_note = None;
         if let Some(note) = green_done_note(cur, &mut out) {
@@ -2852,6 +3336,7 @@ impl Skill for ImplementSkill {
             .into_iter()
             .chain(strip_note)
             .chain(repeat_think_note)
+            .chain(early_park_think_note)
             .chain(not_ours_note)
             .chain(extra_note)
             .collect();
@@ -2878,6 +3363,7 @@ impl ReviewSkill {
             done_stays_done: true,
             seen: true,
             decision: true,
+            tests: true,
         }
     }
 
@@ -2889,11 +3375,12 @@ impl ReviewSkill {
         self
     }
 
-    /// Sets `guards.seen_map`/`guards.decision_field`; see
-    /// [`PlanSkill::state_fields`].
-    pub fn state_fields(mut self, seen: bool, decision: bool) -> Self {
+    /// Sets `guards.seen_map`/`guards.decision_field`/`guards.tests_field`;
+    /// see [`PlanSkill::state_fields`].
+    pub fn state_fields(mut self, seen: bool, decision: bool, tests: bool) -> Self {
         self.seen = seen;
         self.decision = decision;
+        self.tests = tests;
         self
     }
 }
@@ -3014,7 +3501,16 @@ impl Skill for ReviewSkill {
         args: &serde_json::Value,
         output: &str,
     ) -> Option<Patch> {
-        common_after_tool(ws, step, name, args, output, self.seen, self.decision)
+        common_after_tool(
+            ws,
+            step,
+            name,
+            args,
+            output,
+            self.seen,
+            self.decision,
+            self.tests,
+        )
     }
 
     /// First strips every harness-owned key present in the raw patch (see
@@ -3115,10 +3611,10 @@ pub fn coding_skills() -> Vec<(
 ///
 /// `done_stays_done` defaults to `false` here (`coding_skills_configured`'s
 /// default path, the first bench battery's audit showed the switch off no
-/// worse -- see `plan_rules`'s doc); `seen_map`/`decision_field` default to
-/// `true` (today's behaviour, like every other guard -- see `core/src/
-/// guards.rs`); use `coding_skills_configured` directly to opt any of these
-/// back.
+/// worse -- see `plan_rules`'s doc); `seen_map`/`decision_field`/
+/// `tests_field` default to `true` (today's behaviour, like every other
+/// guard -- see `core/src/guards.rs`); use `coding_skills_configured`
+/// directly to opt any of these back.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_with_delegates(
     delegates: Vec<String>,
@@ -3126,24 +3622,25 @@ pub fn coding_skills_with_delegates(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
 )> {
-    coding_skills_configured(delegates, false, true, true)
+    coding_skills_configured(delegates, false, true, true, true)
 }
 
 /// All four coding skills with every knob: `delegates` as in
 /// [`coding_skills_with_delegates`]; `done_stays_done` = `guards.
 /// done_stays_done` (statie-spec.md "10. After it works: the rule audit");
-/// `seen`/`decision` = `guards.seen_map`/`guards.decision_field`
-/// (`core/src/guards.rs`; BACKLOG.md item 2) -- all threaded into `plan`,
-/// `implement`, and `review` via [`PlanSkill::with_done_stays_done`]/
-/// [`PlanSkill::state_fields`] and their siblings. `router` is unaffected by
-/// all three: it has no plan-step rules and no tools, so nothing in it reads
-/// any of them.
+/// `seen`/`decision`/`tests` = `guards.seen_map`/`guards.decision_field`/
+/// `guards.tests_field` (`core/src/guards.rs`; BACKLOG.md items 2 and 5) --
+/// all threaded into `plan`, `implement`, and `review` via
+/// [`PlanSkill::with_done_stays_done`]/[`PlanSkill::state_fields`] and
+/// their siblings. `router` is unaffected by all four: it has no plan-step
+/// rules and no tools, so nothing in it reads any of them.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_configured(
     delegates: Vec<String>,
     done_stays_done: bool,
     seen: bool,
     decision: bool,
+    tests: bool,
 ) -> Vec<(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
@@ -3155,7 +3652,7 @@ pub fn coding_skills_configured(
             Arc::new(
                 PlanSkill::with_delegates(delegates.clone())
                     .with_done_stays_done(done_stays_done)
-                    .state_fields(seen, decision),
+                    .state_fields(seen, decision, tests),
             ),
         ),
         (
@@ -3163,7 +3660,7 @@ pub fn coding_skills_configured(
             Arc::new(
                 ImplementSkill::with_delegates(delegates.clone())
                     .with_done_stays_done(done_stays_done)
-                    .state_fields(seen, decision),
+                    .state_fields(seen, decision, tests),
             ),
         ),
         (
@@ -3171,7 +3668,7 @@ pub fn coding_skills_configured(
             Arc::new(
                 ReviewSkill::with_delegates(delegates)
                     .with_done_stays_done(done_stays_done)
-                    .state_fields(seen, decision),
+                    .state_fields(seen, decision, tests),
             ),
         ),
     ]

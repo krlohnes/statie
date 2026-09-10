@@ -28,7 +28,8 @@
   "guards": {
     "commitment_read_cap": false,
     "seen_map": false,
-    "decision_field": false
+    "decision_field": false,
+    "tests_field": false
   },
   "thinker": {
     "timeout_secs": 600

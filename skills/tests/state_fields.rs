@@ -4,7 +4,7 @@
 //! Workspace::seen`/`decision`) can be measured against it with the model,
 //! budgets, and window fixed.
 //!
-//! Driven through `ImplementSkill::new().state_fields(seen, decision)`
+//! Driven through `ImplementSkill::new().state_fields(seen, decision, tests)`
 //! (mirrors `done_stays_done.rs`'s use of `with_done_stays_done`), with a
 //! real `Session<CodingWorkspace>` wired to the real file tools via
 //! `common::make_file_tools_session` -- the same fixture style as
@@ -82,7 +82,8 @@ async fn seen_map_off_leaves_seen_empty_after_a_read() {
     let cfg = common::config(&root);
     let (mut session, log) = common::make_file_tools_session(Arc::clone(&model), cfg);
 
-    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new().state_fields(false, true));
+    let skill: Arc<ImplementSkill> =
+        Arc::new(ImplementSkill::new().state_fields(false, true, true));
     let mut active = session.activate(skill).await.unwrap();
 
     let outcome = run_step(&mut active, &log).await;
@@ -109,7 +110,7 @@ async fn seen_map_on_records_seen_after_a_read() {
     let cfg = common::config(&root);
     let (mut session, log) = common::make_file_tools_session(Arc::clone(&model), cfg);
 
-    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new().state_fields(true, true));
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new().state_fields(true, true, true));
     let mut active = session.activate(skill).await.unwrap();
 
     let outcome = run_step(&mut active, &log).await;
@@ -136,7 +137,8 @@ async fn decision_field_off_leaves_an_existing_decision_uncleared_by_a_passing_t
     let cfg = common::config(&root);
     let (mut session, log) = common::make_file_tools_session(Arc::clone(&model), cfg);
 
-    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new().state_fields(true, false));
+    let skill: Arc<ImplementSkill> =
+        Arc::new(ImplementSkill::new().state_fields(true, false, true));
     let mut active = session.activate(skill).await.unwrap();
 
     // Operator patch is a trusted write to the harness-owned `decision`

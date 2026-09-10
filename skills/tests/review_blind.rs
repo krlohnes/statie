@@ -389,7 +389,8 @@ async fn blind_approval_followed_by_clean_pass_then_approval_lands() {
     assert_eq!(state.harness.tool_calls, 1);
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "the substituted test passed: green_step must be set"
     );
     assert!(!state.harness.green_filtered);

@@ -177,7 +177,8 @@ async fn implement_done_true_with_passing_test_hands_off_to_review_not_terminal(
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "setup: the scripted test call must have set green_step"
     );
 

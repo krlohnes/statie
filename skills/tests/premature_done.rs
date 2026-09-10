@@ -415,7 +415,8 @@ async fn implement_done_after_green_checkpoint_hands_off_to_review_with_open_ste
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "green_step must be committed on the harness after the passing test"
     );
 

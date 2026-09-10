@@ -8,7 +8,7 @@ mod toy;
 pub use child::{ChildBudgets, ChildSkill, ChildSkillConfig, ChildSkillError};
 pub use coding::{
     CodingWorkspace, Decision, FileNote, ImplementSkill, PlanSkill, PlanStep, ReviewSkill,
-    RouterSkill, SeenFile, StepStatus, coding_skills, coding_skills_configured,
+    RouterSkill, SeenFile, StepStatus, TestRecord, coding_skills, coding_skills_configured,
     coding_skills_with_delegates,
 };
 pub use delegate::{ChildRunnerError, ConfiguredChildRunner, TokenizerFactory};

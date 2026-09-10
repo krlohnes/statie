@@ -74,6 +74,18 @@ pub struct Guards {
     /// only the second, persistent copy in `decision` is switched off.
     /// Added for BACKLOG.md item 2, same rationale as `seen_map`.
     pub decision_field: bool,
+    /// `CodingWorkspace::tests` (BACKLOG.md item 5): the harness writes it,
+    /// replaced whole, from every successful `test` tool call
+    /// (`common_after_tool`) -- the command, whether it passed, up to 8
+    /// failing test names, and the first recognized error line. Off:
+    /// `common_after_tool` writes no `tests` patch at all -- the field
+    /// stays `null` for the life of the session. The field stays harness-
+    /// owned either way (a model patch touching it is still stripped the
+    /// same as always); this switch only controls whether the harness
+    /// itself writes to it. Independent of `decision_field`: a `test`
+    /// call's `decision`-clearing half (when `decision_field` is on) still
+    /// applies regardless of this switch.
+    pub tests_field: bool,
 }
 
 impl Default for Guards {
@@ -87,6 +99,7 @@ impl Default for Guards {
             commitment_read_cap: true,
             seen_map: true,
             decision_field: true,
+            tests_field: true,
         }
     }
 }

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -11,6 +12,7 @@ use crate::delegate::{
     ChildRequest, ChildRunner, InboxItem as ChildInboxItem, changed_top_level_keys,
 };
 use crate::error::SessionError;
+use crate::fixer::{CandidateRunner, FixInput, Fixer, RunnerEdit};
 use crate::guards::Guards;
 use crate::log::{LogEntry, LogKind, SessionLog, StepRecord};
 use crate::loop_types::{Event, Executable, Outcome, Park};
@@ -250,6 +252,79 @@ fn non_progress_shape(tool_skipped: bool, action: &Action) -> String {
     "non-progress step".to_string()
 }
 
+/// One candidate's loser line, as it appears in a `try_fixes` observation:
+/// `"<n>. <path> — <rationale> -> <reason>"`.
+struct Loser {
+    line: String,
+}
+
+/// The result of `Active::verify_candidates`: either the first candidate
+/// that passed (with its diff, ready to report, already applied to the
+/// sandbox) or no candidate passed at all -- either way, every candidate's
+/// loser line so far (for `NoneWon`, that is all of them; for `Winner`,
+/// every OTHER candidate, including the untried tail).
+enum VerifyOutcome {
+    Winner {
+        index: usize,
+        edit: crate::fixer::CandidateEdit,
+        diff: String,
+        cmd: String,
+        losers: Vec<Loser>,
+    },
+    NoneWon {
+        cmd: String,
+        losers: Vec<Loser>,
+    },
+}
+
+/// The first line of `stdout`/`stderr` (stdout first, then stderr) that
+/// starts with (trimmed) one of a fixed set of failure markers, else the
+/// last non-empty line of the combined output, capped at 200 chars. Used
+/// to build a `try_fixes` loser's `-> <reason>` suffix.
+fn loser_reason(stdout: &str, stderr: &str, timed_out: bool) -> String {
+    const MARKERS: &[&str] = &[
+        "error[",
+        "error:",
+        "thread '",
+        "panicked at",
+        "assertion",
+        "AssertionError",
+        "Error:",
+        "FAILED",
+        "FAIL:",
+        "Traceback",
+    ];
+
+    if timed_out {
+        return cap_reason("timed out");
+    }
+
+    let combined = format!("{stdout}\n{stderr}");
+    for line in combined.lines() {
+        let trimmed = line.trim();
+        if MARKERS.iter().any(|m| trimmed.starts_with(m)) {
+            return cap_reason(trimmed);
+        }
+    }
+
+    let last_non_empty = combined
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no output)");
+    cap_reason(last_non_empty)
+}
+
+fn cap_reason(text: &str) -> String {
+    if text.chars().count() <= 200 {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(200).collect();
+        truncated
+    }
+}
+
 /// Extracts the command string for `shell`/`test` args: `args.cmd`, falling
 /// back to `args.command` (the alias the tools themselves accept), then
 /// normalizes it. `None` when neither key is a string.
@@ -484,6 +559,39 @@ pub struct Session<W> {
     /// `self.session.tools` (`think` is not run by the registry -- see
     /// `statie_tools::Think`).
     thinker: Option<Arc<dyn Thinker>>,
+    /// The `try_fixes` tool's proposer backend and verification primitive
+    /// (BACKLOG.md item 4): `None` means `try_fixes` is registered (if the
+    /// active tool set includes it) but every call reports itself as
+    /// unconfigured, the same as an unconfigured `thinker` does for
+    /// `think`. When set, `Active::execute`'s `Action::Tool` interception
+    /// for `name == "try_fixes"` calls `fixer.propose` and verifies each
+    /// candidate through `runner` directly, instead of dispatching to
+    /// `self.session.tools` (`try_fixes` is not run by the registry -- see
+    /// `statie_tools::TryFixes`). `runner`/`default_k`/`try_fixes_timeout`/
+    /// `try_fixes_output_cap` are only meaningful once `fixer` is `Some`
+    /// (see `with_fixer`); `runner` defaults to `None` even when `fixer` is
+    /// set until `with_fixer` supplies one, in which case `try_fixes`
+    /// reports the same "not configured" shape as no fixer at all (there is
+    /// nothing to verify candidates with).
+    fixer: Option<Arc<dyn Fixer>>,
+    /// The verification primitive for `try_fixes` (see `fixer::
+    /// CandidateRunner`'s doc for why this is a trait rather than a direct
+    /// dependency on `statie-tools`). Set by `with_fixer` alongside
+    /// `fixer`.
+    candidate_runner: Option<Arc<dyn CandidateRunner>>,
+    /// How many candidates a bare `try_fixes {}` call (no `k` in its args)
+    /// asks the fixer for. Set by `with_fixer`.
+    default_k: u32,
+    /// Timeout for each candidate's verification run (`CandidateRunner::
+    /// run`), mirroring the `test`/`shell` tools' own `shell_timeout_secs`.
+    /// Set by `with_fixer` from the same tools config `cli/src/main.rs`
+    /// builds `statie_tools::default_tools` from, since `SessionConfig`
+    /// carries no shell timeout of its own for the session to read.
+    try_fixes_timeout: Duration,
+    /// Output cap (bytes) for each candidate's verification run, mirroring
+    /// the `test`/`shell` tools' own `max_output_bytes`. Set by `with_fixer`
+    /// the same way as `try_fixes_timeout`.
+    try_fixes_output_cap: usize,
     /// A copy of the current step's rendered prompt (`system()`/`user()`),
     /// kept so a `think` call made during this step can hand the reasoning
     /// subagent exactly what the worker itself saw. Set once per step, right
@@ -626,6 +734,11 @@ impl<W> Session<W> {
             delegations: 0,
             maintainer: None,
             thinker: None,
+            fixer: None,
+            candidate_runner: None,
+            default_k: 3,
+            try_fixes_timeout: Duration::from_secs(120),
+            try_fixes_output_cap: 200_000,
             last_prompt: None,
             working_set: WorkingSetConfig::default(),
             guards: Guards::default(),
@@ -656,6 +769,41 @@ impl<W> Session<W> {
     /// model `think` is not configured.
     pub fn with_thinker(mut self, t: Arc<dyn Thinker>) -> Self {
         self.thinker = Some(t);
+        self
+    }
+
+    /// Attaches the `try_fixes` tool's proposer backend and verification
+    /// primitive (BACKLOG.md item 4). Without a call, `try_fixes` still
+    /// commits (never rejected) but its tool output tells the model
+    /// `try_fixes` is not configured, the same as `think` without a
+    /// `with_thinker` call. `default_k` is how many candidates a bare
+    /// `try_fixes {}` (no `k` in its args) asks for.
+    pub fn with_fixer(mut self, f: Arc<dyn Fixer>, default_k: u32) -> Self {
+        self.fixer = Some(f);
+        self.default_k = default_k;
+        self
+    }
+
+    /// Supplies the verification primitive `try_fixes` runs each candidate
+    /// through (`fixer::CandidateRunner`). Without a call, `try_fixes`
+    /// reports itself unconfigured even when `with_fixer` attached a
+    /// proposer -- there is nothing to verify a candidate with. Callers
+    /// wire this from `statie_tools::worktree::WorktreeRunner` (see
+    /// `cli/src/main.rs`).
+    pub fn with_candidate_runner(mut self, r: Arc<dyn CandidateRunner>) -> Self {
+        self.candidate_runner = Some(r);
+        self
+    }
+
+    /// Overrides the timeout/output cap `try_fixes` uses for each
+    /// candidate's verification run. Without a call, these default to the
+    /// same values `statie_tools::ToolConfig::default()` gives `shell`/
+    /// `test` (120s, 200_000 bytes) -- callers that build a non-default
+    /// `ToolConfig` should call this with the same values so `try_fixes`
+    /// matches the `test` tool's own timeout/cap.
+    pub fn with_try_fixes_limits(mut self, timeout: Duration, output_cap: usize) -> Self {
+        self.try_fixes_timeout = timeout;
+        self.try_fixes_output_cap = output_cap;
         self
     }
 
@@ -759,6 +907,9 @@ impl<W> Session<W> {
                         edits_since_test: 0,
                         last_think_step: None,
                         repeated_failure_step: None,
+                        try_fixes_available: self.fixer.is_some(),
+                        last_try_fixes_step: None,
+                        consecutive_non_question_asks: 0,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -777,6 +928,11 @@ impl<W> Session<W> {
                 // `think` call either (see `HarnessState::last_think_step`'s
                 // doc).
                 harness.last_think_step = None;
+                // Mirrors `thinker`/`last_think_step`: whether a fixer is
+                // attached to THIS session, refreshed every activation the
+                // same way `active_tools`/`budgets` are (the config, not the
+                // persisted snapshot, owns it).
+                harness.try_fixes_available = self.fixer.is_some();
                 self.store.set_harness(harness).await?;
             }
         }
@@ -1374,6 +1530,17 @@ where
                 }
             };
 
+        // `HarnessState::consecutive_non_question_asks`: read from the
+        // model's own raw parsed action, before `Skill::validate` (right
+        // below) can rewrite it -- a skill converting a non-question
+        // `ask_user` into `Action::Continue` (or the early-park trigger
+        // converting it into `think`) must not hide the shape this field
+        // exists to count. Used when `next_harness` is built (8, below).
+        let raw_non_question_ask = matches!(
+            parsed.action(),
+            Action::AskUser { message } if !message.contains('?')
+        );
+
         // 7. Validate.
         let validated: ValidatedStep<K::Workspace> = match self.skill.validate(&cur, parsed) {
             Ok(v) => v,
@@ -1671,6 +1838,17 @@ where
         }
         next_harness.active_tools = self.skill.tools();
         next_harness.activation = self.skill.name().to_string();
+        // `HarnessState::consecutive_non_question_asks`: streak of the raw
+        // shape captured above (7, before `validate`), regardless of what
+        // the skill's `validate` rewrote the action into -- a fresh `?`-free
+        // `ask_user` extends the streak from the previous commit; anything
+        // else (a tool call, a real question, `done`, `yield`, a delegate)
+        // resets it.
+        next_harness.consecutive_non_question_asks = if raw_non_question_ask {
+            cur.harness.consecutive_non_question_asks.saturating_add(1)
+        } else {
+            0
+        };
 
         let patch_raw = patch.raw().clone();
         let new_version = self
@@ -2163,6 +2341,14 @@ where
                 // differs.
                 if name == "think" {
                     return self.execute_think(step, entries, args, token).await;
+                }
+
+                // `try_fixes` (BACKLOG.md item 4): the session intercepts
+                // it here, exactly like `think` above -- `statie_tools::
+                // TryFixes::call` always errors, by design (see that
+                // type's doc).
+                if name == "try_fixes" {
+                    return self.execute_try_fixes(step, entries, args, token).await;
                 }
 
                 let Some(tool) = self.session.tools.get(&name) else {
@@ -3057,6 +3243,468 @@ where
             .await?;
 
         Ok(Outcome::Continue)
+    }
+
+    /// Runs a `try_fixes` call (BACKLOG.md item 4, "Hypotheses and
+    /// verify"): the session's own handling for `Action::Tool { name:
+    /// "try_fixes", .. }`, called from `execute` before dispatch to
+    /// `self.session.tools`, the same as `execute_think` handles `think`
+    /// (`try_fixes` is registered there only so its schema/description
+    /// render -- `statie_tools::TryFixes::call` itself always errors).
+    ///
+    /// No fixer attached: the same unconfigured-observation shape
+    /// `execute_think` produces without a thinker (see that function).
+    /// No failing test on record (`self.session.last_test_failure` is
+    /// `None`): a tool-error observation, the fixer never called. Otherwise
+    /// builds a `FixInput` from the current step's own prompt (mirroring
+    /// `execute_think`) and the normalised failure summary already kept by
+    /// the repeated-failure bookkeeping, calls `fixer.propose`, then
+    /// verifies each candidate in its own worktree via `candidate_runner`
+    /// (snapshot once, each candidate tried and cleaned up regardless of
+    /// outcome), applies the first passer, and falls back to a `think` call
+    /// (when a thinker is attached) if none passed. `HarnessState.
+    /// last_try_fixes_step` AND `last_think_step` are always set to this
+    /// step (see `HarnessState::last_try_fixes_step`'s doc), so the
+    /// once-per-streak repeated-failure gate is shared between the two
+    /// tools.
+    async fn execute_try_fixes(
+        &mut self,
+        step: u64,
+        entries: &mut Vec<LogEntry>,
+        args: Value,
+        token: CancellationToken,
+    ) -> Result<Outcome, SessionError> {
+        let name = "try_fixes".to_string();
+        let start = std::time::Instant::now();
+
+        // No fixer attached: same shape as `think` with no thinker.
+        let Some(fixer) = self.session.fixer.clone() else {
+            return self
+                .finish_try_fixes(
+                    step,
+                    entries,
+                    name,
+                    args,
+                    "`try_fixes` is not configured: set a `fixer` section in the config (see \
+                     README, Config). Decide from what you have."
+                        .to_string(),
+                    serde_json::json!({
+                        "k": Value::Null,
+                        "candidates": 0,
+                        "winner": Value::Null,
+                        "losers": Value::Array(vec![]),
+                        "configured": false,
+                        "wall_ms": start.elapsed().as_millis() as u64,
+                    }),
+                )
+                .await;
+        };
+
+        // No failing test on record: no `last_test_cmd` at all, or the most
+        // recent `test` call passed (`last_test_failure` is `None` before
+        // any failing `test` call this activation, and cleared back to
+        // `None` on a pass -- see that field's doc). Either way there is
+        // nothing to fix.
+        let (cur, _version) = self.session.state().await?;
+        let last_test_cmd = cur.harness.last_test_cmd.clone();
+        let failure = self.session.last_test_failure.clone();
+        let (Some(cmd), Some(failure)) = (last_test_cmd, failure) else {
+            entries.push(system_entry(
+                step,
+                "tool_error",
+                serde_json::json!({
+                    "name": name,
+                    "reason": "no failing test to fix; run test first"
+                }),
+            ));
+            let (obs, _overflow) = Observation::truncate_with_report(
+                &crate::promptable::ToolOutputFull::new(
+                    "try_fixes: no failing test to fix; run test first".to_string(),
+                ),
+                self.session.config.budgets.observation,
+                self.session.tokenizer.as_ref(),
+            );
+            self.session.pending_observation = Some(obs);
+            self.session.record_tool_call().await?;
+            return Ok(Outcome::Continue);
+        };
+
+        let (system, user) = self
+            .session
+            .last_prompt
+            .clone()
+            .unwrap_or_else(|| (String::new(), String::new()));
+        let k = args
+            .get("k")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32)
+            .unwrap_or(self.session.default_k);
+
+        let input = FixInput {
+            system,
+            user,
+            failure,
+            k,
+        };
+
+        let propose_result = fixer.propose(input, token.clone()).await;
+        let candidates = match propose_result {
+            Ok(out) => out.candidates,
+            Err(crate::fixer::FixError::Empty) => {
+                return self
+                    .finish_try_fixes(
+                        step,
+                        entries,
+                        name,
+                        args,
+                        "try_fixes: the proposer returned no candidates".to_string(),
+                        serde_json::json!({
+                            "k": k,
+                            "candidates": 0,
+                            "winner": Value::Null,
+                            "losers": Value::Array(vec![]),
+                            "configured": true,
+                            "wall_ms": start.elapsed().as_millis() as u64,
+                        }),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                return self
+                    .finish_try_fixes(
+                        step,
+                        entries,
+                        name,
+                        args,
+                        format!("try_fixes failed: {e}"),
+                        serde_json::json!({
+                            "k": k,
+                            "candidates": 0,
+                            "winner": Value::Null,
+                            "losers": Value::Array(vec![]),
+                            "configured": true,
+                            "error": e.to_string(),
+                            "wall_ms": start.elapsed().as_millis() as u64,
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        let verify_outcome = self
+            .verify_candidates(&candidates, &cmd, token.clone())
+            .await?;
+
+        let mut winner_index: Option<usize> = None;
+        let mut loser_descriptions: Vec<String> = Vec::new();
+        let text = match verify_outcome {
+            VerifyOutcome::Winner {
+                index,
+                edit,
+                diff,
+                cmd,
+                losers,
+            } => {
+                winner_index = Some(index);
+                let mut lines = vec![format!(
+                    "try_fixes: {} candidates; candidate {} passed `{cmd}` and was applied",
+                    candidates.len(),
+                    index + 1,
+                )];
+                lines.push(format!("applied: {} — {}", edit.path, edit.rationale));
+                let capped_diff: String = diff.chars().take(2000).collect();
+                lines.push(capped_diff);
+                if !losers.is_empty() {
+                    lines.push("losers:".to_string());
+                    for l in &losers {
+                        loser_descriptions.push(l.line.clone());
+                        lines.push(l.line.clone());
+                    }
+                }
+                lines.join("\n")
+            }
+            VerifyOutcome::NoneWon { cmd, losers } => {
+                let mut lines = vec![format!(
+                    "try_fixes: {} candidates; none passed `{cmd}`",
+                    candidates.len(),
+                )];
+                for l in &losers {
+                    loser_descriptions.push(l.line.clone());
+                    lines.push(l.line.clone());
+                }
+                let base = lines.join("\n");
+
+                // Fall back to `think` when a thinker is attached, with the
+                // losers in its question.
+                if let Some(thinker) = self.session.thinker.clone() {
+                    let loser_text = loser_descriptions.join("\n");
+                    let question = format!(
+                        "None of these candidate fixes passed {cmd}:\n{loser_text}\nWhat is \
+                         wrong instead, and what is the one edit to make?"
+                    );
+                    let (system, user) = self
+                        .session
+                        .last_prompt
+                        .clone()
+                        .unwrap_or_else(|| (String::new(), String::new()));
+                    let think_input = ThinkInput {
+                        system: &system,
+                        user: &user,
+                        question: &question,
+                    };
+                    match thinker.think(think_input, token.clone()).await {
+                        Ok(out) => format!("{base}\nthink:\n{}", out.answer),
+                        Err(e) => format!("{base}\nthink:\nthink failed: {e}"),
+                    }
+                } else {
+                    base
+                }
+            }
+        };
+
+        let losers_json: Vec<Value> = loser_descriptions
+            .iter()
+            .map(|l| serde_json::Value::String(l.clone()))
+            .collect();
+        let payload = serde_json::json!({
+            "k": k,
+            "candidates": candidates.len(),
+            "winner": winner_index.map(|i| i + 1),
+            "losers": losers_json,
+            "configured": true,
+            "wall_ms": start.elapsed().as_millis() as u64,
+        });
+
+        self.finish_try_fixes(step, entries, name, args, text, payload)
+            .await
+    }
+
+    /// Shared tail of `execute_try_fixes`: logs the `try_fixes` System
+    /// entry and the `ToolOutput` entry, runs the loop guard, commits
+    /// `tool_calls`/`last_try_fixes_step`/`last_think_step`, and calls
+    /// `call_after_tool_hook` -- mirroring `execute_think`'s own tail
+    /// exactly (see that function's doc for why every one of these steps
+    /// runs regardless of whether the call was configured, errored, or
+    /// produced a real verdict).
+    async fn finish_try_fixes(
+        &mut self,
+        step: u64,
+        entries: &mut Vec<LogEntry>,
+        name: String,
+        args: Value,
+        text: String,
+        mut payload: Value,
+    ) -> Result<Outcome, SessionError> {
+        if let Value::Object(map) = &mut payload {
+            map.insert("event".to_string(), Value::String("try_fixes".to_string()));
+        }
+        entries.push(LogEntry {
+            step,
+            kind: LogKind::System,
+            ts: chrono::Utc::now().to_rfc3339(),
+            payload,
+            agent: None,
+        });
+
+        entries.push(LogEntry {
+            step,
+            kind: LogKind::ToolOutput,
+            ts: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "name": name,
+                "output": text,
+                "truncated": false,
+            }),
+            agent: None,
+        });
+
+        let raw_output = text.clone();
+        let current = (name.clone(), args.clone(), text.clone());
+        let prior_occurrences = self
+            .session
+            .recent_tool_calls
+            .iter()
+            .filter(|entry| **entry == current)
+            .count();
+        let mut text = text;
+        if prior_occurrences >= 2 {
+            let occurrence = prior_occurrences + 1;
+            text = format!(
+                "[harness] This is occurrence #{occurrence} of `{name}` with identical \
+                 arguments and identical output within the last {TOOL_CALL_HISTORY} tool calls; \
+                 nothing has changed. Record what you learned in the workspace and take a \
+                 different action (if the work is finished, hand off with `next_skill` or set \
+                 the terminal field).\n\n{text}"
+            );
+        }
+        self.session.recent_tool_calls.push_back(current);
+        if self.session.recent_tool_calls.len() > TOOL_CALL_HISTORY {
+            self.session.recent_tool_calls.pop_front();
+        }
+
+        let (obs, _overflow) = Observation::truncate_with_report(
+            &crate::promptable::ToolOutputFull::new(text),
+            self.session.config.budgets.observation,
+            self.session.tokenizer.as_ref(),
+        );
+        self.session.pending_observation = Some(obs);
+
+        let (cur, _version) = self.session.state().await?;
+        let mut harness = cur.harness;
+        harness.tool_calls += 1;
+        harness.last_try_fixes_step = Some(step);
+        harness.last_think_step = Some(step);
+        self.session.store.set_harness(harness).await?;
+
+        self.call_after_tool_hook(step, &name, &args, &raw_output)
+            .await?;
+
+        Ok(Outcome::Continue)
+    }
+
+    /// Verifies each candidate in its own worktree via `self.session.
+    /// candidate_runner`, in order, stopping at the first pass. Every
+    /// worktree created is removed before this returns, on every path
+    /// (winner, loser, or a candidate-creation error), via an explicit
+    /// cleanup loop rather than relying on `Drop` (the trait objects carry
+    /// no such guarantee).
+    ///
+    /// A candidate whose creation itself errors (an ambiguous/missing
+    /// anchor, an invalid path, or a backend/git failure) is a loser with
+    /// that error text as its reason -- it is never run.
+    async fn verify_candidates(
+        &mut self,
+        candidates: &[crate::fixer::CandidateEdit],
+        cmd: &str,
+        _token: CancellationToken,
+    ) -> Result<VerifyOutcome, SessionError> {
+        let cmd = cmd.to_string();
+
+        // No runner attached: every candidate is a loser with the same
+        // "not configured" reason, none tried.
+        let Some(runner) = self.session.candidate_runner.clone() else {
+            let losers = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, c)| Loser {
+                    line: format!(
+                        "{}. {} — {} -> try_fixes has no worktree runner configured",
+                        i + 1,
+                        c.path,
+                        c.rationale
+                    ),
+                })
+                .collect();
+            return Ok(VerifyOutcome::NoneWon { cmd, losers });
+        };
+
+        let root = self.session.config.root.path().to_path_buf();
+        let snap = match runner.snapshot(&root).await {
+            Ok(s) => s,
+            Err(e) => {
+                let losers = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| Loser {
+                        line: format!("{}. {} — {} -> {e}", i + 1, c.path, c.rationale),
+                    })
+                    .collect();
+                return Ok(VerifyOutcome::NoneWon { cmd, losers });
+            }
+        };
+
+        let mut losers: Vec<Loser> = Vec::new();
+        let mut winner: Option<(usize, crate::fixer::CandidateEdit, String)> = None;
+
+        for (i, c) in candidates.iter().enumerate() {
+            if winner.is_some() {
+                losers.push(Loser {
+                    line: format!("{}. {} — {} -> not tried", i + 1, c.path, c.rationale),
+                });
+                continue;
+            }
+
+            let edit = RunnerEdit {
+                path: c.path.clone(),
+                old: c.old.clone(),
+                new: c.new.clone(),
+            };
+
+            let cand = match runner.candidate(snap.as_ref(), &edit).await {
+                Ok(cand) => cand,
+                Err(e) => {
+                    losers.push(Loser {
+                        line: format!("{}. {} — {} -> {e}", i + 1, c.path, c.rationale),
+                    });
+                    continue;
+                }
+            };
+
+            let run_result = runner
+                .run(
+                    cand.as_ref(),
+                    &cmd,
+                    self.session.try_fixes_timeout,
+                    self.session.try_fixes_output_cap,
+                )
+                .await;
+
+            match run_result {
+                Ok(res) if res.passed() => {
+                    let diff = runner.diff(cand.as_ref()).await.unwrap_or_default();
+                    if let Err(e) = runner.apply_to_sandbox(cand.as_ref()).await {
+                        losers.push(Loser {
+                            line: format!(
+                                "{}. {} — {} -> applying the winning diff failed: {e}",
+                                i + 1,
+                                c.path,
+                                c.rationale
+                            ),
+                        });
+                        let _ = runner.remove(cand).await;
+                        continue;
+                    }
+                    winner = Some((i, c.clone(), diff));
+                    let _ = runner.remove(cand).await;
+                }
+                Ok(res) => {
+                    let reason = loser_reason(&res.stdout, &res.stderr, res.timed_out);
+                    losers.push(Loser {
+                        line: format!("{}. {} — {} -> {reason}", i + 1, c.path, c.rationale),
+                    });
+                    let _ = runner.remove(cand).await;
+                }
+                Err(e) => {
+                    losers.push(Loser {
+                        line: format!("{}. {} — {} -> {e}", i + 1, c.path, c.rationale),
+                    });
+                    let _ = runner.remove(cand).await;
+                }
+            }
+        }
+
+        match winner {
+            Some((index, edit, diff)) => {
+                // The sandbox changed: bump `edits_since_test` the same as
+                // an ordinary `edit_file`/`write_file` call would (see
+                // `execute`'s success path), so the model is told it must
+                // run `test` to confirm rather than trusting the candidate
+                // run alone.
+                let (cur, _version) = self.session.state().await?;
+                let mut harness = cur.harness;
+                harness.edits_since_test = harness.edits_since_test.saturating_add(1);
+                self.session.store.set_harness(harness).await?;
+
+                Ok(VerifyOutcome::Winner {
+                    index,
+                    edit,
+                    diff,
+                    cmd,
+                    losers,
+                })
+            }
+            None => Ok(VerifyOutcome::NoneWon { cmd, losers }),
+        }
     }
 
     fn reject(

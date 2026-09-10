@@ -13,6 +13,7 @@ mod search;
 mod shell;
 mod test_tool;
 mod think;
+mod try_fixes;
 mod worktree;
 mod write_file;
 
@@ -31,9 +32,10 @@ pub use search::Search;
 pub use shell::Shell;
 pub use test_tool::{TestTool, detect_test_command};
 pub use think::{Think, ThinkArgs};
+pub use try_fixes::{TryFixes, TryFixesArgs};
 pub use worktree::{
-    Candidate, RunResult, Snapshot, WorktreeError, apply_to_sandbox, candidate, diff, remove,
-    run_in, run_in_with_env, snapshot,
+    Candidate, RunResult, Snapshot, WorktreeError, WorktreeRunner, apply_to_sandbox, candidate,
+    diff, remove, run_in, run_in_with_env, snapshot,
 };
 pub use write_file::WriteFile;
 
@@ -97,6 +99,7 @@ pub fn default_tools(cfg: &ToolConfig) -> ToolSet {
         max_output_bytes: cfg.max_output_bytes,
     }));
     tools.register(Arc::new(Think));
+    tools.register(Arc::new(TryFixes));
 
     if cfg.allow_shell {
         tools.register(Arc::new(Shell {
@@ -145,6 +148,7 @@ mod tests {
                 "shell",
                 "test",
                 "think",
+                "try_fixes",
                 "write_file"
             ]
         );
@@ -170,6 +174,7 @@ mod tests {
                 "revert_file",
                 "search",
                 "think",
+                "try_fixes",
                 "write_file"
             ]
         );

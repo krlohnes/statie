@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use statie_core::{Guards, Maintainer, SessionLog, StateStore, Thinker, TiktokenTokenizer};
+use statie_core::{Fixer, Guards, Maintainer, SessionLog, StateStore, Thinker, TiktokenTokenizer};
 use statie_models::{
-    MockModel, MockTurn, ModelMaintainer, ModelThinker, OllamaConfig, OllamaFormat, OllamaModel,
-    OpenAiCompatConfig, OpenAiCompatModel,
+    MockModel, MockTurn, ModelFixer, ModelMaintainer, ModelThinker, OllamaConfig, OllamaFormat,
+    OllamaModel, OpenAiCompatConfig, OpenAiCompatModel,
 };
 use statie_skills::ChildSkillConfig;
 use statie_store::{InMemoryStore, JsonlLog, SqliteStore};
@@ -48,6 +48,11 @@ pub struct Config {
     /// tells the model `think` is not configured (see
     /// `Session::with_thinker`).
     pub thinker: Option<ThinkerConfig>,
+    /// The `try_fixes` tool's proposer backend (BACKLOG.md item 4). Absent
+    /// (the default) means no fixer is attached; session-side handling of
+    /// an unconfigured `try_fixes` call is a later unit, mirroring
+    /// `thinker`.
+    pub fixer: Option<FixerConfig>,
     /// Working-set config (statie-spec.md "10. Working set"): recent tool
     /// calls and read/search windows kept in front of the model.
     /// `max_windows: 0` disables the section.
@@ -75,6 +80,7 @@ impl Default for Config {
             subagents: BTreeMap::new(),
             maintainer: None,
             thinker: None,
+            fixer: None,
             working_set: WorkingSetConfigEntry::default(),
             guards: Guards::default(),
         }
@@ -161,7 +167,9 @@ pub struct ThinkerConfig {
     /// chunks with a short summarized carry-over between them, so a long
     /// trace fits inside the session's own context window rather than
     /// needing a separate, larger one and the model reload that comes with
-    /// switching to it. Default `false` (today's unchunked behavior). When
+    /// switching to it. Default `true` since the calibration battery: a
+    /// chunked think on the rounding trap answered in 46 seconds against
+    /// 100 to 250 unchunked with a reload each way (DECISIONS.md D9). When
     /// `true`, built with `ChunkConfig::default()`.
     pub chunked: bool,
 }
@@ -172,7 +180,7 @@ impl Default for ThinkerConfig {
             model: None,
             timeout_secs: 600,
             num_ctx: None,
-            chunked: false,
+            chunked: true,
         }
     }
 }
@@ -180,6 +188,36 @@ impl Default for ThinkerConfig {
 /// The default `num_ctx` for an unchunked thinker: its own large window,
 /// separate from the acting model's.
 const UNCHUNKED_DEFAULT_NUM_CTX: u32 = 32768;
+
+/// The `try_fixes` tool's proposer backend config (BACKLOG.md item 4).
+/// `model` defaults to the top-level `model` when omitted, the same as
+/// `ThinkerConfig::model`. Unlike `thinker.num_ctx`, `num_ctx` here has no
+/// deliberate override default: these calls run with thinking off and a
+/// short `num_predict` (1200), so there is no trace competing with the
+/// prompt for room the way `think` has -- `num_ctx` simply defaults to the
+/// resolved model's own `num_ctx`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct FixerConfig {
+    pub model: Option<ModelConfig>,
+    pub timeout_secs: u64,
+    /// How many candidate fixes to sample per `try_fixes` call.
+    pub k: u32,
+    /// Context window sent on each candidate call. `None` (the default)
+    /// uses the resolved model's own `num_ctx`.
+    pub num_ctx: Option<u32>,
+}
+
+impl Default for FixerConfig {
+    fn default() -> Self {
+        FixerConfig {
+            model: None,
+            timeout_secs: 600,
+            k: 3,
+            num_ctx: None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -573,6 +611,43 @@ impl Config {
         })
     }
 
+    /// Builds the `try_fixes` tool's proposer backend from `self.fixer`.
+    /// `None` when the section is absent, mirroring `build_thinker`.
+    /// `fixer.model` is built when given, else the top-level `model` is
+    /// reused. Only the Ollama backend is supported, the same restriction
+    /// as `build_thinker` and for the same reason: `ModelFixer` is built
+    /// directly from an `OllamaModel`, not the `Arc<dyn Model>` trait
+    /// object `build_model_from` returns for other backends. The resolved
+    /// model config's `num_ctx` is overridden by `fixer.num_ctx` when set,
+    /// else left as the resolved model's own `num_ctx` -- unlike
+    /// `thinker`, these calls run with thinking off and a short
+    /// `num_predict`, so there is no separate large window to default to.
+    ///
+    /// Called from `run_coding` (`cli/src/main.rs`) alongside `build_
+    /// thinker`, and attached via `Session::with_fixer` with `self.fixer.k`
+    /// (defaulting to `FixerConfig::default().k` when the section itself is
+    /// absent -- `with_fixer` is only called when this returns `Some`, so
+    /// that default never actually reaches a session).
+    pub fn build_fixer(&self) -> anyhow::Result<Option<Arc<dyn Fixer>>> {
+        let Some(f) = &self.fixer else {
+            return Ok(None);
+        };
+        let model_cfg = f.model.as_ref().unwrap_or(&self.model);
+        if model_cfg.backend != "ollama" {
+            anyhow::bail!(
+                "fixer requires the ollama backend (got `{}`)",
+                model_cfg.backend
+            );
+        }
+        let mut ollama_cfg = ollama_config(model_cfg);
+        if let Some(num_ctx) = f.num_ctx {
+            ollama_cfg.num_ctx = num_ctx;
+        }
+        let model = OllamaModel::new(ollama_cfg)?;
+        let fixer = ModelFixer::new(Arc::new(model), Duration::from_secs(f.timeout_secs));
+        Ok(Some(Arc::new(fixer)))
+    }
+
     /// Resolves `self.store.path` and `self.session_log` against the
     /// sandbox root, so relative paths in the config are anchored there
     /// rather than the process cwd.
@@ -940,6 +1015,44 @@ mod tests {
             "decision_field is a separate switch from seen_map and keeps its own default"
         );
         assert!(!parsed.guards.seen_map);
+
+        // Round-trips through serialize -> deserialize unchanged.
+        let json = serde_json::to_string(&parsed).unwrap();
+        let round_tripped: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.guards, parsed.guards);
+    }
+
+    /// BACKLOG.md item 5: `guards.tests_field` picks up a config value the
+    /// same way every other `Guards` field does, with the rest at default.
+    #[test]
+    fn guards_tests_field_false_parses_with_other_fields_at_default() {
+        let text = serde_json::json!({
+            "guards": {"tests_field": false}
+        })
+        .to_string();
+        let parsed: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.guards,
+            Guards {
+                tests_field: false,
+                ..Guards::default()
+            }
+        );
+        assert!(parsed.guards.redundant_reads);
+        assert!(parsed.guards.silent_reads);
+        assert!(parsed.guards.read_guard);
+        assert!(parsed.guards.redundant_verify);
+        assert!(
+            !parsed.guards.done_stays_done,
+            "done_stays_done defaults to false, unlike the other rules"
+        );
+        assert!(parsed.guards.commitment_read_cap);
+        assert!(parsed.guards.seen_map);
+        assert!(
+            parsed.guards.decision_field,
+            "decision_field is a separate switch from tests_field and keeps its own default"
+        );
+        assert!(!parsed.guards.tests_field);
 
         // Round-trips through serialize -> deserialize unchanged.
         let json = serde_json::to_string(&parsed).unwrap();
@@ -1369,11 +1482,30 @@ mod tests {
         assert_eq!(t.timeout_secs, 30);
         assert!(t.model.is_none());
         assert_eq!(t.num_ctx, None, "thinker.num_ctx must default to None");
-        assert!(!t.chunked, "thinker.chunked must default to false");
+        assert!(t.chunked, "thinker.chunked must default to true (D9)");
         assert_eq!(
             cfg.effective_thinker_num_ctx(&t),
-            32768,
-            "unchunked, effective num_ctx must default to 32768"
+            cfg.model.num_ctx,
+            "chunked, effective num_ctx must follow the session's model.num_ctx"
+        );
+    }
+
+    #[test]
+    fn thinker_chunked_off_restores_the_separate_32k_window() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"model":{"num_ctx":16384},"thinker":{"chunked":false}}"#)
+                .unwrap();
+        let t = cfg.thinker.clone().expect("thinker section should parse");
+        assert!(!t.chunked);
+        assert_eq!(cfg.effective_thinker_num_ctx(&t), 32768);
+
+        let cfg: Config =
+            serde_json::from_str(r#"{"model":{"num_ctx":16384},"thinker":{}}"#).unwrap();
+        let t = cfg.thinker.clone().expect("thinker section should parse");
+        assert_eq!(
+            cfg.effective_thinker_num_ctx(&t),
+            16384,
+            "chunked by default, the think runs in the session window: no reload"
         );
     }
 
@@ -1488,6 +1620,112 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("ollama"), "{err}");
+    }
+
+    #[test]
+    fn absent_fixer_section_builds_none() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.fixer.is_none());
+        let fixer = cfg.build_fixer().unwrap();
+        assert!(fixer.is_none());
+    }
+
+    #[test]
+    fn fixer_section_parses_and_fills_in_defaults() {
+        let cfg: Config = serde_json::from_str(r#"{"fixer":{"timeout_secs":30}}"#).unwrap();
+        let f = cfg.fixer.clone().expect("fixer section should parse");
+        assert_eq!(f.timeout_secs, 30);
+        assert!(f.model.is_none());
+        assert_eq!(f.k, 3, "fixer.k must default to 3");
+        assert_eq!(f.num_ctx, None, "fixer.num_ctx must default to None");
+    }
+
+    #[test]
+    fn fixer_explicit_k_and_num_ctx_parse() {
+        let cfg: Config = serde_json::from_str(r#"{"fixer":{"k":5,"num_ctx":8192}}"#).unwrap();
+        let f = cfg.fixer.clone().expect("fixer section should parse");
+        assert_eq!(f.k, 5);
+        assert_eq!(f.num_ctx, Some(8192));
+    }
+
+    #[test]
+    fn present_fixer_section_builds_some_with_ollama_backend() {
+        let cfg: Config = serde_json::from_str(r#"{"fixer":{"timeout_secs":30}}"#).unwrap();
+        // Top-level model defaults to backend "ollama", so this should build.
+        let fixer = cfg.build_fixer().unwrap();
+        assert!(fixer.is_some());
+    }
+
+    #[test]
+    fn fixer_num_ctx_defaults_to_model_num_ctx_when_absent() {
+        let text = serde_json::json!({
+            "model": {"backend": "ollama", "num_ctx": 16384},
+            "fixer": {}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let f = cfg.fixer.as_ref().expect("fixer section should parse");
+        assert_eq!(f.num_ctx, None);
+        let model_cfg = f.model.as_ref().unwrap_or(&cfg.model);
+        let mut ollama_cfg = ollama_config(model_cfg);
+        if let Some(num_ctx) = f.num_ctx {
+            ollama_cfg.num_ctx = num_ctx;
+        }
+        assert_eq!(
+            ollama_cfg.num_ctx, 16384,
+            "absent fixer.num_ctx must fall back to the resolved model's own num_ctx"
+        );
+    }
+
+    #[test]
+    fn fixer_num_ctx_overrides_model_num_ctx_when_set() {
+        let text = serde_json::json!({
+            "model": {"backend": "ollama", "num_ctx": 16384},
+            "fixer": {"num_ctx": 65536}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let f = cfg.fixer.as_ref().expect("fixer section should parse");
+        let model_cfg = f.model.as_ref().unwrap_or(&cfg.model);
+        let mut ollama_cfg = ollama_config(model_cfg);
+        if let Some(num_ctx) = f.num_ctx {
+            ollama_cfg.num_ctx = num_ctx;
+        }
+        assert_eq!(ollama_cfg.num_ctx, 65536);
+        assert_ne!(ollama_cfg.num_ctx, cfg.model.num_ctx);
+    }
+
+    #[test]
+    fn fixer_with_non_ollama_backend_errors() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"model":{"backend":"mock"},"fixer":{"timeout_secs":30}}"#)
+                .unwrap();
+        let result = cfg.build_fixer();
+        let err = match result {
+            Ok(_) => panic!("expected an error for a non-ollama fixer backend"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("ollama"), "{err}");
+    }
+
+    #[test]
+    fn fixer_model_overrides_top_level_model() {
+        let text = serde_json::json!({
+            "model": {"backend": "mock"},
+            "fixer": {
+                "model": {"backend": "ollama", "model": "fixer-model"}
+            }
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let f = cfg.fixer.expect("fixer section should parse");
+        let model_cfg = f.model.expect("fixer.model should parse");
+        assert_eq!(model_cfg.model, "fixer-model");
+        assert_ne!(model_cfg.model, cfg.model.model);
+        // Top-level model backend is "mock", but fixer.model overrides with
+        // "ollama", so build_fixer should succeed.
+        let cfg2: Config = serde_json::from_str(&text).unwrap();
+        assert!(cfg2.build_fixer().unwrap().is_some());
     }
 
     #[test]

@@ -300,7 +300,8 @@ async fn review_approval_after_one_read_file_call_is_accepted() {
     assert_eq!(state.harness.tool_calls, 2);
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "green_step must be set after the passing test"
     );
 

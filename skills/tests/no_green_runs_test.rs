@@ -398,7 +398,8 @@ async fn substituted_test_passing_then_done_hands_off() {
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.harness.green_step,
-        Some(state.harness.step),
+        // one past: the `tests` record commits its own version after every `test` call
+        Some(state.harness.step - 1),
         "the substituted rerun must have passed and set green_step"
     );
     assert_eq!(

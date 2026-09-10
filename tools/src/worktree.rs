@@ -546,6 +546,201 @@ pub fn remove(candidate: Candidate) -> Result<(), WorktreeError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// `CandidateRunner`: the real (git-worktree) implementation of `statie_
+// core::CandidateRunner`, the trait `Session::execute_try_fixes` verifies
+// each `try_fixes` candidate through (`core/src/fixer.rs`'s doc explains
+// why the trait lives in `core` while this implementation lives here).
+// ---------------------------------------------------------------------
+
+use async_trait::async_trait;
+use statie_core::{
+    CandidateRunResult, CandidateRunner as CandidateRunnerTrait, RunnerCandidate, RunnerEdit,
+    RunnerError, RunnerSnapshot,
+};
+
+impl From<WorktreeError> for RunnerError {
+    fn from(e: WorktreeError) -> Self {
+        RunnerError::Backend(e.to_string())
+    }
+}
+
+impl From<RunResult> for CandidateRunResult {
+    fn from(r: RunResult) -> Self {
+        CandidateRunResult {
+            exit: r.exit,
+            stdout: r.stdout,
+            stderr: r.stderr,
+            timed_out: r.timed_out,
+        }
+    }
+}
+
+/// The real `try_fixes` verification primitive: `snapshot`/`candidate`/
+/// `run_in`/`diff`/`apply_to_sandbox`/`remove` above, wired to `statie_
+/// core::CandidateRunner` so `core::Session::execute_try_fixes` can drive
+/// them without depending on this crate.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WorktreeRunner;
+
+impl WorktreeRunner {
+    pub fn new() -> Self {
+        WorktreeRunner
+    }
+}
+
+/// Reads `<worktree>/<edit.path>`, requires `edit.old` to occur exactly
+/// once (matching `edit_file`'s own "must occur exactly once" contract),
+/// replaces it with `edit.new`, and writes the file. Rejects a `path` that
+/// escapes the worktree via a canonicalize-and-starts-with check, the same
+/// shape `SandboxRoot::join` uses (this runs against a plain worktree
+/// `Path`, not a `SandboxRoot`, since a candidate worktree lives outside
+/// any configured sandbox root).
+fn apply_edit_in_worktree(worktree: &Path, edit: &RunnerEdit) -> Result<(), RunnerError> {
+    let candidate_path = worktree.join(&edit.path);
+
+    // Reject an absolute path or a `..` component outright, before ever
+    // touching the filesystem.
+    if Path::new(&edit.path).is_absolute()
+        || Path::new(&edit.path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(RunnerError::InvalidPath(edit.path.clone()));
+    }
+
+    let canon_worktree = worktree
+        .canonicalize()
+        .map_err(|e| RunnerError::Backend(format!("failed to canonicalize worktree: {e}")))?;
+    let canon_target = candidate_path
+        .canonicalize()
+        .map_err(|e| RunnerError::InvalidPath(format!("{}: {e}", edit.path)))?;
+    if !canon_target.starts_with(&canon_worktree) {
+        return Err(RunnerError::InvalidPath(edit.path.clone()));
+    }
+
+    let contents = std::fs::read_to_string(&canon_target)
+        .map_err(|e| RunnerError::Backend(format!("failed to read {}: {e}", edit.path)))?;
+
+    let occurrences = contents.matches(edit.old.as_str()).count();
+    if occurrences == 0 {
+        return Err(RunnerError::AnchorNotFound);
+    }
+    if occurrences > 1 {
+        return Err(RunnerError::AnchorAmbiguous(occurrences));
+    }
+
+    let updated = contents.replacen(&edit.old, &edit.new, 1);
+    std::fs::write(&canon_target, updated)
+        .map_err(|e| RunnerError::Backend(format!("failed to write {}: {e}", edit.path)))?;
+    Ok(())
+}
+
+#[async_trait]
+impl CandidateRunnerTrait for WorktreeRunner {
+    async fn snapshot(&self, root: &Path) -> Result<Box<dyn RunnerSnapshot>, RunnerError> {
+        let root = root.to_path_buf();
+        let snap = tokio::task::spawn_blocking(move || snapshot(&root))
+            .await
+            .map_err(|e| RunnerError::Backend(format!("snapshot task panicked: {e}")))??;
+        Ok(Box::new(snap))
+    }
+
+    async fn candidate(
+        &self,
+        snap: &dyn RunnerSnapshot,
+        edit: &RunnerEdit,
+    ) -> Result<Box<dyn RunnerCandidate>, RunnerError> {
+        let snap = snap
+            .as_any()
+            .downcast_ref::<Snapshot>()
+            .ok_or_else(|| RunnerError::Backend("snapshot from a different runner".to_string()))?
+            .clone();
+        let edit = edit.clone();
+
+        let cand = tokio::task::spawn_blocking(move || {
+            candidate(&snap, |worktree| {
+                apply_edit_in_worktree(worktree, &edit).map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .map_err(|e| RunnerError::Backend(format!("candidate task panicked: {e}")))?;
+
+        match cand {
+            Ok(c) => Ok(Box::new(c)),
+            Err(WorktreeError::Edit(msg)) => {
+                // `apply_edit_in_worktree` stringifies its own `RunnerError`
+                // via `Display` (`e.to_string()` above, required by
+                // `candidate<F>`'s `Result<(), String>` edit closure) --
+                // recover the specific variant from that text so a caller
+                // still sees `AnchorNotFound`/`AnchorAmbiguous`/
+                // `InvalidPath` rather than a generic `Backend` string.
+                if msg == RunnerError::AnchorNotFound.to_string() {
+                    Err(RunnerError::AnchorNotFound)
+                } else if let Some(rest) = msg.strip_prefix("anchor is ambiguous (") {
+                    let n: usize = rest.trim_end_matches(" matches)").parse().unwrap_or(0);
+                    Err(RunnerError::AnchorAmbiguous(n))
+                } else if msg.starts_with("invalid path: ") {
+                    Err(RunnerError::InvalidPath(msg))
+                } else {
+                    Err(RunnerError::Backend(msg))
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn run(
+        &self,
+        cand: &dyn RunnerCandidate,
+        cmd: &str,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<CandidateRunResult, RunnerError> {
+        let cand = cand
+            .as_any()
+            .downcast_ref::<Candidate>()
+            .ok_or_else(|| RunnerError::Backend("candidate from a different runner".to_string()))?;
+        let result = run_in(cand, cmd, timeout, max_output_bytes).await?;
+        Ok(result.into())
+    }
+
+    async fn diff(&self, cand: &dyn RunnerCandidate) -> Result<String, RunnerError> {
+        let cand = cand
+            .as_any()
+            .downcast_ref::<Candidate>()
+            .ok_or_else(|| RunnerError::Backend("candidate from a different runner".to_string()))?
+            .clone();
+        let out = tokio::task::spawn_blocking(move || diff(&cand))
+            .await
+            .map_err(|e| RunnerError::Backend(format!("diff task panicked: {e}")))??;
+        Ok(out)
+    }
+
+    async fn apply_to_sandbox(&self, cand: &dyn RunnerCandidate) -> Result<(), RunnerError> {
+        let cand = cand
+            .as_any()
+            .downcast_ref::<Candidate>()
+            .ok_or_else(|| RunnerError::Backend("candidate from a different runner".to_string()))?
+            .clone();
+        tokio::task::spawn_blocking(move || apply_to_sandbox(&cand))
+            .await
+            .map_err(|e| RunnerError::Backend(format!("apply task panicked: {e}")))??;
+        Ok(())
+    }
+
+    async fn remove(&self, cand: Box<dyn RunnerCandidate>) -> Result<(), RunnerError> {
+        let boxed: Box<dyn std::any::Any> = cand;
+        let cand = boxed
+            .downcast::<Candidate>()
+            .map_err(|_| RunnerError::Backend("candidate from a different runner".to_string()))?;
+        tokio::task::spawn_blocking(move || remove(*cand))
+            .await
+            .map_err(|e| RunnerError::Backend(format!("remove task panicked: {e}")))??;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -482,6 +482,9 @@ fn harness_view_marks_filtered_pass() {
         edits_since_test: 0,
         last_think_step: None,
         repeated_failure_step: None,
+        try_fixes_available: false,
+        last_try_fixes_step: None,
+        consecutive_non_question_asks: 0,
     };
 
     let view = HarnessView::new(&state);

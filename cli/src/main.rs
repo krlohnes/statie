@@ -10,6 +10,7 @@ mod toy;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use statie_augment::{RepoBm25, RepoBm25Options, SessionLogBm25};
@@ -494,6 +495,7 @@ async fn run_coding(
     let tokenizer = Box::new(TiktokenTokenizer);
     let maintainer = cfg.build_maintainer()?;
     let thinker = cfg.build_thinker()?;
+    let fixer = cfg.build_fixer()?;
 
     let session_config = SessionConfig {
         budgets: cfg.effective_budgets(),
@@ -526,6 +528,18 @@ async fn run_coding(
     }
     if let Some(t) = thinker {
         session = session.with_thinker(t);
+    }
+    if let Some(f) = fixer {
+        // `build_fixer` only returns `Some` when `cfg.fixer` itself is
+        // `Some` (see that function's doc), so this always has a real `k`.
+        let k = cfg.fixer.as_ref().map(|f| f.k).unwrap_or(3);
+        session = session
+            .with_fixer(f, k)
+            .with_candidate_runner(Arc::new(statie_tools::WorktreeRunner::new()))
+            .with_try_fixes_limits(
+                Duration::from_secs(cfg.tools.shell_timeout_secs),
+                cfg.tools.max_output_bytes,
+            );
     }
     session = session.with_working_set(cfg.working_set.into());
     session = session.with_guards(cfg.guards);

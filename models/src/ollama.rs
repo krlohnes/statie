@@ -200,6 +200,8 @@ impl OllamaModel {
     /// `options` for this call only (e.g. `num_predict`, to cap one chunk of
     /// a chunked reasoning pass -- see `ModelThinker`). `num_ctx` stays
     /// pinned to `cfg.num_ctx` regardless of what `extra_options` contains.
+    /// Never sends a `format` key; for a JSON-constrained free-text call
+    /// (e.g. `ModelFixer`), use `chat_json_with`.
     pub async fn chat_free_with(
         &self,
         system: &str,
@@ -209,7 +211,33 @@ impl OllamaModel {
         cancel: CancellationToken,
     ) -> Result<FreeReply, ModelError> {
         let body = self.base_body(system, user, think, &extra_options);
+        self.run_free_body(body, cancel).await
+    }
 
+    /// Like `chat_free_with`, but sends `"format": "json"` (Ollama's plain
+    /// JSON mode, not the full tool/output schema `step` uses) so the
+    /// server constrains the reply to valid JSON. Used by `ModelFixer`
+    /// (`statie-models::fixer`) to ask for a JSON array of candidate fixes
+    /// without imposing the harness's own step schema on a free-text
+    /// prompt.
+    pub async fn chat_json_with(
+        &self,
+        system: &str,
+        user: &str,
+        think: bool,
+        extra_options: Value,
+        cancel: CancellationToken,
+    ) -> Result<FreeReply, ModelError> {
+        let mut body = self.base_body(system, user, think, &extra_options);
+        body["format"] = json!("json");
+        self.run_free_body(body, cancel).await
+    }
+
+    async fn run_free_body(
+        &self,
+        body: Value,
+        cancel: CancellationToken,
+    ) -> Result<FreeReply, ModelError> {
         let request_text =
             serde_json::to_string(&body).map_err(|e| ModelError::Io(e.to_string()))?;
         tracing::debug!(

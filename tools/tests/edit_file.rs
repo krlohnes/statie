@@ -1210,7 +1210,9 @@ async fn edit_leaving_extra_closing_brace_notes_imbalance() {
 
     let text = out.to_string();
     assert!(
-        text.contains("note: braces are unbalanced after this edit (1 more `}` than `{`)"),
+        text.contains(
+            "note: this edit changed the file's brace balance (-1 `}`); check the edited region before running tests."
+        ),
         "output was:\n{text}"
     );
 }
@@ -1235,10 +1237,7 @@ async fn balanced_edit_has_no_brace_note() {
         .unwrap();
 
     let text = out.to_string();
-    assert!(
-        !text.contains("braces are unbalanced"),
-        "output was:\n{text}"
-    );
+    assert!(!text.contains("brace balance"), "output was:\n{text}");
 }
 
 #[tokio::test]
@@ -1261,10 +1260,7 @@ async fn unbalanced_edit_on_non_code_extension_has_no_brace_note() {
         .unwrap();
 
     let text = out.to_string();
-    assert!(
-        !text.contains("braces are unbalanced"),
-        "output was:\n{text}"
-    );
+    assert!(!text.contains("brace balance"), "output was:\n{text}");
 }
 
 #[tokio::test]
@@ -1710,4 +1706,249 @@ async fn exact_anchor_match_takes_precedence_over_collapsed_whitespace_tier_no_n
 
     let on_disk = std::fs::read_to_string(&file).unwrap();
     assert_eq!(on_disk, "one\ntwo\ninserted\nthree\n");
+}
+
+#[tokio::test]
+async fn after_insert_duplicating_python_constant_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("pricing.py");
+    let content = "from formatter import format_amount\n\nTAX_RATE = 0.08\n\n\ndef total(amount):\n    return amount * (1 + TAX_RATE)\n";
+    std::fs::write(&file, content).unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({
+                "path": "pricing.py",
+                "after": "from formatter import format_amount",
+                "new": "TAX_RATE = 0.08"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => {
+            assert_eq!(
+                msg,
+                "line 3 of pricing.py already has `TAX_RATE = 0.08`; your insert would duplicate it. Use old/new to replace the existing code instead."
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content, "file must be byte-identical on refusal");
+}
+
+#[tokio::test]
+async fn after_insert_duplicating_rust_use_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("lib_dup_use.rs");
+    let content = "use std::fmt;\nuse std::collections::HashMap;\n\nfn f() {}\n";
+    std::fs::write(&file, content).unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({
+                "path": "lib_dup_use.rs",
+                "after": "use std::fmt;",
+                "new": "use std::collections::HashMap;"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => {
+            assert_eq!(
+                msg,
+                "line 2 of lib_dup_use.rs already has `use std::collections::HashMap;`; your insert would duplicate it. Use old/new to replace the existing code instead."
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content, "file must be byte-identical on refusal");
+}
+
+#[tokio::test]
+async fn after_insert_sharing_only_a_non_definition_line_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("pricing_control.py");
+    // Control: the inserted block shares a non-definition line
+    // ("    return total") with an existing function elsewhere in the
+    // file, but is otherwise new code. This must apply normally rather
+    // than being refused, since a bare `return` line legitimately recurs
+    // and is not "looks like a definition".
+    let content =
+        "def existing(amount):\n    total = amount\n    return total\n\n\ndef other():\n    pass\n";
+    std::fs::write(&file, content).unwrap();
+
+    let out = edit_tool()
+        .call(
+            json!({
+                "path": "pricing_control.py",
+                "after": "def other():",
+                "new": "    total = 0\n    return total"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    assert!(
+        text.contains("inserted 2 line(s) after line 6"),
+        "output was:\n{text}"
+    );
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        on_disk,
+        "def existing(amount):\n    total = amount\n    return total\n\n\ndef other():\n    total = 0\n    return total\n    pass\n"
+    );
+}
+
+#[tokio::test]
+async fn before_insert_duplicating_definition_is_also_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("before_dup.rs");
+    let content = "const LIMIT: u32 = 10;\nfn f() {}\n";
+    std::fs::write(&file, content).unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({
+                "path": "before_dup.rs",
+                "before": "fn f() {}",
+                "new": "const LIMIT: u32 = 10;"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => {
+            assert_eq!(
+                msg,
+                "line 1 of before_dup.rs already has `const LIMIT: u32 = 10;`; your insert would duplicate it. Use old/new to replace the existing code instead."
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content, "file must be byte-identical on refusal");
+}
+
+#[tokio::test]
+async fn old_new_edit_that_unbalances_braces_reports_delta_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("brace_note.rs");
+    std::fs::write(&file, "fn a() {\n}\n").unwrap();
+
+    let out = edit_tool()
+        .call(
+            json!({
+                "path": "brace_note.rs",
+                "old": "fn a() {\n}",
+                "new": "fn a() {\n"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    assert!(
+        text.contains(
+            "note: this edit changed the file's brace balance (+1 `{`); check the edited region before running tests."
+        ),
+        "output was:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn balance_preserving_edit_has_no_note_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("brace_balanced2.rs");
+    std::fs::write(&file, "fn a() {\n    1\n}\n").unwrap();
+
+    let out = edit_tool()
+        .call(
+            json!({
+                "path": "brace_balanced2.rs",
+                "old": "1",
+                "new": "2"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    assert!(!text.contains("note:"), "output was:\n{text}");
+}
+
+#[tokio::test]
+async fn edit_inside_string_literal_with_lone_brace_has_no_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("brace_in_string.rs");
+    std::fs::write(&file, "fn a() {\n    let s = \"x\";\n}\n").unwrap();
+
+    // Replace the string contents with one containing a lone `}` — since
+    // it's inside a string literal, the bracket scanner must not count it,
+    // so no note should appear.
+    let out = edit_tool()
+        .call(
+            json!({
+                "path": "brace_in_string.rs",
+                "old": "\"x\"",
+                "new": "\"}\""
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    assert!(!text.contains("brace balance"), "output was:\n{text}");
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, "fn a() {\n    let s = \"}\";\n}\n");
+}
+
+#[tokio::test]
+async fn edit_on_already_unbalanced_file_not_touching_braces_has_no_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("already_unbalanced.rs");
+    // Already missing a closing brace before the edit.
+    std::fs::write(&file, "fn a() {\n    let x = 1;\n").unwrap();
+
+    let out = edit_tool()
+        .call(
+            json!({
+                "path": "already_unbalanced.rs",
+                "old": "let x = 1;",
+                "new": "let x = 2;"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    assert!(!text.contains("brace balance"), "output was:\n{text}");
 }

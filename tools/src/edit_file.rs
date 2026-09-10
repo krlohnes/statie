@@ -312,6 +312,7 @@ impl Tool for EditFile {
                 strip_repeated_anchor(anchor, &args.new, insert_after)?;
 
             check_not_already_present(&content, stripped_new, &args.path)?;
+            check_no_duplicate_definition(&content, stripped_new, &args.path)?;
 
             let (new_content, start_line, end_line, header) =
                 insert_by_anchor(&content, anchor, stripped_new, insert_after, &args.path)?;
@@ -1081,33 +1082,270 @@ fn lcs_length(a: &[char], b: &[char]) -> usize {
     prev[b.len()]
 }
 
-/// File extensions (without the leading dot) for which a brace-balance
+/// File extensions (without the leading dot) for which a bracket-balance
 /// check is performed after a successful edit.
 const BRACE_CHECKED_EXTENSIONS: &[&str] = &[
     "rs", "c", "h", "cpp", "hpp", "java", "js", "ts", "tsx", "jsx", "go", "swift", "kt", "cs",
     "scala",
 ];
 
-/// Count of `{` minus count of `}` (raw character counts; strings/comments
-/// are not excluded).
-fn brace_balance(content: &str) -> i64 {
-    let mut balance: i64 = 0;
-    for c in content.chars() {
-        match c {
-            '{' => balance += 1,
-            '}' => balance -= 1,
-            _ => {}
+/// Prefixes (after trimming leading whitespace) that mark a trimmed line as
+/// "looks like a definition" for [`looks_like_definition`]. Checked in
+/// order; the first match wins. `let ` is handled separately since it only
+/// counts with no leading indentation.
+const DEFINITION_PREFIXES: &[&str] = &[
+    "use ",
+    "import ",
+    "from ",
+    "pub(crate) fn ",
+    "pub async fn ",
+    "async fn ",
+    "pub fn ",
+    "fn ",
+    "async def ",
+    "def ",
+    "class ",
+    "pub struct ",
+    "struct ",
+    "pub enum ",
+    "enum ",
+    "impl ",
+    "pub trait ",
+    "trait ",
+    "pub const ",
+    "const ",
+    "pub static ",
+    "static ",
+    "pub type ",
+    "type ",
+    "pub mod ",
+    "mod ",
+];
+
+/// Whether `line` (as it appears in a file, i.e. with its original leading
+/// indentation and any trailing whitespace) "looks like a definition": an
+/// import, a function/struct/enum/trait/impl/const/static/type/mod
+/// declaration, a top-level `let`, a Rust struct field at 4-space
+/// indentation, or an all-caps assignment at column 0. Used to decide
+/// whether inserting a duplicate of this line is likely to create a real
+/// duplicate definition (as opposed to duplicating an incidental line like
+/// `}` or `return x;` that legitimately recurs).
+fn looks_like_definition(line: &str) -> bool {
+    let trimmed_end = line.trim_end();
+    if trimmed_end.trim().is_empty() {
+        return false;
+    }
+    let trimmed = trimmed_end.trim_start();
+    let indent_len = trimmed_end.len() - trimmed.len();
+
+    for prefix in DEFINITION_PREFIXES {
+        if trimmed.starts_with(prefix) {
+            return true;
         }
     }
-    balance
+
+    // `let ` only counts at column 0 (no leading indentation).
+    if indent_len == 0 && trimmed.starts_with("let ") {
+        return true;
+    }
+
+    // Rust struct field pattern: `<ident>: <type>,` at exactly 4-space
+    // indentation.
+    if indent_len == 4 && is_struct_field_line(trimmed) {
+        return true;
+    }
+
+    // Python/JS assignment at column 0: `<IDENT> = ...` where IDENT is all
+    // caps (allowing digits and underscores, e.g. `TAX_RATE`).
+    if indent_len == 0 && is_all_caps_assignment(trimmed) {
+        return true;
+    }
+
+    false
+}
+
+/// Whether `trimmed` (already leading/trailing-whitespace-trimmed) matches
+/// the shape `<ident>: <type>,` — a Rust struct field.
+fn is_struct_field_line(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_suffix(',') else {
+        return false;
+    };
+    let Some((name, ty)) = rest.split_once(':') else {
+        return false;
+    };
+    let name = name.trim();
+    let ty = ty.trim();
+    if name.is_empty() || ty.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    first_ok && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `trimmed` (already trimmed) matches `<IDENT> = ...` where IDENT
+/// is all-caps (letters, digits, underscores; at least one letter).
+fn is_all_caps_assignment(trimmed: &str) -> bool {
+    let Some(eq_idx) = trimmed.find('=') else {
+        return false;
+    };
+    // Reject `==`, `!=`, `<=`, `>=` masquerading as assignment, and augmented
+    // assignment operators like `+=` are still fine (name part excludes the
+    // operator character).
+    if trimmed[eq_idx + 1..].starts_with('=') {
+        return false;
+    }
+    let name_part = trimmed[..eq_idx].trim_end();
+    let name = name_part
+        .strip_suffix(['+', '-', '*', '/'])
+        .unwrap_or(name_part);
+    if name.is_empty() {
+        return false;
+    }
+    let has_letter = name.chars().any(|c| c.is_ascii_alphabetic());
+    let all_valid = name
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    has_letter && all_valid
+}
+
+/// Refuses an `after`/`before` insertion where a non-blank line of the text
+/// to insert already exists in the file (exact match after `trim_end`,
+/// leading indentation included) and looks like a definition. A small model
+/// that means "replace" but sends an insert leaves the old definition in
+/// place: a duplicate import, a duplicate constant, two overlapping copies
+/// of a function. Unlike [`check_not_already_present`] (which requires a
+/// multi-line block match), this fires on a single matching definition
+/// line, since a single duplicated `use` or `const` is exactly the failure
+/// mode this exists to catch.
+fn check_no_duplicate_definition(content: &str, new: &str, path: &str) -> Result<(), ToolError> {
+    let file_lines: Vec<&str> = content.lines().collect();
+
+    for new_line in new.lines() {
+        let new_trimmed = new_line.trim_end();
+        if new_trimmed.trim().is_empty() {
+            continue;
+        }
+        if !looks_like_definition(new_line) {
+            continue;
+        }
+        for (i, file_line) in file_lines.iter().enumerate() {
+            if file_line.trim_end() == new_trimmed {
+                let line_no = i + 1;
+                return Err(ToolError::ExecutionFailed(format!(
+                    "line {line_no} of {path} already has `{}`; your insert would duplicate it. Use old/new to replace the existing code instead.",
+                    new_trimmed.trim()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Bracket kinds tracked by [`bracket_balance`], in the order their deltas
+/// are reported: braces, brackets, then parens.
+const BRACKET_PAIRS: [(char, char); 3] = [('{', '}'), ('[', ']'), ('(', ')')];
+
+/// Counts of (`{` minus `}`, `[` minus `]`, `(` minus `)`) in `text`,
+/// ignoring characters inside string literals and comments as far as a
+/// simple single-pass scanner can tell: double-quoted strings with
+/// backslash escapes, single-quoted char literals (1-2 chars, e.g. `'a'` or
+/// `'\n'`), `//` and `#` line comments, and `/* */` block comments. This is
+/// not a real tokenizer (it doesn't know about raw strings, nested block
+/// comments, etc.) but is good enough to avoid false positives from braces
+/// that appear inside a string or comment.
+fn bracket_balance(text: &str) -> (i64, i64, i64) {
+    let mut braces: i64 = 0;
+    let mut brackets: i64 = 0;
+    let mut parens: i64 = 0;
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' => {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if chars[i] == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            '\'' => {
+                // Char literal: '<char>' or '\<escape>' — at most a couple
+                // chars before the closing quote. If no closing quote is
+                // found within a few characters, treat the `'` as a stray
+                // character (e.g. a lifetime or apostrophe) and move on.
+                let start = i;
+                let mut j = i + 1;
+                if j < chars.len() && chars[j] == '\\' {
+                    j += 1;
+                }
+                if j < chars.len() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == '\'' {
+                    i = j + 1;
+                    continue;
+                }
+                i = start + 1;
+                continue;
+            }
+            '/' if i + 1 < chars.len() && chars[i + 1] == '/' => {
+                i += 2;
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '#' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(chars.len());
+                continue;
+            }
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    (braces, brackets, parens)
 }
 
 /// After a successful edit to a file whose extension is one of
-/// `BRACE_CHECKED_EXTENSIONS`, compares the `{`/`}` balance before and after
-/// the edit. Returns a note line when the file became unbalanced (starting
-/// from balanced) or when an existing imbalance grew; returns `None`
-/// otherwise (including when the edit fixed or held steady an existing
-/// imbalance). Never blocks the edit — this is purely informational.
+/// `BRACE_CHECKED_EXTENSIONS`, compares the `{}`/`[]`/`()` balance before
+/// and after the edit (via [`bracket_balance`]). Returns a note line
+/// listing every bracket kind whose balance *changed* (regardless of
+/// whether the file was already unbalanced before the edit); returns `None`
+/// when no kind's balance changed, including when the file was already
+/// unbalanced and the edit didn't touch that imbalance. Never blocks the
+/// edit — this is purely informational.
 fn brace_balance_note(path: &str, before: &str, after: &str) -> Option<String> {
     let ext = std::path::Path::new(path)
         .extension()
@@ -1116,32 +1354,146 @@ fn brace_balance_note(path: &str, before: &str, after: &str) -> Option<String> {
         return None;
     }
 
-    let before_balance = brace_balance(before);
-    let after_balance = brace_balance(after);
+    let before_balance = bracket_balance(before);
+    let after_balance = bracket_balance(after);
 
-    let was_balanced = before_balance == 0;
-    let is_unbalanced = after_balance != 0;
+    let before_arr = [before_balance.0, before_balance.1, before_balance.2];
+    let after_arr = [after_balance.0, after_balance.1, after_balance.2];
 
-    let should_note = if was_balanced {
-        is_unbalanced
-    } else {
-        // Already unbalanced before; note only if the imbalance grew (in
-        // magnitude).
-        after_balance.abs() > before_balance.abs()
-    };
+    let mut deltas: Vec<String> = Vec::new();
+    for (idx, (open, close)) in BRACKET_PAIRS.iter().enumerate() {
+        let delta = after_arr[idx] - before_arr[idx];
+        if delta == 0 {
+            continue;
+        }
+        let ch = if delta > 0 { open } else { close };
+        deltas.push(format!("{delta:+} `{ch}`"));
+    }
 
-    if !should_note {
+    if deltas.is_empty() {
         return None;
     }
 
-    let n = after_balance.abs();
-    if after_balance > 0 {
-        Some(format!(
-            "note: braces are unbalanced after this edit ({n} more `{{` than `}}`)"
-        ))
-    } else {
-        Some(format!(
-            "note: braces are unbalanced after this edit ({n} more `}}` than `{{`)"
-        ))
+    Some(format!(
+        "note: this edit changed the file's brace balance ({}); check the edited region before running tests.",
+        deltas.join(", ")
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_definition_positives() {
+        assert!(looks_like_definition("use foo::Bar;"));
+        assert!(looks_like_definition("fn x() {"));
+        assert!(looks_like_definition("pub struct S {"));
+        assert!(looks_like_definition("const A: u32 = 1;"));
+        assert!(looks_like_definition("def f(x):"));
+        assert!(looks_like_definition("TAX_RATE = 0.08"));
+        assert!(looks_like_definition("    name: String,"));
+    }
+
+    #[test]
+    fn looks_like_definition_negatives() {
+        assert!(!looks_like_definition("    return x"));
+        assert!(!looks_like_definition("    let y = 2;"));
+        assert!(!looks_like_definition("}"));
+        assert!(!looks_like_definition(""));
+        assert!(!looks_like_definition("// comment"));
+        assert!(!looks_like_definition("x = 1"));
+    }
+
+    #[test]
+    fn looks_like_definition_more_prefixes() {
+        assert!(looks_like_definition("import os"));
+        assert!(looks_like_definition("from foo import bar"));
+        assert!(looks_like_definition("pub fn f() {"));
+        assert!(looks_like_definition("pub(crate) fn f() {"));
+        assert!(looks_like_definition("async fn f() {"));
+        assert!(looks_like_definition("pub async fn f() {"));
+        assert!(looks_like_definition("async def f():"));
+        assert!(looks_like_definition("class Foo:"));
+        assert!(looks_like_definition("pub enum E {"));
+        assert!(looks_like_definition("enum E {"));
+        assert!(looks_like_definition("impl Foo {"));
+        assert!(looks_like_definition("trait Bar {"));
+        assert!(looks_like_definition("pub trait Bar {"));
+        assert!(looks_like_definition("pub const A: u32 = 1;"));
+        assert!(looks_like_definition("static A: u32 = 1;"));
+        assert!(looks_like_definition("pub static A: u32 = 1;"));
+        assert!(looks_like_definition("type Foo = Bar;"));
+        assert!(looks_like_definition("pub type Foo = Bar;"));
+        assert!(looks_like_definition("mod foo;"));
+        assert!(looks_like_definition("pub mod foo;"));
+        assert!(looks_like_definition("let y = 2;")); // column 0
+    }
+
+    #[test]
+    fn looks_like_definition_indented_let_is_not_a_definition() {
+        // `let` only counts with no leading indentation.
+        assert!(!looks_like_definition("    let y = 2;"));
+        assert!(!looks_like_definition("\tlet y = 2;"));
+    }
+
+    #[test]
+    fn looks_like_definition_lowercase_assignment_is_not_a_definition() {
+        assert!(!looks_like_definition("tax_rate = 0.08"));
+        assert!(!looks_like_definition("Tax_Rate = 0.08"));
+    }
+
+    #[test]
+    fn looks_like_definition_struct_field_requires_four_space_indent() {
+        assert!(looks_like_definition("    name: String,"));
+        assert!(!looks_like_definition("  name: String,"));
+        assert!(!looks_like_definition("        name: String,"));
+        // No trailing comma: not a field.
+        assert!(!looks_like_definition("    name: String"));
+    }
+
+    #[test]
+    fn bracket_balance_counts_all_three_kinds() {
+        assert_eq!(bracket_balance("{[()]}"), (0, 0, 0));
+        assert_eq!(bracket_balance("{{{"), (3, 0, 0));
+        assert_eq!(bracket_balance("]]"), (0, -2, 0));
+        assert_eq!(bracket_balance("((("), (0, 0, 3));
+    }
+
+    #[test]
+    fn bracket_balance_ignores_string_literal_contents() {
+        // A lone `}` inside a string literal must not count.
+        assert_eq!(bracket_balance(r#"let s = "}";"#), (0, 0, 0));
+        assert_eq!(bracket_balance(r#"let s = "{ [ (";"#), (0, 0, 0));
+    }
+
+    #[test]
+    fn bracket_balance_handles_escaped_quotes_in_strings() {
+        // The escaped quote must not end the string early, so the `}` right
+        // after it is still inside the string and ignored.
+        assert_eq!(bracket_balance(r#"let s = "\"}"; "#), (0, 0, 0));
+    }
+
+    #[test]
+    fn bracket_balance_ignores_char_literals() {
+        assert_eq!(bracket_balance("let c = '}';"), (0, 0, 0));
+        assert_eq!(bracket_balance("let c = '\\n';"), (0, 0, 0));
+    }
+
+    #[test]
+    fn bracket_balance_ignores_line_comments() {
+        assert_eq!(bracket_balance("let x = 1; // }"), (0, 0, 0));
+        assert_eq!(bracket_balance("x = 1  # }"), (0, 0, 0));
+    }
+
+    #[test]
+    fn bracket_balance_ignores_block_comments() {
+        assert_eq!(bracket_balance("/* { [ ( */ let x = 1;"), (0, 0, 0));
+    }
+
+    #[test]
+    fn bracket_balance_counts_real_code_outside_comments_and_strings() {
+        let text = "fn f() {\n    let s = \"}\"; // }\n}\n";
+        assert_eq!(bracket_balance(text), (0, 0, 0));
     }
 }

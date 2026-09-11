@@ -60,6 +60,7 @@ fn build_prompt(version: Version) -> BoundedPrompt {
         last_try_fixes_step: None,
         consecutive_non_question_asks: 0,
         last_failure_summary: None,
+        last_skip: None,
     };
     let harness_view = HarnessView::new(&harness);
 

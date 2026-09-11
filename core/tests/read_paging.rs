@@ -681,3 +681,85 @@ async fn redundant_reads_off_disables_paging_too() {
         "the repeat must actually reach the tool"
     );
 }
+
+/// Unit 21: `HarnessState::last_skip` (`core/src/version.rs`) is the
+/// harness-owned mirror of `Session::last_skip_key`/`skip_repeat_count`,
+/// committed via `set_harness` so a skill's `validate` (which only ever sees
+/// committed state) can read it. This is the core-level proof that it is
+/// set on a `skipped_redundant` step and cleared on the next step that is
+/// NOT itself a skip -- `skills/tests/skip_think.rs` covers the
+/// `implement_repeated_skip_thinks` substitution this field feeds.
+#[tokio::test]
+async fn last_skip_is_set_on_a_skip_and_cleared_on_the_next_executed_call() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let read_calls = Arc::new(AtomicU64::new(0));
+
+    // Step 1: search "foo" (fresh). Step 2: identical repeat -> skipped,
+    // `last_skip` must be set. Step 3: a DIFFERENT search -> not a skip,
+    // `last_skip` must clear.
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), search_action("foo")),
+        step_output(serde_json::json!({}), search_action("foo")),
+        step_output(serde_json::json!({}), search_action("bar")),
+    ]);
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        tool_set(Arc::clone(&read_calls), 250),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+
+    let skill = Arc::new(GuardSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    // Step 1: ordinary first search -- no skip yet, `last_skip` stays None.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(!has_event(&rec1, "skipped_redundant"));
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+    let (state1, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state1.harness.last_skip, None,
+        "the first call must not set last_skip"
+    );
+
+    // Step 2: identical repeat -> skipped. `last_skip` must be
+    // `Some(SkippedRead { tool: "search", count: 1, .. })`.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(
+        has_event(&rec2, "skipped_redundant"),
+        "the identical repeat must be skipped: {:?}",
+        rec2.entries()
+    );
+    SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+    let (state2, _v) = active.session().state().await.unwrap();
+    let skip = state2
+        .harness
+        .last_skip
+        .clone()
+        .expect("a skipped_redundant step must set last_skip");
+    assert_eq!(skip.tool, "search");
+    assert_eq!(skip.count, 1);
+    assert_eq!(
+        skip.key,
+        statie_core::read_call_key("search", &serde_json::json!({"pattern": "foo"}))
+    );
+
+    // Step 3: a DIFFERENT search -- not a skip, must clear last_skip back to
+    // None.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(
+        !has_event(&rec3, "skipped_redundant"),
+        "a different call must not be skipped: {:?}",
+        rec3.entries()
+    );
+    SessionLogExt::append_record(log.as_ref(), rec3).unwrap();
+    let (state3, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state3.harness.last_skip, None,
+        "a non-skip step must clear last_skip"
+    );
+}

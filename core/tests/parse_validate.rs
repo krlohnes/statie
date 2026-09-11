@@ -105,6 +105,7 @@ fn committed(value: i64, inbox: Vec<InboxItem>) -> CommittedState<Workspace> {
             last_try_fixes_step: None,
             consecutive_non_question_asks: 0,
             last_failure_summary: None,
+            last_skip: None,
         },
         agent: Workspace {
             value,

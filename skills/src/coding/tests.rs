@@ -38,6 +38,7 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             last_try_fixes_step: None,
             consecutive_non_question_asks: 0,
             last_failure_summary: None,
+            last_skip: None,
         },
         agent,
     }
@@ -745,6 +746,128 @@ fn implement_bare_done_with_maintainer_next_and_all_steps_marked_done_hands_off_
         patch.next().next_skill.as_deref(),
         Some("review"),
         "implement_bare_done must inject next_skill: review"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unit 20: `implement_try_fixes_needs_failing_test`
+// (`ImplementSkill::validate`'s `validate`-level gate for `try_fixes`) --
+// see `skills/tests/try_fixes_gate.rs` for the end-to-end proof that this
+// keeps the call from ever reaching `core/src/session.rs`'s
+// `execute_try_fixes` (which would otherwise log a `tool_error`).
+// ---------------------------------------------------------------------
+
+fn try_fixes_action() -> serde_json::Value {
+    json!({
+        "patch": {},
+        "action": {"type": "tool", "name": "try_fixes", "args": {}},
+        "ack_inbox": []
+    })
+}
+
+/// (a) No `tests` record at all: `try_fixes` becomes `test` at the same
+/// step, with the exact note text, and the patch is otherwise untouched.
+#[test]
+fn implement_try_fixes_with_no_tests_record_is_substituted_for_test() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace {
+        tests: None,
+        ..Default::default()
+    });
+    let step = parse_and_validate(&skill, &cur, try_fixes_action())
+        .expect("the substituted test call should not be rejected");
+    let notes = step.notes().to_vec();
+    let (_patch, action, _acks) = step.into_parts();
+    match action {
+        Action::Tool { name, args } => {
+            assert_eq!(
+                name, "test",
+                "try_fixes with no tests record must be substituted for test"
+            );
+            assert_eq!(args, json!({}));
+        }
+        other => panic!("expected Action::Tool {{ name: \"test\", .. }}, got {other:?}"),
+    }
+    assert_eq!(
+        notes,
+        vec![
+            "`try_fixes` needs a failing test to work from, so the harness ran `test` instead."
+                .to_string()
+        ]
+    );
+}
+
+/// (b) A failing `tests` record (`pass: false`): `try_fixes` passes
+/// through unchanged.
+#[test]
+fn implement_try_fixes_with_a_failing_tests_record_passes_through_unchanged() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace {
+        tests: Some(TestRecord {
+            cmd: "cargo test".to_string(),
+            pass: false,
+            failing: vec!["a_test".to_string()],
+            first_error: None,
+            step: 3,
+        }),
+        ..Default::default()
+    });
+    let step = parse_and_validate(&skill, &cur, try_fixes_action())
+        .expect("try_fixes with a failing tests record must not be rejected");
+    let notes = step.notes().to_vec();
+    let (_patch, action, _acks) = step.into_parts();
+    match action {
+        Action::Tool { name, args } => {
+            assert_eq!(
+                name, "try_fixes",
+                "try_fixes must pass through unchanged when a failing tests record exists"
+            );
+            assert_eq!(args, json!({}));
+        }
+        other => panic!("expected Action::Tool {{ name: \"try_fixes\", .. }}, got {other:?}"),
+    }
+    assert!(
+        notes.is_empty(),
+        "no gate note should be attached when try_fixes passes through, got {notes:?}"
+    );
+}
+
+/// (c) A passing `tests` record (`pass: true`, nothing to fix): `try_fixes`
+/// is substituted for `test`, exactly like (a).
+#[test]
+fn implement_try_fixes_with_a_passing_tests_record_is_substituted_for_test() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace {
+        tests: Some(TestRecord {
+            cmd: "cargo test".to_string(),
+            pass: true,
+            failing: vec![],
+            first_error: None,
+            step: 3,
+        }),
+        ..Default::default()
+    });
+    let step = parse_and_validate(&skill, &cur, try_fixes_action())
+        .expect("the substituted test call should not be rejected");
+    let notes = step.notes().to_vec();
+    let (_patch, action, _acks) = step.into_parts();
+    match action {
+        Action::Tool { name, args } => {
+            assert_eq!(
+                name, "test",
+                "try_fixes with a passing (nothing-to-fix) tests record must be substituted \
+                 for test"
+            );
+            assert_eq!(args, json!({}));
+        }
+        other => panic!("expected Action::Tool {{ name: \"test\", .. }}, got {other:?}"),
+    }
+    assert_eq!(
+        notes,
+        vec![
+            "`try_fixes` needs a failing test to work from, so the harness ran `test` instead."
+                .to_string()
+        ]
     );
 }
 

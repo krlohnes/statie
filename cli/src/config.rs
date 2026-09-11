@@ -191,7 +191,7 @@ impl Default for ThinkerConfig {
             timeout_secs: 600,
             num_ctx: None,
             chunked: true,
-            listed: true,
+            listed: false,
         }
     }
 }
@@ -1543,17 +1543,17 @@ mod tests {
         );
     }
 
-    /// Item 14: `thinker.listed` absent must default to `true` (`think`
-    /// stays advertised in the tool list, today's behaviour).
+    /// Item 14: `thinker.listed` absent must default to `false` (D16: `think`
+    /// is harness-triggered unless a config lists it).
     #[test]
-    fn thinker_listed_absent_defaults_true() {
+    fn thinker_listed_absent_defaults_false() {
         let cfg: Config = serde_json::from_str(r#"{"thinker":{"timeout_secs":30}}"#).unwrap();
         let t = cfg.thinker.clone().expect("thinker section should parse");
-        assert!(t.listed, "thinker.listed must default to true");
+        assert!(!t.listed, "thinker.listed must default to false (D16)");
 
-        let cfg: Config = serde_json::from_str(r#"{"thinker":{"listed":false}}"#).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{"thinker":{"listed":true}}"#).unwrap();
         let t = cfg.thinker.clone().expect("thinker section should parse");
-        assert!(!t.listed);
+        assert!(t.listed);
     }
 
     #[test]

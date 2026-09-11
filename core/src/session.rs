@@ -202,7 +202,11 @@ fn normalize_command(cmd: &str) -> String {
 /// enabled (it is not, workspace-wide -- see `Cargo.lock`), so `Value`'s
 /// `Display`/`to_string()` already serializes object keys in sorted order;
 /// no separate normalization step is needed for the args to be canonical.
-fn read_call_key(name: &str, args: &Value) -> String {
+///
+/// `pub`: the coding skills' `implement_repeated_skip_thinks`
+/// (`skills/src/coding/mod.rs`) computes the same key from a read-only
+/// tool call to match it against `HarnessState::last_skip`'s recorded key.
+pub fn read_call_key(name: &str, args: &Value) -> String {
     format!("{name} {args}")
 }
 
@@ -921,6 +925,7 @@ impl<W> Session<W> {
                         last_try_fixes_step: None,
                         consecutive_non_question_asks: 0,
                         last_failure_summary: None,
+                        last_skip: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -944,6 +949,10 @@ impl<W> Session<W> {
                 // same way `active_tools`/`budgets` are (the config, not the
                 // persisted snapshot, owns it).
                 harness.try_fixes_available = self.fixer.is_some();
+                // Mirrors `last_skip_key`/`skip_repeat_count`'s own reset
+                // just below: a new activation starts the repeated-skip
+                // guard fresh.
+                harness.last_skip = None;
                 self.store.set_harness(harness).await?;
             }
         }
@@ -2215,6 +2224,26 @@ where
                 self.session.skip_repeat_count = 1;
             }
 
+            // `HarnessState::last_skip`: harness-owned mirror of the
+            // `last_skip_key`/`skip_repeat_count` pair just updated above,
+            // committed via `set_harness` (the same out-of-band commit
+            // pattern `record_tool_call` uses) so a skill's `validate` --
+            // which only ever sees committed state, never `Session`'s own
+            // in-memory fields -- can read it (`implement_repeated_skip_
+            // thinks`, `skills/src/coding/mod.rs`). Recorded at this step's
+            // count BEFORE the cap-park reset below (if any): the skip that
+            // just happened still gets its own `Some(count)` entry, exactly
+            // mirroring `last_skip_key`'s own value for this step.
+            let (cur_for_skip, _version) = self.session.state().await?;
+            let mut harness_for_skip = cur_for_skip.harness;
+            harness_for_skip.last_skip = Some(crate::version::SkippedRead {
+                tool: name.clone(),
+                key: key.1.clone(),
+                count: self.session.skip_repeat_count,
+                step: next_harness.step,
+            });
+            self.session.store.set_harness(harness_for_skip).await?;
+
             if self.session.skip_repeat_count >= CONTINUE_REPEAT_CAP {
                 // Reset so a resumed session starts this streak fresh
                 // rather than parking again on the very next step even if
@@ -2246,6 +2275,19 @@ where
         } else if !tool_skipped {
             self.session.last_skip_key = None;
             self.session.skip_repeat_count = 0;
+
+            // `HarnessState::last_skip`: cleared the same step `last_skip_key`
+            // is, mirroring that field's own reset rule -- any committed
+            // step that is not itself a skip breaks the streak. Only
+            // touches the store when there is something to clear, avoiding
+            // an extra round-trip on the (overwhelmingly common) case where
+            // `last_skip` is already `None`.
+            let (cur_for_skip, _version) = self.session.state().await?;
+            if cur_for_skip.harness.last_skip.is_some() {
+                let mut harness_for_skip = cur_for_skip.harness;
+                harness_for_skip.last_skip = None;
+                self.session.store.set_harness(harness_for_skip).await?;
+            }
         }
 
         // Mixed-shape non-progress guard (`NON_PROGRESS_CAP`): unlike the

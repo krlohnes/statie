@@ -106,7 +106,7 @@ pub use promptable::{Notes, Observation, Promptable, Reasoning, ToolOutputFull};
 pub use read_window::{ReadWindowHeader, parse_read_header};
 pub use report::{FileNote, Report, ReportOutcome, ReportStats, ReportWorkspace};
 pub use sandbox::{SandboxPath, SandboxRoot};
-pub use session::{Active, CancelHandle, Session, SessionConfig};
+pub use session::{Active, CancelHandle, Session, SessionConfig, read_call_key};
 pub use skill::{
     Commitment, ParsedOutput, Patch, Skill, SkillRules, SkillSpec, ValidatedStep, check_inbox,
     validate_default,
@@ -118,5 +118,7 @@ pub use thinker::{
 };
 pub use tokenizer::{Budgets, HeuristicTokenizer, TiktokenTokenizer, TokenBudget, Tokenizer};
 pub use tool::{Tool, ToolCtx, ToolList, ToolSet};
-pub use version::{Committed, CommittedState, HarnessState, InboxItem, Pinned, Version};
+pub use version::{
+    Committed, CommittedState, HarnessState, InboxItem, Pinned, SkippedRead, Version,
+};
 pub use working_set::{WorkingSet, WorkingSetConfig};

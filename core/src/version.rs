@@ -194,6 +194,42 @@ pub struct HarnessState {
     /// this field existed still deserializes.
     #[serde(default)]
     pub last_failure_summary: Option<String>,
+    /// Mirrors `Session::last_skip_key`/`skip_repeat_count`
+    /// (`core/src/session.rs`), harness-owned so a skill's `validate` can
+    /// see it: `Some(SkippedRead { .. })` on every `skipped_redundant` step
+    /// (7.7/7.8's "do NOT run the tool" path in `Active::execute`),
+    /// recording that step's `(tool, read_call_key)` and the consecutive
+    /// count (`Session::skip_repeat_count`, so always `>= 1` whenever this
+    /// is `Some`); cleared back to `None` on any step that is not a skip --
+    /// the same reset rule `last_skip_key` follows (`Active::step`, right
+    /// alongside that field's own reset). Read by the coding skills'
+    /// `implement_repeated_skip_thinks` (`skills/src/coding/mod.rs`) to
+    /// substitute a `think` call, once, the second time the model asks to
+    /// re-read something already skipped -- unlike `last_skip_key`, which
+    /// only ever compares to the SAME step's fresh key (so it cannot tell
+    /// `validate` "a skip happened", only core's own loop guard can act on
+    /// it), this field survives into the committed state a skill's
+    /// `validate` actually sees. `#[serde(default)]` so state persisted
+    /// before this field existed still deserializes.
+    #[serde(default)]
+    pub last_skip: Option<SkippedRead>,
+}
+
+/// One skipped-redundant read, recorded on `HarnessState::last_skip`. See
+/// that field's doc for when it is set/cleared.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkippedRead {
+    /// The tool name of the skipped call (e.g. `"read_file"`, `"search"`).
+    pub tool: String,
+    /// The call's canonical key, `core/src/session.rs`'s `read_call_key`
+    /// (tool name + canonical JSON of its args) -- used to tell whether a
+    /// later call is the SAME skipped call recurring.
+    pub key: String,
+    /// Consecutive count of this same skip, mirroring `Session::
+    /// skip_repeat_count` at the step that set this value -- always `>= 1`.
+    pub count: u32,
+    /// The harness step at which this skip was recorded.
+    pub step: u64,
 }
 
 /// A guide pinned into the prompt's Pinned section, with a step-counted

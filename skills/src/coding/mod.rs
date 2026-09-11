@@ -1105,6 +1105,92 @@ enum Reason {
 }
 
 /// The question the harness asks `think` on the model's behalf when
+/// [`implement_repeated_skip_thinks`] fires (unit 21): a second refused
+/// re-read (7.7/7.8's `skipped_redundant` guard, `core/src/session.rs`) of
+/// the SAME call, with no `think` in between, gets a substituted `think`
+/// call instead of letting core's own `skipped_redundant` observation repeat
+/// a third time. `{path}` is filled from the call's `path` argument, or the
+/// tool name when the call has none (e.g. a pathless `search`).
+pub const REPEATED_SKIP_QUESTION: &str = "You asked to read {path} again, but its contents are \
+     already in your working set above and nothing has changed. Either state the exact next \
+     edit (path, old text, new text) that moves the plan forward, or name a different file or \
+     range you actually need and why.";
+
+/// `implement`-only (BACKLOG.md item 21): the second time in a row the model
+/// asks to re-read the SAME thing core's `skipped_redundant` guard (7.7/7.8,
+/// `Active::execute` in `core/src/session.rs`) already refused to re-run,
+/// this substitutes a `think` call instead of letting the model repeat the
+/// identical skip a third time (`CONTINUE_REPEAT_CAP`, `core/src/session.rs`,
+/// would otherwise park the run on that third repeat). Mirrors
+/// `implement_repeat_failure_thinks`'s once-per-streak shape, but keyed off
+/// `HarnessState::last_skip` instead of `repeated_failure_step`.
+///
+/// Fires when all of these hold:
+/// - `out.action()` is `Action::Tool { name, args }` with `name` one of
+///   `read_file`/`search`/`list_files` -- a `shell` read has already been
+///   rewritten into `read_file` by `shell_read_substitution`, which runs
+///   before this in `ImplementSkill::validate`, so a `shell` action reaching
+///   here is never a plain read and is left alone.
+/// - `cur.harness.last_skip` (`core/src/version.rs`) is `Some(skip)` with
+///   `skip.count >= 1`, `skip.tool == name`, and `skip.key` equal to this
+///   call's own `read_call_key(name, args)` (`statie_core::read_call_key`,
+///   made `pub` for exactly this) -- the SAME call the guard just skipped,
+///   computed the same way core does so the two can never drift apart.
+/// - No `think` has run since that skip: `cur.harness.last_think_step` is
+///   `None`, or `Some(t)` with `t < skip.step`.
+///
+/// A first skip is left alone (core's own `skipped_redundant` observation is
+/// enough the first time); a skip of a DIFFERENT call, or any skip once a
+/// `think` has already run since it, is also left alone.
+///
+/// Effect: same substitution mechanism as `implement_repeat_failure_thinks`
+/// (`substitute_think`), replacing the action with `Action::Tool { name:
+/// "think", args: {"question": q} }` where `q` is `REPEATED_SKIP_QUESTION`
+/// with `{path}` filled from `args.path` (or `name` when the call has no
+/// `path` argument). The model's action was already a tool call, so there is
+/// no `next_skill` to strip (`strip_next_skill_if_ask_user: false`).
+fn implement_repeated_skip_thinks(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    const READ_TOOLS: &[&str] = &["read_file", "search", "list_files"];
+
+    let statie_core::Action::Tool { name, args } = out.action() else {
+        return None;
+    };
+    if !READ_TOOLS.contains(&name.as_str()) {
+        return None;
+    }
+
+    let skip = cur.harness.last_skip.as_ref()?;
+    if skip.count < 1 || skip.tool != *name {
+        return None;
+    }
+    let key = statie_core::read_call_key(name, args);
+    if skip.key != key {
+        return None;
+    }
+    if let Some(think_step) = cur.harness.last_think_step
+        && think_step >= skip.step
+    {
+        return None;
+    }
+
+    let path = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(name.as_str());
+    let question = REPEATED_SKIP_QUESTION.replace("{path}", path);
+    let note = format!(
+        "you asked to re-read {path}, which the harness already refused to re-run (nothing has \
+         changed since your last read), so it asked the reasoning subagent instead (its \
+         conclusion is below, and in `decision`). Act on it."
+    );
+
+    Some(substitute_think(out, &question, note, false))
+}
+
+/// The question the harness asks `think` on the model's behalf when
 /// [`implement_repeat_failure_thinks`] fires for an [`FailureKind::Assertion`]
 /// failure -- unchanged from before [`classify_failure`] existed, kept under
 /// this name since `skills/tests/think_trigger.rs` and
@@ -1512,6 +1598,59 @@ fn implement_early_park_thinks(
         .to_string();
 
     Some(substitute_think(out, EARLY_PARK_QUESTION, note, true))
+}
+
+/// Unit 20: `try_fixes` is only useful once a failing `test` run is on
+/// record for it to work from (`core/src/session.rs`'s `execute_try_fixes`
+/// otherwise logs a `tool_error` and replies "no failing test to fix; run
+/// test first" -- the harness now avoids ever sending it that call in the
+/// first place). `ImplementSkill::tools()` cannot gate on workspace state:
+/// `Skill::tools(&self) -> Vec<String>` takes no `cur`/workspace parameter
+/// and is genuinely static (see `core/src/skill.rs`), so the gate lives
+/// here instead, in `validate`.
+///
+/// Fires when the model's action is `Action::Tool { name: "try_fixes", .. }`
+/// and `cur.agent.tests` is `None` or `Some(TestRecord { pass: true, .. })`
+/// -- `tests` is harness-owned (`common_harness_owned_fields`) and replaced
+/// whole on every `test` call (`common_after_tool`), so `cur.agent.tests`
+/// (the already-committed record) is authoritative here; there is no
+/// model-patchable copy to race against. Nothing fires when a failing
+/// `tests` record exists (`Some(TestRecord { pass: false, .. })`):
+/// `try_fixes` passes through unchanged.
+///
+/// Effect: same substitution mechanism as `implement_repeat_failure_thinks`
+/// (`substitute_action`), replacing the action with `Action::Tool { name:
+/// "test", args: {} }` (an auto-detected test run, same shape `implement_
+/// no_green_runs_test` substitutes) and returning the note. This is a
+/// substitution, not a rejection, so it does not count as a tool error.
+fn implement_try_fixes_needs_failing_test(
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+    cur: &CommittedState<CodingWorkspace>,
+) -> Option<String> {
+    let is_try_fixes = matches!(
+        out.action(),
+        statie_core::Action::Tool { name, .. } if name == "try_fixes"
+    );
+    if !is_try_fixes {
+        return None;
+    }
+
+    let has_failing_test = matches!(cur.agent.tests, Some(TestRecord { pass: false, .. }));
+    if has_failing_test {
+        return None;
+    }
+
+    let note = "`try_fixes` needs a failing test to work from, so the harness ran `test` instead."
+        .to_string();
+
+    Some(substitute_action(
+        out,
+        statie_core::Action::Tool {
+            name: "test".to_string(),
+            args: serde_json::json!({}),
+        },
+        note,
+    ))
 }
 
 /// Shared substitution mechanism for both `implement_repeat_failure_thinks`
@@ -3842,6 +3981,9 @@ impl Skill for ImplementSkill {
              - `think` asks a reasoning subagent that sees what you see; use it when a \
                fix did not change the failure or you cannot tell which cause is real, \
                then act on its `decision`.\n\
+             - `try_fixes` is only useful after a failing `test`: it proposes and verifies \
+               candidate fixes for the most recent failure, so call `test` first if none has \
+               failed yet.\n\
              - If you are blocked (missing information only the user can give you), use \
                action `ask_user` rather than guessing -- it is the only way to pause; \
                `yield` is rejected in this skill.\n\n\
@@ -4069,6 +4211,22 @@ impl Skill for ImplementSkill {
         let strip_note = strip_malformed_next(&cur.agent, &mut out);
         let shell_read_note = shell_read_substitution(&mut out);
         write_file_auto_confirm(cur, &mut out);
+        // Unit 20: a model-chosen `try_fixes` with no failing `tests` record
+        // to work from is substituted for `test` before anything else below
+        // gets a chance to see (or itself construct) a `try_fixes` action --
+        // `implement_repeat_failure_thinks` only ever builds `try_fixes`
+        // itself once a repeated failure is already open, which implies a
+        // failing `tests` record exists, so the two never fight over the
+        // same step.
+        let try_fixes_gate_note = implement_try_fixes_needs_failing_test(&mut out, cur);
+        // Unit 21: a second refused re-read (core's `skipped_redundant`
+        // guard already declined to re-run it once) is substituted for
+        // `think` before `implement_repeat_failure_thinks` gets a look --
+        // the two never target the same action shape (this one only fires
+        // on a read-only tool call; that one only fires on an edit/idle-test/
+        // ask_user), so ordering between them never matters in practice, but
+        // this runs first to match the brief's stated order.
+        let repeated_skip_think_note = implement_repeated_skip_thinks(cur, &mut out);
         let repeat_think_note = implement_repeat_failure_thinks(cur, &mut out);
         // Only reachable when `implement_repeat_failure_thinks` did not
         // already fire: that function replaces a matching `ask_user` action
@@ -4105,6 +4263,8 @@ impl Skill for ImplementSkill {
             .into_iter()
             .chain(strip_note)
             .chain(shell_read_note)
+            .chain(try_fixes_gate_note)
+            .chain(repeated_skip_think_note)
             .chain(repeat_think_note)
             .chain(early_park_think_note)
             .chain(not_ours_note)

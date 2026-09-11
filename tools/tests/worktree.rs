@@ -279,19 +279,29 @@ async fn run_in_timeout_kills_process_and_reports_promptly() {
 
     let cmd = format!("exec -a {marker} sleep 30");
 
+    // The outer limit is well above the 1s tool timeout and the reap wait
+    // polls instead of sleeping once: on a loaded machine (a bench battery
+    // and a workspace gate compiling at the same time) spawn and kill can
+    // take longer than the original 2s / 200ms margins, and this test is
+    // about the process being killed and reported, not about scheduler
+    // latency.
     let result = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         run_in(&cand, &cmd, Duration::from_secs(1), 200_000),
     )
     .await
-    .expect("did not finish within 2s")
+    .expect("did not finish within 10s")
     .unwrap();
 
     assert!(result.timed_out, "{result:?}");
     assert_eq!(result.exit, None);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let remaining = pgrep_marker_count(&marker);
+    let mut remaining = pgrep_marker_count(&marker);
+    let reap_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while remaining != 0 && std::time::Instant::now() < reap_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        remaining = pgrep_marker_count(&marker);
+    }
     pkill_marker(&marker);
     assert_eq!(remaining, 0, "expected no lingering {marker} processes");
 

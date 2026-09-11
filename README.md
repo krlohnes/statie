@@ -135,6 +135,7 @@ statie would actually use and where it came from.
 | `guards.decision_field` | bool | `true` | The harness writes `decision` from a `think` call and clears it on a passing `test`. `false` does neither; the `think` tool itself still runs. The other half of that arm. |
 | `guards.tests_field` | bool | `true` | The harness writes `tests` (`{cmd, pass, failing, first_error, step}`) on every `test` call, replaced whole. `false` never writes it. Off in the model-owned arm. |
 | `guards.grounded_findings` | bool | `true` | A review send-back keeps only findings that cite `path:line` for a file in `files` or `seen`, with the line inside the seen line count when one is recorded. Dropped findings are named in the note; a send-back with none left is refused. `false` passes every finding through. |
+| `guards.situational_rules` | bool | `false` | Render only the rules that neighbour the last action as a `## Now` section, and keep the universal bullets in the skill text (BACKLOG.md item 26). Off: the whole rules block every step. |
 | `max_autonomous_steps` | integer | `200` | Safety cap on consecutive autonomous steps (`Outcome::Continue`) before a run stops on its own. |
 
 ## Commands
@@ -1529,6 +1530,15 @@ either a default or a config knob:
   | 10, fixer arm with cap | 12/16 | cap parked at the third strike |
   | 11, fixer arm | 15/16 | second strike is a `think` (items 21, 23) |
   | 11, current arm | 15/16 | same binary, no fixer |
+
+  Item 25 on the three hardest tasks (build 12): `multi_file_feature`
+  2 of 2, `trap_rounding` 1 of 2, `refactor_signature` 0 of 2 at 132
+  steps each to the timeout. The stalled-path guard fired four times a
+  seed and changed nothing: the runs cycle through eight to ten
+  distinct compile errors with every edit applying, which no repeat
+  guard can see. Across 79 landed runs the most failing tests before
+  the first pass was 13; the refactor misses ran 29, 24, and 22
+  (backlog item 27).
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

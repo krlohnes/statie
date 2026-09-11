@@ -326,7 +326,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Gate wall clock and `Running` lines before and after.
 
 ### 25. Repeat guards key on the shape of an error, not its text
-- **Status.** Built (Milestone 32); in the thirteenth gate. First cut rejected: its error trigger fired on any call of the tool after one error, which would have blocked the corrected edit; now identical call or repeated shape. Found in `arm_harness_max_b7`: `refactor_signature` ran 116 and 153 steps before the mixed-shape cap parked it.
+- **Status.** Committed (3024891; Milestone 32). Measured (`refactor_b8`): the stall guard fired four times per seed but `refactor_signature` still ran 132 steps to the 900 s timeout on both, with 25 to 30 applied edits and 18 to 21 test runs cycling through 8 to 10 distinct compile errors. Every guard saw progress; the test saw none. Item 27 is the cap for that shape. First cut rejected: its error trigger fired on any call of the tool after one error, which would have blocked the corrected edit; now identical call or repeated shape. Found in `arm_harness_max_b7`: `refactor_signature` ran 116 and 153 steps before the mixed-shape cap parked it.
 - **What.** The identical-error streak keys on (tool, reason text), so
   nine `edit_file` failures in a row with different line numbers in the
   reason count as nine different errors, and a run that alternates a
@@ -341,6 +341,23 @@ moves the metric it was built for. Ordered within each tier.
   for forty steps; seed 2 issued nine consecutive failing edits.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
+
+### 27. A run without a green test in N test runs stops
+- **Status.** Building. Evidence across 79 landed runs (builds 10 and 11): the most failing `test` runs before the first pass was 13 (one `multi_file_feature` seed), the 90th percentile 6, the median 2. The five `refactor_signature` misses ran 29, 24, 22, 14, and 11 failing tests.
+- **What.** The harness counts failing `test` runs since the last pass in
+  this activation (`HarnessState.fails_since_green`). At 12, `implement`
+  substitutes `think` with a question that says how many tests have
+  failed and asks whether the plan itself is wrong and what the smallest
+  change that could pass is. At 16 the core parks through
+  `park_non_progress_cap` with the shape "no green in 16 test runs". A
+  pass resets the count.
+- **Why.** The refactor runs cycle through distinct compile errors,
+  each edit applies, no guard keyed on repeats can see it, and the run
+  spends its whole budget. The cap sits above every landed run in the
+  record, so it costs nothing on the evidence and ends the worst
+  misses at half their length.
+- **Measure.** `refactor_signature` steps; landing on the full battery
+  unchanged.
 
 ## P2: worth doing, weaker or narrower evidence
 
@@ -409,6 +426,7 @@ moves the metric it was built for. Ordered within each tier.
   models; full injection hurt. Our rules block is a full injection.
 - **Measure.** Mean and peak prompt tokens, landing on the full battery,
   the eight-short-task row.
+- **Status.** Built (Milestone 33); in the fourteenth gate. Measured next by `situational_b9` against `arm_harness_max_b9` on the same binary.
 - **Depends on.** Nothing; P2 because the evidence is from other models.
 
 ## Not doing

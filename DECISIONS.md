@@ -397,3 +397,7 @@ holds the resulting design; this file holds why.
   state (about three hours before the Developer Tools permission). The
   test-fixture git helpers also stop inheriting the developer's signing
   config, which had failed a test once under load.
+- **Addendum (build 12).** A gate is stopped by killing its process
+  group; anything launched from the same shell call shares that group.
+  A battery runner launched alongside a gate died with it. Batteries
+  and gates are launched from separate shell calls.

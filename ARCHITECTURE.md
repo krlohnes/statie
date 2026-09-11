@@ -1647,6 +1647,24 @@ refused read and a failed edit on the same path as one streak;
 strike and the core parks at six with the shape "stalled on <path>".
 Think steps keep every count (D19).
 
+## Milestone 33: situational rules (BACKLOG.md item 26; RELATED-WORK.md Procedural Graphs)
+
+Behind `guards.situational_rules` (default off). `Skill::situational(cur)`
+is a new per-step hook; the session renders its text as a `## Now`
+section between the harness view and the working set, budgeted like
+notes. `HarnessState.last_tool` records the last executed tool's name.
+`skills/src/coding/procedure.rs` holds a static procedure graph whose
+nodes are situations derived from harness state (`start`, `read`,
+`search`, `edit_ok`, `edit_error`, `test_pass`, `test_fail_compile`,
+`test_fail_assert`, `test_fail_other`, `think_done`, `skipped`,
+`stalled`) and whose edges carry the "after X, do Y" bullets moved out
+of the plan and implement rules; `render` gives the two-hop
+neighbourhood as at most ten lines. With the switch on, the spec keeps
+only the universal bullets; off, the spec text is byte-identical to
+before (snapshotted in the tests) and no `## Now` section exists. The
+saving on the fixture prompt is 131 tokens at step 3; the battery
+decides whether the localisation matters.
+
 ## Testing conventions
 
 - Unit tests live beside code (`#[cfg(test)]`). Integration tests in

@@ -8,6 +8,7 @@ mod green_checkpoint;
 mod green_filtered;
 mod guards;
 mod maintainer;
+mod no_green_cap;
 mod non_progress;
 mod on_activate;
 mod parse_validate;

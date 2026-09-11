@@ -308,6 +308,22 @@ pub struct HarnessState {
     /// before this field existed still deserializes.
     #[serde(default)]
     pub last_tool: Option<String>,
+    /// Unit 27 ("no green cap"): the count of `test` tool runs whose result
+    /// was a failure since the last PASSING `test` run in this activation --
+    /// incremented on every failing `test` call, at the same call site as
+    /// `green_step`/`repeated_failure_step` (`core/src/session.rs`), and
+    /// reset to `0` both on a passing `test` call and on a fresh activation
+    /// (`activate_inner`), mirroring `last_think_step`'s own per-activation
+    /// reset. Harness-owned: patches cannot touch it. At the failing `test`
+    /// call that brings this count to `NO_GREEN_PARK_AT`
+    /// (`core/src/session.rs`), core parks through `park_non_progress_cap`
+    /// with the shape `"no green in {NO_GREEN_PARK_AT} test runs"`. Read by
+    /// the coding skills' `implement_no_green_thinks`
+    /// (`skills/src/coding/mod.rs`) to substitute a `think` call once this
+    /// reaches `NO_GREEN_THINK_AT`. `#[serde(default)]` so state persisted
+    /// before this field existed still deserializes.
+    #[serde(default)]
+    pub fails_since_green: u32,
 }
 
 /// One skipped-redundant read, recorded on `HarnessState::last_skip`. See

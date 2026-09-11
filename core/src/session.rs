@@ -108,6 +108,21 @@ const CONTINUE_REPEAT_CAP: u32 = 3;
 /// `Session::non_progress_count`/`non_progress_shapes`.
 const NON_PROGRESS_CAP: u32 = 6;
 
+/// Unit 27 ("no green cap"): the `HarnessState::fails_since_green` count at
+/// which the coding skills' `implement_no_green_thinks`
+/// (`skills/src/coding/mod.rs`) substitutes a `think` call, asking whether
+/// the plan itself is wrong, once no `think` has run since the last failing
+/// `test`'s step.
+pub const NO_GREEN_THINK_AT: u32 = 12;
+
+/// Unit 27: the `HarnessState::fails_since_green` count at which a failing
+/// `test` call itself parks the session, through `park_non_progress_cap`,
+/// with the shape `"no green in {NO_GREEN_PARK_AT} test runs"` -- a run that
+/// has failed this many times since its last green checkpoint (in this
+/// activation) is not making progress, regardless of what shape each
+/// individual step took.
+pub const NO_GREEN_PARK_AT: u32 = 16;
+
 /// Large enough window to find any `ToolOutput` entry from the current
 /// activation when looking up a previous `read_file` call's header for
 /// 7.8's read-paging special case (mirrors `working_set.rs`'s
@@ -1225,6 +1240,7 @@ impl<W> Session<W> {
                         last_tool_error: None,
                         last_stall: None,
                         last_tool: None,
+                        fails_since_green: 0,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -1261,6 +1277,11 @@ impl<W> Session<W> {
                 // below (unit 25 part 3): a new activation starts the
                 // stalled-path guard fresh too.
                 harness.last_stall = None;
+                // Unit 27: `fails_since_green` counts failures "in this
+                // activation" (see its doc) -- a new activation starts the
+                // no-green cap fresh, the same treatment `tool_calls`/
+                // `last_think_step` get above.
+                harness.fails_since_green = 0;
                 // Deliberately NOT reset here: `last_failure_summary` is a
                 // fact about the sandbox (the most recent `test` call's
                 // result), not about this activation, so it survives
@@ -2934,6 +2955,31 @@ where
             }
         }
 
+        // No-green cap (unit 27, `NO_GREEN_PARK_AT`): a failing `test` call
+        // that has just brought `HarnessState::fails_since_green` to
+        // `NO_GREEN_PARK_AT` parks the run through the mixed-shape
+        // non-progress guard's own path, the same way the repeated-
+        // tool-error and stalled-path guards above do -- this run has
+        // failed `test` that many times since its last green checkpoint (in
+        // this activation) without ever landing a pass, regardless of what
+        // shape each individual failing step took. Only evaluated when this
+        // step hasn't already parked (mirrors the stalled-path guard's own
+        // `!matches!(outcome, Outcome::Parked(_))` check just above): a
+        // park is itself progress in the sense that matters here.
+        if let Action::Tool { name, .. } = &action_for_maintainer
+            && name == "test"
+            && !matches!(outcome, Outcome::Parked(_))
+        {
+            let (cur_for_no_green, _version) = self.session.state().await?;
+            if cur_for_no_green.harness.fails_since_green >= NO_GREEN_PARK_AT {
+                self.session
+                    .non_progress_shapes
+                    .push(format!("no green in {NO_GREEN_PARK_AT} test runs"));
+                outcome =
+                    self.park_non_progress_cap(next_harness.step, &mut entries, NO_GREEN_PARK_AT);
+            }
+        }
+
         // Mixed-shape non-progress guard (`NON_PROGRESS_CAP`): unlike the
         // two guards just above, which only catch a streak of the SAME
         // shape recurring, this one catches ANY run of non-progress steps
@@ -3436,6 +3482,17 @@ where
                                 .last_test_failure
                                 .as_ref()
                                 .map(|s| s.chars().take(600).collect::<String>());
+                            // `fails_since_green` (unit 27, `core/src/
+                            // version.rs`): incremented on every failing
+                            // `test` call, reset to 0 on a pass -- the same
+                            // `self.session.last_test_result` this block
+                            // already reads to decide `green_step`.
+                            if self.session.last_test_result == Some(true) {
+                                harness.fails_since_green = 0;
+                            } else {
+                                harness.fails_since_green =
+                                    harness.fails_since_green.saturating_add(1);
+                            }
                         } else if matches!(
                             name.as_str(),
                             "edit_file" | "write_file" | "revert_file"

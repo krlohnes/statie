@@ -19,8 +19,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use statie_core::{
-    Commitment, CommittedState, HarnessState, ParsedOutput, Patch, PatchError, Report, Skill,
-    SkillSpec, ValidatedStep, parse_read_header, validate_default,
+    Commitment, CommittedState, HarnessState, NO_GREEN_THINK_AT, ParsedOutput, Patch, PatchError,
+    Report, Skill, SkillSpec, ValidatedStep, parse_read_header, validate_default,
 };
 use statie_patch::JsonMergePatch;
 
@@ -1416,6 +1416,90 @@ fn implement_stall_thinks(
         "you have been going back and forth on {path} (a re-read refused, an edit failed, or \
          both), so the harness asked the reasoning subagent instead (its conclusion is below, \
          and in `decision`). Act on it."
+    );
+
+    Some(substitute_think(out, &question, note, false))
+}
+
+/// The question the harness asks `think` on the model's behalf when
+/// [`implement_no_green_thinks`] fires (unit 27, "no green cap"): the run
+/// has failed `test` `{n}` times in a row since its last pass without ever
+/// getting back to green, so the harness asks whether the PLAN itself --
+/// not just the next edit -- is wrong. `{n}` is filled from
+/// `HarnessState::fails_since_green` (`core/src/version.rs`).
+pub const NO_GREEN_QUESTION: &str = "{n} test runs have failed since the last pass. Is the plan \
+     itself wrong? Name the one smallest change that could make the failing test pass, or say \
+     which plan step should be dropped.";
+
+/// `implement`-only (unit 27, "no green cap"): once
+/// `HarnessState::fails_since_green` (`core/src/version.rs`) reaches
+/// `NO_GREEN_THINK_AT`, with no `think` since the last failing `test`'s
+/// step, substitutes a `think` call asking whether the plan itself is
+/// wrong, instead of letting the model keep editing blind. Run right after
+/// [`implement_stall_thinks`] in `ImplementSkill::validate`: unlike the
+/// other `think` triggers (each keyed on a specific streak shape --
+/// identical skip, identical-shape tool error, a stalled path), this one is
+/// keyed purely on the raw count of failing `test` runs since the last
+/// pass, so it can fire on ANY action shape, including one none of the
+/// other triggers would recognize (e.g. a fresh, non-repeating edit that
+/// still hasn't gotten the suite green in 12 tries) -- but is explicitly
+/// left out when the action is itself `test` or `think`, so the model can
+/// still verify its own fix or think on its own without the harness
+/// stepping on it.
+///
+/// Fires when all of these hold:
+/// - `cur.harness.fails_since_green >= NO_GREEN_THINK_AT`.
+/// - `cur.agent.tests` (`CodingWorkspace::tests`, the harness's own record
+///   of the most recent `test` call, `common_after_tool`) is `Some(rec)`
+///   with `rec.pass == false` -- the last recorded `test` run is the
+///   failure this count is tracking, and its own `step` anchors the
+///   `last_think_step` comparison below (mirroring `implement_repeated_
+///   error_thinks`'s use of `err.step`/`implement_stall_thinks`'s use of
+///   `stall.step`).
+/// - No `think` has run since that failing test's step:
+///   `cur.harness.last_think_step` is `None`, or `Some(t)` with `t <
+///   rec.step`.
+/// - `out.action()` is NOT `Action::Tool { name: "test" | "think", .. }` --
+///   the model verifying its own fix, or thinking on its own, is left
+///   alone.
+///
+/// Effect: same substitution mechanism as the other triggers
+/// (`substitute_think`), replacing the action with `Action::Tool { name:
+/// "think", args: {"question": q} }` where `q` is [`NO_GREEN_QUESTION`]
+/// with `{n}` filled from `fails_since_green`. The model's action was
+/// already set (a tool call, `done`, or `ask_user`), so there is no
+/// `next_skill` to strip (`strip_next_skill_if_ask_user: false`), the same
+/// as the other `think` triggers wired alongside it.
+fn implement_no_green_thinks(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    if cur.harness.fails_since_green < NO_GREEN_THINK_AT {
+        return None;
+    }
+    let rec = cur.agent.tests.as_ref()?;
+    if rec.pass {
+        return None;
+    }
+    if let Some(think_step) = cur.harness.last_think_step
+        && think_step >= rec.step
+    {
+        return None;
+    }
+    let is_test_or_think = matches!(
+        out.action(),
+        statie_core::Action::Tool { name, .. } if matches!(name.as_str(), "test" | "think")
+    );
+    if is_test_or_think {
+        return None;
+    }
+
+    let n = cur.harness.fails_since_green;
+    let question = NO_GREEN_QUESTION.replace("{n}", &n.to_string());
+    let note = format!(
+        "{n} test runs have failed since the last pass, so the harness asked the reasoning \
+         subagent whether the plan itself is wrong (its conclusion is below, and in \
+         `decision`). Act on it."
     );
 
     Some(substitute_think(out, &question, note, false))
@@ -4573,6 +4657,14 @@ impl Skill for ImplementSkill {
         // idempotent-safe to call at most once per step, matching the other
         // two triggers here.
         let stall_think_note = implement_stall_thinks(cur, &mut out);
+        // Unit 27 ("no green cap"): a run that has failed `test` at least
+        // `NO_GREEN_THINK_AT` times since its last pass, with no `think`
+        // since that failing test's own step, is substituted for `think`
+        // right after the stalled-path trigger above -- keyed on the raw
+        // failure count rather than any particular action shape, so it can
+        // fire on an action none of the streak-shaped triggers above would
+        // recognize.
+        let no_green_think_note = implement_no_green_thinks(cur, &mut out);
         let repeat_think_note = implement_repeat_failure_thinks(cur, &mut out);
         // Only reachable when `implement_repeat_failure_thinks` did not
         // already fire: that function replaces a matching `ask_user` action
@@ -4613,6 +4705,7 @@ impl Skill for ImplementSkill {
             .chain(repeated_skip_think_note)
             .chain(repeated_error_think_note)
             .chain(stall_think_note)
+            .chain(no_green_think_note)
             .chain(repeat_think_note)
             .chain(early_park_think_note)
             .chain(not_ours_note)

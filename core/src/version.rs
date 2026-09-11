@@ -210,9 +210,15 @@ pub struct HarnessState {
     /// (7.7/7.8's "do NOT run the tool" path in `Active::execute`),
     /// recording that step's `(tool, read_call_key)` and the consecutive
     /// count (`Session::skip_repeat_count`, so always `>= 1` whenever this
-    /// is `Some`); cleared back to `None` on any step that is not a skip --
-    /// the same reset rule `last_skip_key` follows (`Active::step`, right
-    /// alongside that field's own reset). Read by the coding skills'
+    /// is `Some`); cleared back to `None` on any step that is not a skip AND
+    /// is not a `think` step (`core/src/session.rs`'s `is_think_action`,
+    /// unit 23's correction) -- the same reset rule `last_skip_key` follows
+    /// (`Active::step`, right alongside that field's own reset). A `think`
+    /// step (model-chosen or substituted by `implement_repeated_skip_
+    /// thinks`) leaves this field exactly as it was: a think between two
+    /// identical skips must not clear it, or the model could alternate
+    /// skip/think forever without ever reaching `CONTINUE_REPEAT_CAP`. Read
+    /// by the coding skills'
     /// `implement_repeated_skip_thinks` (`skills/src/coding/mod.rs`) to
     /// substitute a `think` call, once, the second time the model asks to
     /// re-read something already skipped -- unlike `last_skip_key`, which
@@ -223,6 +229,37 @@ pub struct HarnessState {
     /// before this field existed still deserializes.
     #[serde(default)]
     pub last_skip: Option<SkippedRead>,
+    /// Mirrors `Session::last_tool_error_key`/`tool_error_repeat_count`
+    /// (`core/src/session.rs`), harness-owned so a skill's `validate` can
+    /// see it -- the same treatment `last_skip` gets for the repeated-skip
+    /// guard, unit 23 part (b): `Some(RepeatedToolError { .. })` on every
+    /// `tool_error` System entry (the generic tool-execution error path in
+    /// `Active::execute`, or the `think`/`try_fixes` interceptions' own
+    /// invalid-argument/no-failing-test tool errors), recording that step's
+    /// `(tool, args, reason)` and the consecutive count (`Session::
+    /// tool_error_repeat_count`, so always `>= 1` whenever this is `Some`);
+    /// cleared back to `None` on any step that is not a `tool_error` AND is
+    /// not a `think` step (`core/src/session.rs`'s `is_think_action`, unit
+    /// 23's correction) -- the same reset rule `last_tool_error_key`
+    /// follows (`Active::step`, right alongside that field's own reset),
+    /// and on activation, the same as `last_skip`. A `think` step
+    /// (model-chosen or substituted by `implement_repeated_error_thinks`)
+    /// leaves this field exactly as it was: without this exemption the
+    /// substituted think would itself clear the field, letting the model
+    /// alternate error/think/error/think forever with every repeat looking
+    /// like a fresh occurrence, never reaching `CONTINUE_REPEAT_CAP`. `args`
+    /// is the committed action's own tool-call
+    /// arguments (`Action::Tool { args, .. }`), not read back from the
+    /// `tool_error` entry's payload (which carries only `name`/`reason`) --
+    /// every `tool_error` entry is pushed from within a tool-call dispatch
+    /// path, so the committed action is always `Action::Tool` whenever this
+    /// is set. Read by the coding skills' `implement_repeated_error_thinks`
+    /// (`skills/src/coding/mod.rs`) to substitute a `think` call, once, the
+    /// second time the model repeats the SAME failing tool call. `#[serde(
+    /// default)]` so state persisted before this field existed still
+    /// deserializes.
+    #[serde(default)]
+    pub last_tool_error: Option<RepeatedToolError>,
 }
 
 /// One skipped-redundant read, recorded on `HarnessState::last_skip`. See
@@ -239,6 +276,27 @@ pub struct SkippedRead {
     /// skip_repeat_count` at the step that set this value -- always `>= 1`.
     pub count: u32,
     /// The harness step at which this skip was recorded.
+    pub step: u64,
+}
+
+/// One repeated identical `tool_error`, recorded on `HarnessState::
+/// last_tool_error`. See that field's doc for when it is set/cleared.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RepeatedToolError {
+    /// The tool name the error came from (e.g. `"edit_file"`, `"think"`).
+    pub tool: String,
+    /// The failing call's own arguments, exactly as the committed action
+    /// carried them -- compared against a later `Action::Tool { name, args
+    /// }` to tell whether it is the SAME call recurring.
+    pub args: serde_json::Value,
+    /// The error's reason string, as reported on the `tool_error` System
+    /// entry's own payload.
+    pub reason: String,
+    /// Consecutive count of this same identical `(tool, reason)` error,
+    /// mirroring `Session::tool_error_repeat_count` at the step that set
+    /// this value -- always `>= 1`.
+    pub count: u32,
+    /// The harness step at which this error was recorded.
     pub step: u64,
 }
 

@@ -824,12 +824,20 @@ fn common_after_tool(
         }
 
         if tests_enabled {
+            // Unit 23: when the call's own args carried no `cmd`/`command`
+            // (auto-detected by `tools/src/test_tool.rs`), fall back to
+            // parsing it back out of the tool's own `command: <cmd>` first
+            // line (`statie_core::detected_test_command`, the same function
+            // `core/src/session.rs` uses to populate `harness.last_test_cmd`)
+            // so this record's `cmd` is never empty after a run that printed
+            // a command.
             let cmd = args
                 .get("cmd")
                 .or_else(|| args.get("command"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+                .map(str::to_string)
+                .or_else(|| statie_core::detected_test_command(output))
+                .unwrap_or_default();
             let pass = statie_core::is_pass(output);
             let (failing, first_error) = if pass {
                 (Vec::new(), None)
@@ -1185,6 +1193,102 @@ fn implement_repeated_skip_thinks(
         "you asked to re-read {path}, which the harness already refused to re-run (nothing has \
          changed since your last read), so it asked the reasoning subagent instead (its \
          conclusion is below, and in `decision`). Act on it."
+    );
+
+    Some(substitute_think(out, &question, note, false))
+}
+
+/// The question the harness asks `think` on the model's behalf when
+/// [`implement_repeated_error_thinks`] fires (unit 23 part (b)): the SAME
+/// tool call fails a second time in a row with the identical reason core's
+/// own repeated-tool-error guard (`HarnessState::last_tool_error`,
+/// `core/src/session.rs`) already tracks. `{tool}` is filled from that
+/// error's own tool name, `{reason}` from its reason string, cut to 300
+/// characters (`cap_reason`, mirroring the redundant-verification guard's
+/// own cap on a long tool-error message).
+pub const REPEATED_ERROR_QUESTION: &str = "Your last `{tool}` call failed with: {reason}. \
+     Repeating the same call will fail the same way. Using the working set above, state a \
+     different exact next action: for an edit, the path, the old text as it appears in the \
+     file, and the new text; otherwise the file or range to read and why.";
+
+/// `implement`-only (unit 23 part (b)): the second time in a row the model
+/// repeats the SAME tool call that just failed -- identity is `(tool name,
+/// args)`, matched against `HarnessState::last_tool_error`
+/// (`core/src/version.rs`), which core's own repeated-tool-error guard
+/// (`core/src/session.rs`) already tracks by `(tool name, reason string)` --
+/// this substitutes a `think` call instead of letting the model repeat the
+/// identical failing call again. Mirrors [`implement_repeated_skip_thinks`]'s
+/// once-per-streak shape and wiring (run right after it in `ImplementSkill::
+/// validate`), but keyed off `HarnessState::last_tool_error` instead of
+/// `HarnessState::last_skip`.
+///
+/// Fires when all of these hold:
+/// - `out.action()` is `Action::Tool { name, args }`.
+/// - `cur.harness.last_tool_error` (`core/src/version.rs`) is `Some(err)`
+///   with `err.count >= 1`, `err.tool == name`, and `err.args == args` --
+///   this call's own arguments equal exactly the failing call's, so a call
+///   to a DIFFERENT tool, or the SAME tool with DIFFERENT arguments, is left
+///   alone (it cannot be the same call recurring).
+/// - No `think` has run since that error: `cur.harness.last_think_step` is
+///   `None`, or `Some(t)` with `t < err.step` -- the same `last_think_step`
+///   rule [`implement_repeated_skip_thinks`] uses.
+///
+/// A first error is left alone (core's own repeated-tool-error guard already
+/// prefixes the observation the second time -- see that guard's doc,
+/// `core/src/session.rs`); a DIFFERENT call after an error, or the SAME call
+/// once a `think` has already run since it, is also left alone. The core cap
+/// (`CONTINUE_REPEAT_CAP`, "the core cap... parks" -- the THIRD identical
+/// error) is unchanged: this only ever intercepts the SECOND.
+///
+/// Effect: same substitution mechanism as [`implement_repeated_skip_thinks`]
+/// (`substitute_think`), replacing the action with `Action::Tool { name:
+/// "think", args: {"question": q} }` where `q` is [`REPEATED_ERROR_QUESTION`]
+/// with `{tool}`/`{reason}` filled from `err.tool`/`err.reason` (cut to 300
+/// characters via `cap_reason`). The model's action was already a tool call,
+/// so there is no `next_skill` to strip (`strip_next_skill_if_ask_user:
+/// false`), the same as the skip trigger.
+/// Cuts `text` to at most 300 characters (unit 23 part (b)'s brief: "reason
+/// cut to 300 characters"), with no truncation marker appended -- unlike
+/// [`truncate_decision_answer`], which is capping a `think` ANSWER for
+/// storage in `decision`, this is capping a tool-error REASON string being
+/// substituted into a question sent to the reasoning subagent, so the exact
+/// cap point doesn't need to be visible to the model.
+fn cap_reason_to_300_chars(text: &str) -> String {
+    const REASON_CAP: usize = 300;
+    if text.chars().count() <= REASON_CAP {
+        text.to_string()
+    } else {
+        text.chars().take(REASON_CAP).collect()
+    }
+}
+
+fn implement_repeated_error_thinks(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    let statie_core::Action::Tool { name, args } = out.action() else {
+        return None;
+    };
+
+    let err = cur.harness.last_tool_error.as_ref()?;
+    if err.count < 1 || err.tool != *name || err.args != *args {
+        return None;
+    }
+    if let Some(think_step) = cur.harness.last_think_step
+        && think_step >= err.step
+    {
+        return None;
+    }
+
+    let reason = cap_reason_to_300_chars(&err.reason);
+    let question = REPEATED_ERROR_QUESTION
+        .replace("{tool}", &err.tool)
+        .replace("{reason}", &reason);
+    let note = format!(
+        "your last `{}` call failed with: {reason}. Repeating it will fail the same way, so the \
+         harness asked the reasoning subagent instead (its conclusion is below, and in \
+         `decision`). Act on it.",
+        err.tool
     );
 
     Some(substitute_think(out, &question, note, false))
@@ -4227,6 +4331,15 @@ impl Skill for ImplementSkill {
         // ask_user), so ordering between them never matters in practice, but
         // this runs first to match the brief's stated order.
         let repeated_skip_think_note = implement_repeated_skip_thinks(cur, &mut out);
+        // Unit 23 part (b): the second time in a row the model repeats the
+        // SAME tool call that just failed (`HarnessState::last_tool_error`),
+        // substituted for `think` right after the repeated-skip trigger
+        // above, mirroring its wiring -- the two never target the same
+        // committed action twice (a tool call that just failed and a
+        // read-only call that was just skipped are mutually exclusive
+        // outcomes of the SAME step), so ordering between them only matters
+        // in the sense the brief states it in.
+        let repeated_error_think_note = implement_repeated_error_thinks(cur, &mut out);
         let repeat_think_note = implement_repeat_failure_thinks(cur, &mut out);
         // Only reachable when `implement_repeat_failure_thinks` did not
         // already fire: that function replaces a matching `ask_user` action
@@ -4265,6 +4378,7 @@ impl Skill for ImplementSkill {
             .chain(shell_read_note)
             .chain(try_fixes_gate_note)
             .chain(repeated_skip_think_note)
+            .chain(repeated_error_think_note)
             .chain(repeat_think_note)
             .chain(early_park_think_note)
             .chain(not_ours_note)

@@ -106,7 +106,9 @@ pub use promptable::{Notes, Observation, Promptable, Reasoning, ToolOutputFull};
 pub use read_window::{ReadWindowHeader, parse_read_header};
 pub use report::{FileNote, Report, ReportOutcome, ReportStats, ReportWorkspace};
 pub use sandbox::{SandboxPath, SandboxRoot};
-pub use session::{Active, CancelHandle, Session, SessionConfig, read_call_key};
+pub use session::{
+    Active, CancelHandle, Session, SessionConfig, detected_test_command, read_call_key,
+};
 pub use skill::{
     Commitment, ParsedOutput, Patch, Skill, SkillRules, SkillSpec, ValidatedStep, check_inbox,
     validate_default,

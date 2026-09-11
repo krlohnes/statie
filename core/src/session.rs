@@ -217,6 +217,25 @@ pub fn read_call_key(name: &str, args: &Value) -> String {
     format!("{name} {args}")
 }
 
+/// True when `action` is a `think` call (`Action::Tool { name: "think", .. }`)
+/// -- whether the model chose it itself or a skill's `validate` substituted
+/// it (`execute_think`'s own doc: "a harness substitution is indistinguishable
+/// from the model choosing `think` itself" by the time an action reaches
+/// `execute`). Used by the repeated-skip and repeated-tool-error guards
+/// (`Active::step`, right after `execute` returns) to exempt a `think` step
+/// from resetting either streak: unit 23 part (b) originally reset both
+/// streaks on any non-matching committed step, `think` included, which let a
+/// model alternate error/think/error/think forever without ever reaching
+/// `CONTINUE_REPEAT_CAP` (the substituted `think` itself cleared
+/// `last_tool_error`/`last_skip`, so the next identical call always looked
+/// like a fresh streak). A `think` step now leaves both streaks exactly as
+/// they were; every other non-matching step (an executed tool call, a
+/// skipped-redundant call of a different shape, a rejection) still resets
+/// them as before.
+fn is_think_action(action: &Action) -> bool {
+    matches!(action, Action::Tool { name, .. } if name == "think")
+}
+
 /// True when `patch` is an empty JSON object (`{}`) -- the raw patch object
 /// has no keys, so this step's patch recorded nothing to the workspace.
 /// Anything else (a non-empty object, or a patch strategy that never sends
@@ -344,6 +363,21 @@ fn extract_command(args: &Value) -> Option<String> {
         .get("cmd")
         .and_then(Value::as_str)
         .or_else(|| args.get("command").and_then(Value::as_str))?;
+    Some(normalize_command(raw))
+}
+
+/// Recovers the command a `test` call actually ran when its args carried no
+/// `cmd`/`command` (auto-detected by `tools/src/test_tool.rs`'s
+/// `detect_test_command`), by parsing it back out of the tool's own output:
+/// `format_result` (`tools/src/test_tool.rs`) always prints `command: <cmd>`
+/// as the first line, whether the run passed, failed, or its exit code
+/// couldn't be parsed. `None` when `output` has no such line (never happens
+/// for a real `test` call, but guards a malformed/mocked one). Normalized the
+/// same way `extract_command` normalizes an explicit `cmd` argument, so
+/// `harness.last_test_cmd` is comparable either way it was populated.
+pub fn detected_test_command(output: &str) -> Option<String> {
+    let line = output.lines().next()?;
+    let raw = line.strip_prefix("command: ")?;
     Some(normalize_command(raw))
 }
 
@@ -695,42 +729,57 @@ pub struct Session<W> {
     /// the most recent `skipped_redundant` step (7.7/7.8's "do NOT run the
     /// tool" path in `Active::execute`), kept so the next skip can tell
     /// whether it is the SAME call being skipped again. `None` initially,
-    /// on activation, and after any step that isn't itself a skip -- i.e. an
-    /// executed tool call, a rejection, or any other outcome breaks the
-    /// streak, the same as a different skipped call would. A
-    /// `skipped_redundant` observation is the same kind of non-progress as a
-    /// repeated `Continue` note (see `last_continue_note`) but wasn't
-    /// counted before this guard existed, letting a run repeat the same
-    /// skip dozens of times.
+    /// on activation, and after any step that isn't itself a skip AND isn't
+    /// a `think` step (`is_think_action`, unit 23's correction) -- i.e. an
+    /// executed non-`think` tool call, a rejection, or any other outcome
+    /// breaks the streak, the same as a different skipped call would, but a
+    /// `think` step (model-chosen or substituted by
+    /// `implement_repeated_skip_thinks`) leaves the streak exactly as it
+    /// was: a think between two identical skips must not reset this, or the
+    /// model can alternate skip/think forever without ever reaching
+    /// `CONTINUE_REPEAT_CAP`. A `skipped_redundant` observation is the same
+    /// kind of non-progress as a repeated `Continue` note (see
+    /// `last_continue_note`) but wasn't counted before this guard existed,
+    /// letting a run repeat the same skip dozens of times.
     last_skip_key: Option<(String, String)>,
     /// How many consecutive steps have produced `last_skip_key` (including
     /// the one that set it, so this is always >= 1 whenever `last_skip_key`
-    /// is `Some`). Reset to 0 alongside `last_skip_key`. At
-    /// `CONTINUE_REPEAT_CAP`, the step that would make the skip recur a
-    /// third time parks instead of continuing (`Active::execute`'s skip
-    /// handling), the same as `continue_repeat_count` does for `Continue`.
+    /// is `Some`). Reset to 0 alongside `last_skip_key` -- including the
+    /// think exemption: a `think` step leaves this count exactly as it was.
+    /// At `CONTINUE_REPEAT_CAP`, the step that would make the skip recur a
+    /// third time (thinks don't count towards this) parks instead of
+    /// continuing (`Active::execute`'s skip handling), the same as
+    /// `continue_repeat_count` does for `Continue`.
     skip_repeat_count: u32,
     /// Repeated-tool-error guard: the `(tool name, reason string)` (the
     /// same pair a `tool_error` System entry's payload carries, see the
     /// generic tool-execution error path in `execute`) of the most recent
     /// `tool_error` step, kept so the next tool error can tell whether it
     /// is the SAME error recurring. `None` initially, on activation, and
-    /// after any step that is not itself an identical tool error -- i.e. a
-    /// successful tool call, a different tool error, a rejection, or any
-    /// other outcome breaks the streak, the same as `last_skip_key` does
-    /// for a skip. A repeated identical tool error is the same kind of
-    /// non-progress as a repeated skip or `Continue` note: the model keeps
-    /// retrying a call whose result cannot change without a different
-    /// action.
+    /// after any step that is not itself an identical tool error AND is not
+    /// a `think` step (`is_think_action`, unit 23's correction) -- i.e. a
+    /// successful non-`think` tool call, a different tool error, a
+    /// rejection, or any other outcome breaks the streak, the same as
+    /// `last_skip_key` does for a skip, but a `think` step (model-chosen or
+    /// substituted by `implement_repeated_error_thinks`) leaves the streak
+    /// exactly as it was: without this exemption the model could alternate
+    /// error/think/error/think forever (the substituted think would itself
+    /// clear the streak, making every repeat look like a fresh occurrence)
+    /// and never reach `CONTINUE_REPEAT_CAP`. A repeated identical tool
+    /// error is the same kind of non-progress as a repeated skip or
+    /// `Continue` note: the model keeps retrying a call whose result cannot
+    /// change without a different action.
     last_tool_error_key: Option<(String, String)>,
     /// How many consecutive steps have produced `last_tool_error_key`
     /// (including the one that set it, so this is always >= 1 whenever
     /// `last_tool_error_key` is `Some`). Reset to 0 alongside
-    /// `last_tool_error_key`. At `CONTINUE_REPEAT_CAP`, the step that would
-    /// make the error recur a third time parks through the mixed-shape
-    /// non-progress path instead of continuing, the same as
-    /// `skip_repeat_count` does for a skip -- see the tool-error handling
-    /// right after the repeated-skip guard in `Active::step`.
+    /// `last_tool_error_key` -- including the think exemption: a `think`
+    /// step leaves this count exactly as it was. At `CONTINUE_REPEAT_CAP`,
+    /// the step that would make the error recur a third time (thinks don't
+    /// count towards this) parks through the mixed-shape non-progress path
+    /// instead of continuing, the same as `skip_repeat_count` does for a
+    /// skip -- see the tool-error handling right after the repeated-skip
+    /// guard in `Active::step`.
     tool_error_repeat_count: u32,
     /// Mixed-shape non-progress guard (`NON_PROGRESS_CAP`): count of
     /// consecutive committed steps whose outcome was a `Continue` conversion
@@ -966,6 +1015,7 @@ impl<W> Session<W> {
                         consecutive_non_question_asks: 0,
                         last_failure_summary: None,
                         last_skip: None,
+                        last_tool_error: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -993,6 +1043,11 @@ impl<W> Session<W> {
                 // just below: a new activation starts the repeated-skip
                 // guard fresh.
                 harness.last_skip = None;
+                // Mirrors `last_tool_error_key`/`tool_error_repeat_count`'s
+                // own reset just below (unit 23 part (b)): a new activation
+                // starts the repeated-tool-error guard fresh, the same
+                // treatment `last_skip` gets just above.
+                harness.last_tool_error = None;
                 // Deliberately NOT reset here: `last_failure_summary` is a
                 // fact about the sandbox (the most recent `test` call's
                 // result), not about this activation, so it survives
@@ -2375,16 +2430,20 @@ where
                     self.restore_green_and_append(next_harness.step, &mut entries, message);
                 outcome = Outcome::Parked(Park::AskUser(message));
             }
-        } else if !tool_skipped {
+        } else if !tool_skipped && !is_think_action(&action_for_maintainer) {
             self.session.last_skip_key = None;
             self.session.skip_repeat_count = 0;
 
             // `HarnessState::last_skip`: cleared the same step `last_skip_key`
             // is, mirroring that field's own reset rule -- any committed
-            // step that is not itself a skip breaks the streak. Only
-            // touches the store when there is something to clear, avoiding
-            // an extra round-trip on the (overwhelmingly common) case where
-            // `last_skip` is already `None`.
+            // step that is not itself a skip breaks the streak, EXCEPT a
+            // `think` step (`is_think_action`, unit 23's correction): a
+            // think between two identical skips must not reset the streak,
+            // or the model can alternate skip/think forever without ever
+            // reaching `CONTINUE_REPEAT_CAP`. Only touches the store when
+            // there is something to clear, avoiding an extra round-trip on
+            // the (overwhelmingly common) case where `last_skip` is already
+            // `None`.
             let (cur_for_skip, _version) = self.session.state().await?;
             if cur_for_skip.harness.last_skip.is_some() {
                 let mut harness_for_skip = cur_for_skip.harness;
@@ -2434,6 +2493,35 @@ where
                 self.session.tool_error_repeat_count = 1;
             }
 
+            // `HarnessState::last_tool_error`: harness-owned mirror of the
+            // `last_tool_error_key`/`tool_error_repeat_count` pair just
+            // updated above (unit 23 part (b)), committed via `set_harness`
+            // the same out-of-band way `HarnessState::last_skip` is just
+            // above, so a skill's `validate` can see it
+            // (`implement_repeated_error_thinks`, `skills/src/coding/
+            // mod.rs`). `args` comes from `action_for_maintainer`, not the
+            // `tool_error` entry's own payload (which carries only `name`/
+            // `reason`) -- every `tool_error` entry is pushed from within a
+            // tool-call dispatch path, so `action_for_maintainer` is always
+            // `Action::Tool { name, args }` whenever `tool_error_entry` is
+            // `Some` here. Recorded at this step's count BEFORE the
+            // cap-park reset below (if any), exactly mirroring `last_skip`'s
+            // own timing.
+            let error_args = match &action_for_maintainer {
+                Action::Tool { args, .. } => args.clone(),
+                _ => Value::Null,
+            };
+            let (cur_for_error, _version) = self.session.state().await?;
+            let mut harness_for_error = cur_for_error.harness;
+            harness_for_error.last_tool_error = Some(crate::version::RepeatedToolError {
+                tool: tool.clone(),
+                args: error_args,
+                reason: key.1.clone(),
+                count: self.session.tool_error_repeat_count,
+                step: next_harness.step,
+            });
+            self.session.store.set_harness(harness_for_error).await?;
+
             if self.session.tool_error_repeat_count >= 2 {
                 // Second (and every later) consecutive identical error:
                 // prefix the observation so the model is told explicitly
@@ -2478,9 +2566,29 @@ where
                     CONTINUE_REPEAT_CAP,
                 );
             }
-        } else {
+        } else if !is_think_action(&action_for_maintainer) {
             self.session.last_tool_error_key = None;
             self.session.tool_error_repeat_count = 0;
+
+            // `HarnessState::last_tool_error`: cleared the same step
+            // `last_tool_error_key` is, mirroring that field's own reset
+            // rule and `HarnessState::last_skip`'s own clearing just above
+            // -- any committed step that is not itself a `tool_error`
+            // breaks the streak, EXCEPT a `think` step (`is_think_action`,
+            // unit 23's correction): a `think` between two identical errors
+            // must not clear `last_tool_error`, or the model can alternate
+            // error/think/error/think forever, since a cleared
+            // `last_tool_error` makes the next identical error look like a
+            // fresh streak (count 1) and `CONTINUE_REPEAT_CAP` never fires.
+            // Only touches the store when there is something to clear,
+            // avoiding an extra round-trip on the (overwhelmingly common)
+            // case where `last_tool_error` is already `None`.
+            let (cur_for_error, _version) = self.session.state().await?;
+            if cur_for_error.harness.last_tool_error.is_some() {
+                let mut harness_for_error = cur_for_error.harness;
+                harness_for_error.last_tool_error = None;
+                self.session.store.set_harness(harness_for_error).await?;
+            }
         }
 
         // Mixed-shape non-progress guard (`NON_PROGRESS_CAP`): unlike the
@@ -2938,11 +3046,20 @@ where
                                     .contains("test(s) were filtered out by this command");
                             // Mirrors `green_step`/`green_filtered`: the
                             // `cmd` this `test` call ran, as given in its
-                            // args, or `None` when auto-detected. Read by
-                            // the `review` skill's `validate` to rerun the
-                            // same command on a blind approval rather than
-                            // an auto-detected one.
-                            harness.last_test_cmd = extract_command(&args);
+                            // args when present, or else parsed back out of
+                            // the tool's own `command: <cmd>` first line
+                            // (`detected_test_command`) when the call was
+                            // auto-detected (`tools/src/test_tool.rs`'s
+                            // `detect_test_command`) -- unit 23: this used to
+                            // stay `None` on an auto-detected run, leaving
+                            // `execute_try_fixes`'s precondition (`Some(cmd)`
+                            // alongside `Some(failure)`) unmet even with a
+                            // genuine failing test on record. Read by the
+                            // `review` skill's `validate` to rerun the same
+                            // command on a blind approval rather than a fresh
+                            // auto-detected one.
+                            harness.last_test_cmd = extract_command(&args)
+                                .or_else(|| detected_test_command(full.as_ref()));
                             // `edits_since_test` (`core/src/version.rs`):
                             // every `test` call resets the counter, pass or
                             // fail -- this is the harness's own record of

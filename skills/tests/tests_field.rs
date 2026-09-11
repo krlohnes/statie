@@ -26,6 +26,19 @@ fn test_turn(cmd: &str) -> MockTurn {
     )
 }
 
+/// A `test {}` call with NO `cmd`/`command` argument -- the auto-detect
+/// path (`tools/src/test_tool.rs`'s `detect_test_command`), used by unit
+/// 23's `detected_command_populates_the_tests_record_cmd` below.
+fn test_turn_no_cmd() -> MockTurn {
+    MockTurn::new(
+        json!({
+            "patch": {},
+            "action": {"type": "tool", "name": "test", "args": {}},
+        })
+        .to_string(),
+    )
+}
+
 fn ask_user_turn() -> MockTurn {
     MockTurn::new(json!({"patch": {}, "action": {"type": "ask_user", "message": "?"}}).to_string())
 }
@@ -256,4 +269,43 @@ async fn tests_field_off_leaves_tests_unset_after_a_test_call() {
         state.agent.tests, None,
         "tests_field = false must leave tests unset after a test call"
     );
+}
+
+// =======================================================================
+// Unit 23 part (a): a `test {}` call with no `cmd`/`command` argument
+// (auto-detected by `tools/src/test_tool.rs`'s `detect_test_command`, here a
+// `Makefile` with a `test:` target) still writes a `tests` record whose
+// `cmd` is the detected command -- `common_after_tool` (`skills/src/coding/
+// mod.rs`) falls back to `statie_core::detected_test_command` (parsed from
+// the tool output's `command: <cmd>` first line) instead of leaving `cmd`
+// empty.
+// =======================================================================
+
+#[tokio::test]
+async fn detected_command_populates_the_tests_record_cmd() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Makefile"), "test:\n\texit 1\n").unwrap();
+
+    let turns = vec![test_turn_no_cmd(), ask_user_turn()];
+    let model = Arc::new(MockModel::new(turns));
+    let cfg = common::config(&root);
+    let (mut session, log) = common::make_file_tools_session(Arc::clone(&model), cfg);
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(skill).await.unwrap();
+
+    let outcome = run_step(&mut active, &log).await;
+    assert!(matches!(outcome, Outcome::Continue), "got {outcome:?}");
+
+    let (state, _v) = active.session().state().await.unwrap();
+    let tests = state
+        .agent
+        .tests
+        .clone()
+        .expect("an auto-detected test call must still write a tests record");
+    assert_eq!(
+        tests.cmd, "make test",
+        "the tests record's cmd must be the auto-detected command, not empty"
+    );
+    assert!(!tests.pass);
 }

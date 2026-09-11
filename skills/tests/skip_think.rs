@@ -18,6 +18,14 @@
 //! isolation, but cannot exercise `Session::with_thinker`/`execute_think` at
 //! all.
 //!
+//! Also proves the mirror-image correction unit 23 made to this guard's own
+//! reset rule: a `think` step (`is_think_action`, `core/src/session.rs`)
+//! does NOT clear `HarnessState.last_skip` or reset `skip_repeat_count` --
+//! a think between two identical skips leaves the streak exactly as it was,
+//! so a skip/think/skip/think/... cycle still reaches `CONTINUE_REPEAT_CAP`
+//! and parks (at most two thinks, three skips), instead of resetting on
+//! every think and running forever.
+//!
 //! Fixture style copied from `skills/tests/think_trigger.rs`: a
 //! `Session<CodingWorkspace>` wired with the real file tools, a scripted
 //! `MockModel`, and outcomes/log entries read straight from the
@@ -441,4 +449,124 @@ async fn a_different_read_after_a_skip_does_not_fire() {
         0,
         "the mock thinker must never have been called"
     );
+}
+
+/// Fourth test (the mirror-image bounded-sequence test unit 23's correction
+/// requires): identical skips of the SAME read, with a `think` between each
+/// pair, must still park at `CONTINUE_REPEAT_CAP` with exactly two `think`
+/// actions -- proving a `think` no longer clears `HarnessState.last_skip`/
+/// resets `skip_repeat_count` (`core/src/session.rs`'s `is_think_action`
+/// exemption), so the skip streak survives across the substituted thinks
+/// the same way the repeated-tool-error streak now does.
+///
+/// Trace: ordinary first read (step 1, no skip) -> identical repeat skipped
+/// (step 2, `last_skip` count 1) -> identical repeat again, substituted for
+/// think (step 3, `skip.step`=2 has no think yet) -> identical repeat
+/// skipped again (step 4, SAME streak now count 2, since the think at step
+/// 3 did not reset it) -> identical repeat again, substituted for think
+/// again (step 5, `skip.step` is now 4, newer than `last_think_step`=3, so
+/// the trigger fires again) -> identical repeat skipped a third time (step
+/// 6, SAME streak now count 3 = `CONTINUE_REPEAT_CAP`) -> parks. Exactly
+/// two thinks (steps 3 and 5), exactly three skips (steps 2, 4, 6).
+#[tokio::test]
+async fn skip_think_skip_think_skip_parks_at_the_cap_with_exactly_two_thinks() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "content\n").unwrap();
+
+    let turns = vec![
+        read_turn("a.txt"),
+        read_turn("a.txt"),
+        read_turn("a.txt"),
+        read_turn("a.txt"),
+        read_turn("a.txt"),
+        read_turn("a.txt"),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let thinker = Arc::new(statie_core::MockThinker::new(vec![
+        Ok(ThinkOutput::answer("first think answer")),
+        Ok(ThinkOutput::answer("second think answer")),
+    ]));
+    let (mut session, log) = make_file_tools_session(
+        Arc::clone(&model),
+        config(&root),
+        Arc::clone(&thinker) as _,
+        WorkingSetConfig::default(),
+    );
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    // Step 1: ordinary first read -- no skip.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    log.append_record(rec1).unwrap();
+    let (state1, _v) = active.session().state().await.unwrap();
+    assert_eq!(state1.harness.last_skip, None);
+
+    // Step 2: identical repeat -- skipped, count 1.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome2 = log.append_record(rec2).unwrap();
+    assert!(matches!(outcome2, Outcome::Continue), "got {outcome2:?}");
+    let (state2, _v) = active.session().state().await.unwrap();
+    assert_eq!(state2.harness.last_skip.as_ref().map(|s| s.count), Some(1));
+
+    // Step 3: substituted think (first of exactly two).
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(matches!(outcome3, Outcome::Continue), "got {outcome3:?}");
+    let (name3, _args3) = last_action(&log);
+    assert_eq!(name3, "think", "step 3 must be the first substituted think");
+    let (state3, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state3.harness.last_skip.as_ref().map(|s| s.count),
+        Some(1),
+        "the think must not reset the streak: count stays 1"
+    );
+
+    // Step 4: identical repeat skipped again -- SAME streak, count 2.
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome4 = log.append_record(rec4).unwrap();
+    assert!(matches!(outcome4, Outcome::Continue), "got {outcome4:?}");
+    let (state4, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state4.harness.last_skip.as_ref().map(|s| s.count),
+        Some(2),
+        "step 4 must advance the SAME streak to count 2, proving the think at step 3 did not \
+         reset it"
+    );
+
+    // Step 5: substituted think again (second of exactly two) -- the
+    // trigger fires because the skip's step (4) is newer than
+    // last_think_step (3).
+    let rec5 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome5 = log.append_record(rec5).unwrap();
+    assert!(matches!(outcome5, Outcome::Continue), "got {outcome5:?}");
+    let (name5, _args5) = last_action(&log);
+    assert_eq!(
+        name5, "think",
+        "step 5 must be the second substituted think (the skip's step is newer than the think \
+         step)"
+    );
+    let (state5, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state5.harness.last_skip.as_ref().map(|s| s.count),
+        Some(2),
+        "the second think must not reset the streak either: count stays 2"
+    );
+
+    // Step 6: identical repeat skipped a third time -- SAME streak reaches
+    // count 3 = CONTINUE_REPEAT_CAP, parks.
+    let rec6 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome6 = log.append_record(rec6).unwrap();
+    assert!(
+        matches!(outcome6, Outcome::Parked(_)),
+        "the third skip of the streak must park: got {outcome6:?}"
+    );
+
+    assert_eq!(
+        thinker.calls().len(),
+        2,
+        "exactly two think actions must have run across the whole bounded sequence"
+    );
+    assert_eq!(thinker.calls()[0].question, expected_question("a.txt"));
+    assert_eq!(thinker.calls()[1].question, expected_question("a.txt"));
 }

@@ -39,6 +39,7 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             consecutive_non_question_asks: 0,
             last_failure_summary: None,
             last_skip: None,
+            last_tool_error: None,
         },
         agent,
     }

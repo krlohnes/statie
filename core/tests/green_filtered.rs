@@ -487,6 +487,7 @@ fn harness_view_marks_filtered_pass() {
         consecutive_non_question_asks: 0,
         last_failure_summary: None,
         last_skip: None,
+        last_tool_error: None,
     };
 
     let view = HarnessView::new(&state);

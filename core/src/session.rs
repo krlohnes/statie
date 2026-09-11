@@ -74,6 +74,13 @@ const READ_GUARD_THRESHOLD: u32 = 4;
 /// the harness commits the patch as usual but parks on `Park::AskUser`
 /// instead of returning `Outcome::Continue`, so a human (or the TUI/headless
 /// driver) breaks the loop instead of the model repeating itself forever.
+/// Also caps `Session::skip_repeat_count` (the same treatment for a
+/// repeated `skipped_redundant` call) and `Session::tool_error_repeat_count`
+/// (the same treatment for a repeated identical `tool_error`, identity
+/// `(tool name, reason string)`) -- the tool-error guard parks through the
+/// mixed-shape non-progress guard's own path (`park_non_progress_cap`)
+/// rather than a bespoke message, but still fires at this cap, not
+/// `NON_PROGRESS_CAP`.
 const CONTINUE_REPEAT_CAP: u32 = 3;
 
 /// How many consecutive non-progress steps of ANY shape may commit before
@@ -642,7 +649,16 @@ pub struct Session<W> {
     /// `None` before any failing `test` call has run since activation, and
     /// cleared back to `None` whenever a `test` call passes -- a pass means
     /// there is nothing to compare the next failure against. Reset to
-    /// `None` on `activate`/`activate_forced`.
+    /// `None` on `activate`/`activate_forced`, because this copy only backs
+    /// `repeated_failure_count` (a per-activation streak counter) and the
+    /// repeated-failure prefix/log entry -- unlike the harness-owned,
+    /// persisted `HarnessState::last_failure_summary` it is mirrored into
+    /// (capped at 600 characters) at the same `test` call site, which is a
+    /// fact about the sandbox and deliberately does NOT reset on
+    /// activation. The two are allowed to diverge across a re-activation
+    /// for exactly this reason -- `execute_try_fixes` reads the harness
+    /// copy, not this one, precisely so it survives a re-activation. See
+    /// `HarnessState::last_failure_summary`'s doc.
     last_test_failure: Option<String>,
     /// How many consecutive failing `test` calls (including the current
     /// one) have shared `last_test_failure`'s summary. 0 when
@@ -694,6 +710,28 @@ pub struct Session<W> {
     /// third time parks instead of continuing (`Active::execute`'s skip
     /// handling), the same as `continue_repeat_count` does for `Continue`.
     skip_repeat_count: u32,
+    /// Repeated-tool-error guard: the `(tool name, reason string)` (the
+    /// same pair a `tool_error` System entry's payload carries, see the
+    /// generic tool-execution error path in `execute`) of the most recent
+    /// `tool_error` step, kept so the next tool error can tell whether it
+    /// is the SAME error recurring. `None` initially, on activation, and
+    /// after any step that is not itself an identical tool error -- i.e. a
+    /// successful tool call, a different tool error, a rejection, or any
+    /// other outcome breaks the streak, the same as `last_skip_key` does
+    /// for a skip. A repeated identical tool error is the same kind of
+    /// non-progress as a repeated skip or `Continue` note: the model keeps
+    /// retrying a call whose result cannot change without a different
+    /// action.
+    last_tool_error_key: Option<(String, String)>,
+    /// How many consecutive steps have produced `last_tool_error_key`
+    /// (including the one that set it, so this is always >= 1 whenever
+    /// `last_tool_error_key` is `Some`). Reset to 0 alongside
+    /// `last_tool_error_key`. At `CONTINUE_REPEAT_CAP`, the step that would
+    /// make the error recur a third time parks through the mixed-shape
+    /// non-progress path instead of continuing, the same as
+    /// `skip_repeat_count` does for a skip -- see the tool-error handling
+    /// right after the repeated-skip guard in `Active::step`.
+    tool_error_repeat_count: u32,
     /// Mixed-shape non-progress guard (`NON_PROGRESS_CAP`): count of
     /// consecutive committed steps whose outcome was a `Continue` conversion
     /// OR a skipped-redundant call, regardless of whether consecutive
@@ -765,6 +803,8 @@ impl<W> Session<W> {
             continue_repeat_count: 0,
             last_skip_key: None,
             skip_repeat_count: 0,
+            last_tool_error_key: None,
+            tool_error_repeat_count: 0,
             non_progress_count: 0,
             non_progress_shapes: Vec::new(),
         }
@@ -953,6 +993,19 @@ impl<W> Session<W> {
                 // just below: a new activation starts the repeated-skip
                 // guard fresh.
                 harness.last_skip = None;
+                // Deliberately NOT reset here: `last_failure_summary` is a
+                // fact about the sandbox (the most recent `test` call's
+                // result), not about this activation, so it survives
+                // `activate`/`activate_forced` the same way `last_test_cmd`
+                // does just above -- a re-activation must not erase the
+                // record of a still-unresolved failing test, or
+                // `execute_try_fixes`'s harness-owned "no failing test on
+                // record" check would wrongly refuse every `try_fixes` call
+                // made right after a re-activation with no intervening
+                // `test`. See that field's doc (`core/src/version.rs`) and
+                // `last_test_failure`'s doc just below for the session-local
+                // copy, which DOES reset per-activation because it only
+                // drives the repeated-failure counter, not this check.
                 self.store.set_harness(harness).await?;
             }
         }
@@ -968,6 +1021,8 @@ impl<W> Session<W> {
         self.continue_repeat_count = 0;
         self.last_skip_key = None;
         self.skip_repeat_count = 0;
+        self.last_tool_error_key = None;
+        self.tool_error_repeat_count = 0;
         self.non_progress_count = 0;
         self.non_progress_shapes.clear();
 
@@ -1351,6 +1406,54 @@ where
         };
         entries.push(entry);
         format!("{message} {sentence}")
+    }
+
+    /// Mixed-shape non-progress guard's park path (`NON_PROGRESS_CAP`'s own
+    /// block, immediately below in `step`, and the repeated-tool-error
+    /// guard, which reaches the same park path early via
+    /// `CONTINUE_REPEAT_CAP` whenever the SAME tool error recurs that many
+    /// times): joins `self.session.non_progress_shapes` (already carrying
+    /// this step's own shape, pushed by the caller before calling this),
+    /// resets both non-progress-streak fields, logs the `non_progress_cap`
+    /// System entry with the joined shapes, and returns the
+    /// `Park::AskUser` message built from `pending_observation` plus the
+    /// standard non-progress sentence -- restoring the green checkpoint
+    /// into the message the same way every other park path here does.
+    /// `count` is the number of steps being reported (the cap that was
+    /// just reached: `NON_PROGRESS_CAP` for the mixed-shape guard,
+    /// `CONTINUE_REPEAT_CAP` for an early tool-error-repeat park), so the
+    /// message always states how many steps actually preceded it rather
+    /// than a constant that may not match `shapes`. Factored out so the
+    /// two callers produce byte-identical log entries/message shapes
+    /// rather than two near-duplicate copies of this formatting.
+    fn park_non_progress_cap(
+        &mut self,
+        step: u64,
+        entries: &mut Vec<LogEntry>,
+        count: u32,
+    ) -> Outcome {
+        let shapes = self.session.non_progress_shapes.join(", ");
+        self.session.non_progress_count = 0;
+        self.session.non_progress_shapes.clear();
+
+        entries.push(system_entry(
+            step,
+            "non_progress_cap",
+            serde_json::json!({"shapes": shapes}),
+        ));
+
+        let base = self
+            .session
+            .pending_observation
+            .as_ref()
+            .map(|o| o.as_str().to_string())
+            .unwrap_or_default();
+        let message = format!(
+            "{base}\n\nThe model has sent {count} steps in a row without progress ({shapes}). \
+             Reply with what it should do next."
+        );
+        let message = self.restore_green_and_append(step, entries, message);
+        Outcome::Parked(Park::AskUser(message))
     }
 
     /// Green checkpoint, for callers that park outside `Active::step` (the
@@ -2290,6 +2393,96 @@ where
             }
         }
 
+        // Repeated-tool-error guard (`CONTINUE_REPEAT_CAP`, the same
+        // treatment the repeated-skip guard just above gets): a `tool_error`
+        // step (the generic tool-execution error path in `execute`, or the
+        // `think`/`try_fixes` interceptions' own invalid-argument/no-
+        // failing-test tool errors -- any `tool_error` System entry this
+        // step produced) is the same kind of non-progress as a repeated skip
+        // or `Continue` note: the model keeps retrying a call whose result
+        // cannot change without a different action. Identity is `(tool
+        // name, reason string)`, read back from the `tool_error` entry's own
+        // payload (not from `action_for_maintainer`'s args, which for a
+        // rejected-arguments error may differ call to call while the error
+        // itself repeats, e.g. `think` with a slightly different empty
+        // question each time still reports the same reason). Any other
+        // committed step (a successful tool call, a DIFFERENT tool error, a
+        // skip, or a `Continue` conversion) resets the streak, the same as
+        // a different skip would for `last_skip_key`.
+        let tool_error_entry = entries.iter().find(|e| {
+            e.kind == LogKind::System
+                && e.payload.get("event").and_then(Value::as_str) == Some("tool_error")
+        });
+        if let Some(e) = tool_error_entry {
+            let tool = e
+                .payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let reason = e
+                .payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let key = (tool.clone(), reason);
+            if self.session.last_tool_error_key.as_ref() == Some(&key) {
+                self.session.tool_error_repeat_count += 1;
+            } else {
+                self.session.last_tool_error_key = Some(key.clone());
+                self.session.tool_error_repeat_count = 1;
+            }
+
+            if self.session.tool_error_repeat_count >= 2 {
+                // Second (and every later) consecutive identical error:
+                // prefix the observation so the model is told explicitly
+                // that repeating the call will not change the outcome --
+                // mirrors the loop guard's own prefix placement (prepended,
+                // so it survives `truncate_with_report`'s budget clamp on a
+                // long error message).
+                if let Some(obs) = self.session.pending_observation.take() {
+                    let text = format!(
+                        "[harness] This is the same `{tool}` error as the previous step; \
+                         repeating the call will not change it.\n\n{}",
+                        obs.as_str()
+                    );
+                    let (new_obs, _overflow) = Observation::truncate_with_report(
+                        &crate::promptable::ToolOutputFull::new(text),
+                        self.session.config.budgets.observation,
+                        self.session.tokenizer.as_ref(),
+                    );
+                    self.session.pending_observation = Some(new_obs);
+                }
+            }
+
+            if self.session.tool_error_repeat_count >= CONTINUE_REPEAT_CAP {
+                // Reset so a resumed session starts this streak fresh,
+                // mirroring the repeated-skip guard's own cap reset.
+                self.session.last_tool_error_key = None;
+                self.session.tool_error_repeat_count = 0;
+
+                // Parks through the mixed-shape non-progress guard's own
+                // park path (see `park_non_progress_cap`) rather than a
+                // bespoke message: this streak never touched
+                // `non_progress_count`/`non_progress_shapes` (a `tool_error`
+                // step is neither a `Continue` conversion nor a skip, so the
+                // mixed-shape guard below would otherwise reset the streak
+                // on this very step), so push this step's own shape first.
+                self.session
+                    .non_progress_shapes
+                    .push(format!("repeated tool error: {tool}"));
+                outcome = self.park_non_progress_cap(
+                    next_harness.step,
+                    &mut entries,
+                    CONTINUE_REPEAT_CAP,
+                );
+            }
+        } else {
+            self.session.last_tool_error_key = None;
+            self.session.tool_error_repeat_count = 0;
+        }
+
         // Mixed-shape non-progress guard (`NON_PROGRESS_CAP`): unlike the
         // two guards just above, which only catch a streak of the SAME
         // shape recurring, this one catches ANY run of non-progress steps
@@ -2313,29 +2506,11 @@ where
                     .push(non_progress_shape(tool_skipped, &action_for_maintainer));
 
                 if self.session.non_progress_count >= NON_PROGRESS_CAP {
-                    let shapes = self.session.non_progress_shapes.join(", ");
-                    self.session.non_progress_count = 0;
-                    self.session.non_progress_shapes.clear();
-
-                    entries.push(system_entry(
+                    outcome = self.park_non_progress_cap(
                         next_harness.step,
-                        "non_progress_cap",
-                        serde_json::json!({"shapes": shapes}),
-                    ));
-
-                    let base = self
-                        .session
-                        .pending_observation
-                        .as_ref()
-                        .map(|o| o.as_str().to_string())
-                        .unwrap_or_default();
-                    let message = format!(
-                        "{base}\n\nThe model has sent {NON_PROGRESS_CAP} steps in a row \
-                         without progress ({shapes}). Reply with what it should do next."
+                        &mut entries,
+                        NON_PROGRESS_CAP,
                     );
-                    let message =
-                        self.restore_green_and_append(next_harness.step, &mut entries, message);
-                    outcome = Outcome::Parked(Park::AskUser(message));
                 }
             } else {
                 self.session.non_progress_count = 0;
@@ -3465,9 +3640,10 @@ where
     ///
     /// No fixer attached: the same unconfigured-observation shape
     /// `execute_think` produces without a thinker (see that function).
-    /// No failing test on record (`self.session.last_test_failure` is
-    /// `None`): a tool-error observation, the fixer never called. Otherwise
-    /// builds a `FixInput` from the current step's own prompt (mirroring
+    /// No failing test on record (`cur.harness.last_failure_summary` is
+    /// `None`, the harness-owned persisted mirror -- see that field's doc):
+    /// a tool-error observation, the fixer never called. Otherwise builds a
+    /// `FixInput` from the current step's own prompt (mirroring
     /// `execute_think`) and the normalised failure summary already kept by
     /// the repeated-failure bookkeeping, calls `fixer.propose`, then
     /// verifies each candidate in its own worktree via `candidate_runner`
@@ -3512,13 +3688,18 @@ where
         };
 
         // No failing test on record: no `last_test_cmd` at all, or the most
-        // recent `test` call passed (`last_test_failure` is `None` before
-        // any failing `test` call this activation, and cleared back to
-        // `None` on a pass -- see that field's doc). Either way there is
-        // nothing to fix.
+        // recent `test` call passed (`harness.last_failure_summary` is
+        // `None` before any failing `test` call this activation, and
+        // cleared back to `None` on a pass -- see that field's doc, and
+        // `last_test_failure`'s doc for the in-memory copy it mirrors).
+        // Read from the harness-owned, persisted mirror rather than the
+        // session-local `last_test_failure` so this check (and the fixer
+        // input built from it) survives a handoff/re-activation that resets
+        // the session-local copy but not the harness state -- see
+        // `last_test_failure`'s doc for why the two can diverge.
         let (cur, _version) = self.session.state().await?;
         let last_test_cmd = cur.harness.last_test_cmd.clone();
-        let failure = self.session.last_test_failure.clone();
+        let failure = cur.harness.last_failure_summary.clone();
         let (Some(cmd), Some(failure)) = (last_test_cmd, failure) else {
             entries.push(system_entry(
                 step,
@@ -3960,6 +4141,13 @@ where
         // skip handling in `execute`.
         self.session.last_skip_key = None;
         self.session.skip_repeat_count = 0;
+
+        // Same reset for the repeated-tool-error guard (see
+        // `last_tool_error_key`): a rejection is not a repeat of a tool
+        // error either, and never reaches the tool-error handling in
+        // `execute`.
+        self.session.last_tool_error_key = None;
+        self.session.tool_error_repeat_count = 0;
 
         // Same reset for the mixed-shape non-progress guard
         // (`NON_PROGRESS_CAP`): a rejected step never committed, so it is

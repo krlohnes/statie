@@ -157,13 +157,25 @@ where
 
 struct ScriptedModel {
     turns: Mutex<Vec<String>>,
+    // Every prompt's user text this model has been asked to complete, in
+    // call order -- additive to the original fixture (unit 22 part (b))
+    // so the repeated-tool-error guard's prefix text can be asserted
+    // directly from the NEXT prompt, the same way `core/tests/
+    // try_fixes.rs`'s `ScriptedModel::prompts()` does. Unused by (and
+    // harmless to) every test that doesn't call `prompts()`.
+    prompts: Mutex<Vec<String>>,
 }
 
 impl ScriptedModel {
     fn new(turns: Vec<Value>) -> Arc<ScriptedModel> {
         Arc::new(ScriptedModel {
             turns: Mutex::new(turns.into_iter().map(|v| v.to_string()).collect()),
+            prompts: Mutex::new(Vec::new()),
         })
+    }
+
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
     }
 }
 
@@ -184,6 +196,7 @@ impl Model for ScriptedModel {
         _sink: &mut dyn StepSink,
         _cancel: CancellationToken,
     ) -> Result<RawOutput, ModelError> {
+        self.prompts.lock().unwrap().push(prompt.user().to_string());
         let mut turns = self.turns.lock().unwrap();
         if turns.is_empty() {
             return Err(ModelError::Backend("script exhausted".to_string()));
@@ -276,7 +289,11 @@ impl Skill for NonProgressSkill {
     }
 
     fn tools(&self) -> Vec<String> {
-        vec!["shell".to_string(), "edit_file".to_string()]
+        vec![
+            "shell".to_string(),
+            "edit_file".to_string(),
+            "lint".to_string(),
+        ]
     }
 
     fn is_terminal(&self, s: &Workspace) -> bool {
@@ -387,15 +404,48 @@ impl Tool for NoopEditFile {
     }
 }
 
+/// A tool that always errors with the SAME `ExecutionFailed` reason,
+/// regardless of its arguments -- used to drive the repeated-tool-error
+/// guard's identical-error streak without depending on a specific tool's
+/// argument-validation wording (unit 22 part (b)).
+struct AlwaysErrorsTool;
+
+#[async_trait]
+impl Tool for AlwaysErrorsTool {
+    fn name(&self) -> &str {
+        "lint"
+    }
+    fn description(&self) -> &str {
+        "always fails, for the repeated-tool-error guard tests"
+    }
+    fn args_schema(&self) -> Schema {
+        Schema::of::<Value>()
+    }
+    async fn call(
+        &self,
+        _args: Value,
+        _ctx: &ToolCtx,
+    ) -> Result<statie_core::ToolOutputFull, statie_core::ToolError> {
+        Err(statie_core::ToolError::ExecutionFailed(
+            "lint config not found".to_string(),
+        ))
+    }
+}
+
 fn tool_set(shell_calls: Arc<AtomicU64>) -> ToolSet {
     let mut tools = ToolSet::new();
     tools.register(Arc::new(CountingShell { calls: shell_calls }));
     tools.register(Arc::new(NoopEditFile));
+    tools.register(Arc::new(AlwaysErrorsTool));
     tools
 }
 
 fn shell_action(cmd: &str) -> Value {
     serde_json::json!({"type": "tool", "name": "shell", "args": {"cmd": cmd}})
+}
+
+fn lint_action() -> Value {
+    serde_json::json!({"type": "tool", "name": "lint", "args": {}})
 }
 
 fn edit_action() -> Value {
@@ -608,6 +658,180 @@ async fn an_executed_tool_call_midway_resets_the_count_so_no_park_at_six() {
             matches!(outcome, Outcome::Continue),
             "step {i}: got {outcome:?}; the executed edit_file call at step 4 must reset the \
              non-progress streak so 6 consecutive non-progress steps never accumulate"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Unit 22 part (b): the repeated-tool-error guard. Identity is `(tool
+// name, reason string)`, read from the `tool_error` System entry's own
+// payload. At the second identical error, the observation is prefixed with
+// "[harness] This is the same `{tool}` error as the previous step;
+// repeating the call will not change it." At `CONTINUE_REPEAT_CAP` (3), the
+// step parks through the mixed-shape non-progress guard's own park path: a
+// `non_progress_cap` System entry, with a shape string
+// "repeated tool error: {tool}" naming the tool.
+// ---------------------------------------------------------------------
+
+/// Three consecutive identical `lint` tool errors (same `(tool, reason)`
+/// pair every time, since `AlwaysErrorsTool` always fails the same way)
+/// park at the third: a `non_progress_cap` System entry is logged, its
+/// `shapes` payload names the tool, and the park message says so too.
+#[tokio::test]
+async fn three_consecutive_identical_tool_errors_park_at_the_third() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let shell_calls = Arc::new(AtomicU64::new(0));
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), lint_action()),
+        step_output(serde_json::json!({}), lint_action()),
+        step_output(serde_json::json!({}), lint_action()),
+    ]);
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        tool_set(Arc::clone(&shell_calls)),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+
+    let skill = Arc::new(NonProgressSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let mut outcomes = Vec::new();
+    let mut cap_shapes: Vec<Option<String>> = Vec::new();
+    for _ in 0..3 {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        cap_shapes.push(non_progress_cap_shapes(&rec));
+        let outcome = SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+        outcomes.push(outcome);
+    }
+
+    // Steps 0 and 1: ordinary tool-error `Continue` outcomes (the cap has
+    // not been reached yet).
+    for (i, outcome) in outcomes.iter().enumerate().take(2) {
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "step {i}: got {outcome:?}; the first two identical tool errors must not park"
+        );
+    }
+
+    // `prompts[0]` is built before anything ran (no observation yet).
+    // `prompts[1]` is built right after step 0's FIRST lint error (repeat
+    // count 1, no prefix yet). `prompts[2]` is built right after step 1's
+    // SECOND identical lint error (repeat count 2), and must carry the
+    // "[harness] This is the same ... error" prefix line, verbatim.
+    let prompts = model.prompts();
+    assert!(
+        prompts.len() >= 3,
+        "expected at least 3 prompts (one per step run, plus the initial one): {}",
+        prompts.len()
+    );
+    assert!(
+        !prompts[1].contains("This is the same `lint` error"),
+        "prompts[1] (right after the FIRST lint error) must not carry the repeated-error \
+         prefix yet:\n{}",
+        prompts[1]
+    );
+    assert!(
+        prompts[2].contains(
+            "[harness] This is the same `lint` error as the previous step; repeating the call \
+             will not change it."
+        ),
+        "prompts[2] (right after the SECOND identical lint error) should carry the \
+         repeated-tool-error prefix line verbatim:\n{}",
+        prompts[2]
+    );
+
+    // Step 2 (the third identical error): parks, with a non_progress_cap
+    // log entry whose shapes name the tool.
+    let shapes = cap_shapes[2]
+        .as_ref()
+        .expect("step 2 should log a non_progress_cap System entry with a shapes string");
+    assert_eq!(
+        shapes, "repeated tool error: lint",
+        "the shape must name the tool exactly as the spec's example does"
+    );
+    match &outcomes[2] {
+        Outcome::Parked(Park::AskUser(msg)) => {
+            assert!(
+                msg.contains("3 steps in a row without progress"),
+                "park message should say 3 steps in a row without progress: {msg}"
+            );
+            assert!(
+                msg.contains("repeated tool error: lint"),
+                "park message should contain the shape: {msg}"
+            );
+            assert!(
+                msg.contains("Reply with what it should do next."),
+                "park message should end with the standard reply prompt: {msg}"
+            );
+        }
+        other => panic!("step 2: expected Parked(AskUser(_)), got {other:?}"),
+    }
+
+    // No non_progress_cap entry at steps 0 or 1.
+    assert!(
+        cap_shapes[0].is_none(),
+        "step 0 must not log non_progress_cap"
+    );
+    assert!(
+        cap_shapes[1].is_none(),
+        "step 1 must not log non_progress_cap"
+    );
+}
+
+/// Two identical `lint` tool errors separated by a successful `shell` call
+/// do not park: the intervening success breaks the streak, the same as
+/// `last_skip_key`'s own reset rule.
+#[tokio::test]
+async fn two_identical_tool_errors_separated_by_a_success_do_not_park() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let shell_calls = Arc::new(AtomicU64::new(0));
+
+    let model = ScriptedModel::new(vec![
+        // Step 0: lint error #1.
+        step_output(serde_json::json!({}), lint_action()),
+        // Step 1: a successful shell call breaks the streak.
+        step_output(serde_json::json!({}), shell_action("cargo test")),
+        // Step 2: lint error again (streak restarted at 1, not 2).
+        step_output(serde_json::json!({}), lint_action()),
+    ]);
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        tool_set(Arc::clone(&shell_calls)),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+
+    let skill = Arc::new(NonProgressSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        let is_cap = has_event(&rec, "non_progress_cap");
+        let outcome = SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+        outcomes.push((outcome, is_cap));
+    }
+
+    for (i, (outcome, is_cap)) in outcomes.iter().enumerate() {
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "step {i}: got {outcome:?}; two identical tool errors separated by a success must \
+             not park"
+        );
+        assert!(
+            !is_cap,
+            "step {i}: must not log non_progress_cap when the identical-error streak never \
+             reaches the cap"
         );
     }
 }

@@ -184,14 +184,24 @@ pub struct HarnessState {
     /// `normalize_failure_summary`) of the most recent FAILING `test` call,
     /// capped at 600 characters. Set at the same `test` call site as
     /// `repeated_failure_step`: `Some(summary)` on a fail, cleared back to
-    /// `None` on a pass. Harness-owned: patches cannot touch it. Read by the
-    /// coding skills' `implement_repeat_failure_thinks` (`skills/src/
-    /// coding/mod.rs`) via `classify_failure`/`repeat_failure_question` to
-    /// shape the substituted `think` question to the kind of failure
-    /// (compile error, assertion, panic, timeout) instead of asking every
-    /// repeat the same arithmetic-trace question (DECISIONS.md D9,
-    /// BACKLOG.md item 18). `#[serde(default)]` so state persisted before
-    /// this field existed still deserializes.
+    /// `None` on a pass. This is a fact about the sandbox, not about the
+    /// current activation, so it deliberately survives `activate`/
+    /// `activate_forced` (both branches of `activate_inner`) -- unlike
+    /// `Session::last_test_failure`, which DOES reset every activation
+    /// because it only backs the repeated-failure counter. The two are
+    /// allowed to diverge across a re-activation for exactly this reason;
+    /// see `last_test_failure`'s doc. Harness-owned: patches cannot touch
+    /// it. Read by `execute_try_fixes`
+    /// (`core/src/session.rs`) as the source of truth for both the "no
+    /// failing test on record" check and the `FixInput.failure` text handed
+    /// to the fixer, and by the coding skills'
+    /// `implement_repeat_failure_thinks` (`skills/src/coding/mod.rs`) via
+    /// `classify_failure`/`repeat_failure_question` to shape the
+    /// substituted `think` question to the kind of failure (compile error,
+    /// assertion, panic, timeout) instead of asking every repeat the same
+    /// arithmetic-trace question (DECISIONS.md D9, BACKLOG.md item 18).
+    /// `#[serde(default)]` so state persisted before this field existed
+    /// still deserializes.
     #[serde(default)]
     pub last_failure_summary: Option<String>,
     /// Mirrors `Session::last_skip_key`/`skip_repeat_count`

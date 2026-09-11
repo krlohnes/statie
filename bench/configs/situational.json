@@ -1,0 +1,45 @@
+{
+  "model": {
+    "backend": "ollama",
+    "base_url": "http://192.168.1.222:11434",
+    "model": "gemma4:26b",
+    "think": false,
+    "num_ctx": 16384,
+    "format": "schema",
+    "timeout_secs": 1200,
+    "options": {
+      "temperature": 0.3
+    }
+  },
+  "budget": {
+    "total": 14000,
+    "observation": 2000,
+    "augmentation": 1000,
+    "working_set": 6000
+  },
+  "tools": {
+    "shell_timeout_secs": 600
+  },
+  "max_autonomous_steps": 160,
+  "maintainer": {
+    "budget": 400,
+    "timeout_secs": 300,
+    "prompt_budget": 4000
+  },
+  "working_set": {
+    "max_windows": 4,
+    "recent_calls": 6
+  },
+  "guards": {
+    "commitment_read_cap": false,
+    "situational_rules": true
+  },
+  "thinker": {
+    "timeout_secs": 600,
+    "listed": true
+  },
+  "fixer": {
+    "timeout_secs": 600,
+    "k": 3
+  }
+}

@@ -1614,6 +1614,23 @@ shared `park_non_progress_cap` with the shape "repeated tool error:
 never-tested, and the passed-since cases; `core/tests/non_progress.rs`
 covers the cap and the reset.
 
+## Milestone 31: the detected test command is recorded; a repeated failing call becomes a `think` (BACKLOG.md item 23)
+
+`detected_test_command` parses the `command: <cmd>` first line the
+`test` tool prints, so `HarnessState.last_test_cmd` and the `tests`
+record's `cmd` are filled after `test {}` with an auto-detected command,
+and `try_fixes` has a command to verify candidates with.
+`HarnessState.last_tool_error: Option<RepeatedToolError { tool, args,
+reason, count, step }>` mirrors the identical-error streak the way
+`last_skip` mirrors the skip streak; `implement_repeated_error_thinks`
+substitutes `think` with `REPEATED_ERROR_QUESTION` (the error quoted,
+a different exact action asked for) when the model re-issues the same
+call with the same arguments after it errored and no `think` has run
+since. A `think` step does not break either streak (`is_think_action`),
+so a model that ignores the answer gets at most two thinks and three
+errors (or skips) before the core cap parks the run;
+`skills/tests/error_think.rs` and `skip_think.rs` pin that bound.
+
 ## Testing conventions
 
 - Unit tests live beside code (`#[cfg(test)]`). Integration tests in `<crate>/tests/`.

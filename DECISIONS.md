@@ -348,3 +348,27 @@ holds the resulting design; this file holds why.
 - **Check.** If a later battery shows the maintainer's notes crowding
   out the working set at peak (mean peak prompt rises with the budget,
   which the 800 row hints at: 8627 against 7857), revisit 200.
+
+## D18. One integration test binary per crate
+- **Decision.** Each crate's integration tests move from one file per
+  binary (`tests/<name>.rs`) to one binary per crate: `tests/it/main.rs`
+  declaring `mod <name>;` for every former file, now at
+  `tests/it/<name>.rs`, with the shared `tests/common/mod.rs` helpers
+  moved alongside. Nothing asserted changes; test names gain the module
+  prefix, and the targeted command becomes
+  `cargo test -p <crate> --test it <module>::`. Done crate by crate,
+  largest first (skills 32 files, core 23, tools 15, cli 8, models 6,
+  augment 2, tui 1), each gated before the next.
+- **Why.** The gate launched about 103 binaries for under five minutes
+  of test CPU: 87 integration files, nine unit binaries, doctests. The
+  cost is per binary (link, then the Gatekeeper wait before the first
+  instruction, D7), so the count is the lever. The user's question was
+  why so many, and the answer was that nobody had chosen the layout.
+  About 16 binaries is a six-fold cut whatever the vetting does.
+- **Check.** Gate wall clock before and after on the same machine
+  state; the count of `Running` lines in the gate log.
+- **Addendum (gate 11).** With the terminal's host app granted the
+  Developer Tools permission part way through the run, gate 11 took 93
+  minutes for 103 binaries against about three hours before: 23
+  binaries in the first 43 minutes, then 24 in the next ten. The
+  per-binary wait is smaller, not gone. D18 attacks the count.

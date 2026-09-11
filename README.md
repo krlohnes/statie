@@ -1502,6 +1502,16 @@ either a default or a config knob:
   ends at three. With the maintainer off the runs take a third more
   steps for the same landing, the same shape as the model-owned arm.
 
+- **Fixer arm on build 10 (items 20 and 22 in).** `try_fixes` errors
+  fell from 145 to 9 and the fixer ran five times, but landing fell
+  from 20 to 17 of 26: the new identical-error cap parked eight runs
+  at the third repeat, five of them on `edit_file` refusals the model
+  kept re-issuing, three on `try_fixes` refused because `test {}` with
+  an auto-detected command records no `last_test_cmd`. The cap works as
+  written and is the wrong response at the second strike: the skip
+  guard gives a `think` there (item 21), the error guard only a prefix
+  line (backlog item 23).
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

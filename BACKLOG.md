@@ -280,7 +280,7 @@ moves the metric it was built for. Ordered within each tier.
   repeated-skip cap across the battery.
 
 ### 22. `try_fixes` reads the harness-owned failure; identical tool errors are capped
-- **Status.** Built (Milestone 30); in the tenth gate. First cut rejected: it cleared the mirror on re-activation and re-ran `test` in its own test, the very loop it was meant to end. Found in `arm_harness_max_b5`: `rename_across_files` seed 2 called `try_fixes` 145 times after a failing `test`, each refused with "no failing test to fix", no park.
+- **Status.** Committed (a39f147; Milestone 30). Measured (`arm_harness_max_b6`): `try_fixes` errors 145 to 9, fixer invoked 5 times; the identical-error cap parked 8 runs (landing 17/26 against 20/26), see item 23. First cut rejected: it cleared the mirror on re-activation and re-ran `test` in its own test, the very loop it was meant to end. Found in `arm_harness_max_b5`: `rename_across_files` seed 2 called `try_fixes` 145 times after a failing `test`, each refused with "no failing test to fix", no park.
 - **What.** Two parts. (a) `execute_try_fixes` decides whether there is a
   failure from `HarnessState.last_failure_summary` and `last_test_cmd`
   (persisted, mirrored from the session field) instead of the
@@ -297,6 +297,33 @@ moves the metric it was built for. Ordered within each tier.
   counted.
 - **Measure.** `try_fixes` errors on the fixer arm; longest identical
   tool-error streak across the battery.
+
+### 23. The detected test command is recorded; a repeated failing call becomes a `think`
+- **Status.** Built (Milestone 31); in the eleventh gate. First cut let a `think` step reset the streak, so error, think, error, think could cycle; corrected so a think keeps the count and the cap bounds it. Found in `arm_harness_max_b6`: three runs refused `try_fixes` after `test {}` because the auto-detected command was never recorded; five runs parked at the third identical `edit_file` error.
+- **What.** (a) When `test` runs with no `cmd`, the harness records the
+  command the tool detected (the tool prints it as its first line) in
+  `HarnessState.last_test_cmd` and in the `tests` record, so a failure
+  after `test {}` is a failure `try_fixes` can work from. (b) The
+  harness records the last tool error (tool, args, reason, count, step)
+  in `HarnessState`, and `implement` substitutes `think` when the model
+  re-issues the same tool call with the same arguments after it errored,
+  with a question that quotes the error and asks for a different exact
+  action. The core cap at three stays as the backstop.
+- **Why.** The same two shapes as items 19 to 22: a harness record that
+  was incomplete, and a repeat the harness answered with a refusal
+  where a question would have moved the run. Eight of build 10's nine
+  fixer-arm misses were these.
+- **Measure.** Fixer arm: `try_fixes` refusals after `test {}`; parks by
+  the identical-error cap; landing.
+
+### 24. One integration test binary per crate
+- **Status.** In progress (D18): skills first, then core, tools, cli, models, augment, tui.
+- **What.** `tests/it/main.rs` per crate declaring the former files as
+  modules; the same tests, one binary. Targeted runs become
+  `cargo test -p <crate> --test it <module>::`.
+- **Why.** The gate launched about 103 binaries for five minutes of
+  test CPU; the per-binary link and Gatekeeper wait were the whole cost.
+- **Measure.** Gate wall clock and `Running` lines before and after.
 
 ## P2: worth doing, weaker or narrower evidence
 

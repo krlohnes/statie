@@ -1528,7 +1528,7 @@ exactly. Measured as false send-backs on the battery.
 
 ## Milestone 25: `thinker.listed` (BACKLOG.md item 14)
 
-`thinker.listed` (default true) threads from config through
+`thinker.listed` (default false since D16; true in the arm configs that measured it) threads from config through
 `CodingRegistry::with_guards_and_listed` to `with_listed` on the plan,
 implement, and review skills; when false, `tools()` omits `think` so the
 prompt never offers it. The harness substitutions still construct
@@ -1568,6 +1568,34 @@ log gets a `reread_evicted` system entry naming the earlier step; a
 repeat whose window is still rendered is refused as before, with the
 paged-read branch untouched. With windows off the guard is unchanged.
 `core/tests/evicted_reread.rs` pins all three cases.
+
+## Milestone 28: `try_fixes` needs a failure to work from (BACKLOG.md item 20)
+
+`Skill::tools()` is static, so the gate lives in `ImplementSkill::validate`:
+`implement_try_fixes_needs_failing_test` runs before the repeated-failure
+trigger and, when the action is `try_fixes` and the workspace's `tests`
+record is absent or passing, substitutes `test {}` through
+`substitute_action` with the note "`try_fixes` needs a failing test to
+work from, so the harness ran `test` instead." No tool error is logged.
+The implement rules gain one bullet saying `try_fixes` is only useful
+after a failing `test`. With a failing record the call passes through
+unchanged. `skills/tests/try_fixes_gate.rs` drives all three cases
+through a real session.
+
+## Milestone 29: a second refused re-read becomes a `think` (BACKLOG.md item 21)
+
+The repeated-skip guard now also writes `HarnessState.last_skip:
+Option<SkippedRead { tool, key, count, step }>` on every
+`skipped_redundant` step and clears it on any executed step or a new
+activation, so the skill layer can see the streak the core sees.
+`implement_repeated_skip_thinks` (after the `try_fixes` gate, before the
+repeated-failure trigger) fires when a `read_file`, `search`, or
+`list_files` call has the same `read_call_key` as `last_skip` and no
+`think` has run since: it substitutes `think` with
+`REPEATED_SKIP_QUESTION`, which names the path and asks for the exact
+next edit or a different file and why. `read_call_key` is public so both
+layers compute the same key. The core's third-strike park stays as the
+backstop. `skills/tests/skip_think.rs` drives the three cases.
 
 ## Testing conventions
 

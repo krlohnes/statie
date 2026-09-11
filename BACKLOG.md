@@ -114,7 +114,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing.
 
 ### 7. Trace by execution
-- **Status.** Built as the general `probe` tool (D11; patch in .claude/item7.diff, on top of item 15). Second trap task `trap_interest` built (a six-month amortisation whose interest truncates twice; the decoy is a `.max(0)` guard pinned by its own test). Applied to main; in the third gate (interrupted, to be re-run).
+- **Status.** Built as the general `probe` tool (D11; patch in .claude/item7.diff, on top of item 15). Second trap task `trap_interest` built (a six-month amortisation whose interest truncates twice; the decoy is a `.max(0)` guard pinned by its own test). Committed (939d3d0).
 - **What.** For an assertion failure with numbers: the model names the
   expressions to watch; the harness writes a temporary test (or
   instruments the functions on the call path) in a worktree, runs it,
@@ -154,7 +154,7 @@ moves the metric it was built for. Ordered within each tier.
   parks that rise with length.
 
 ### 15. `write_file` allowed after a full, recent read
-- **Status.** Applied to main, in the third gate (patch in .claude/item15.diff). First cut rejected at review: its rule ("no edits recorded") still refused the motivating case; corrected with `read_step` on `seen`.
+- **Status.** Committed (939d3d0). First cut rejected at review: its rule ("no edits recorded") still refused the motivating case; corrected with `read_step` on `seen`.
 - **What.** The whole-file rewrite guard (`write_file` refuses an
   existing file longer than a fixed line cap) consults `seen` instead:
   a rewrite is allowed when the harness has recorded a `read_file` of
@@ -174,7 +174,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Item 16 for reads made through `shell`.
 
 ### 16. Shell reads become `read_file`
-- **Status.** Applied to main; in the third gate (patch in .claude/item16.diff).
+- **Status.** Committed (939d3d0).
 - **What.** A `shell` command that is a pure read of one file (`cat`,
   `head`, `tail`, `sed -n`) is substituted with the equivalent
   `read_file` call, the way the think triggers substitute actions, with
@@ -215,7 +215,7 @@ moves the metric it was built for. Ordered within each tier.
   arm pays the same tax.
 
 ### 18. The repeated-failure question fits the failure
-- **Status.** Applied to main; in the third gate (patch in .claude/item18.diff).
+- **Status.** Committed (939d3d0).
 - **What.** `REPEAT_FAILURE_QUESTION` becomes one of several, picked
   from the normalised failure summary: a compile error ("read the
   first error: name the file, the line, and the one edit that fixes
@@ -231,7 +231,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Nothing. Do with item 6's default switch.
 
 ### 19. A read of an evicted window runs again
-- **Status.** Built (Milestone 27); in the sixth gate. Found in the `arm_current` battery: `python_three_modules` 0/2 (was 2/2), `refactor_signature` seed 2, `trap_rounding` seed 1 all parked after three refused re-reads of a file read many steps earlier.
+- **Status.** Committed (939d3d0; Milestone 27). Measured: `python_three_modules` 0/2 to 2/2 on the current arm (`arm_current_b4`, 18/26 landed against 16/24); `reread_evicted` never fired, the model read once and kept the window. Found in the `arm_current` battery: `python_three_modules` 0/2 (was 2/2), `refactor_signature` seed 2, `trap_rounding` seed 1 all parked after three refused re-reads of a file read many steps earlier.
 - **What.** The redundant-read guard (`core/src/session.rs`, keyed on
   `reads_since_mutation`) refuses any repeat read since the last mutation
   and says "that window is in your working set above" whenever windows
@@ -248,7 +248,7 @@ moves the metric it was built for. Ordered within each tier.
   current arm before and after; count of `reread_evicted` events per run.
 
 ### 20. `try_fixes` is offered only when there is a failure to fix
-- **Status.** Found in the `arm_harness_max` battery: 176 of its 195 tool errors were `try_fixes` called with no failing test ("no failing test to fix; run test first"), 113 of them in `design_fork` and 68 in `trap_interest`, the model repeating the call after each error.
+- **Status.** Built (Milestone 28); in the seventh gate. Found in the `arm_harness_max` battery: 176 of its 195 tool errors were `try_fixes` called with no failing test ("no failing test to fix; run test first"), 113 of them in `design_fork` and 68 in `trap_interest`, the model repeating the call after each error.
 - **What.** `implement` lists `try_fixes` only when the workspace's
   `tests` record shows a failure (`pass == false`) and a fixer is
   configured. A `try_fixes` call that arrives with no failing test is not
@@ -261,6 +261,23 @@ moves the metric it was built for. Ordered within each tier.
   `tests` record already knows whether there is a failure.
 - **Measure.** `try_fixes` tool errors per run on the harness-max arm
   before and after; `design_fork` and `trap_interest` landing.
+
+### 21. A second refused re-read becomes a `think`
+- **Status.** Built (Milestone 29); in the eighth gate with item 20. Found in `arm_current_b4`: `refactor_signature` 0/2, both seeds parked by the repeated-skip cap after three refused `read_file src/config.rs` calls whose window was still rendered.
+- **What.** The harness records consecutive identical `skipped_redundant`
+  steps in `HarnessState` (count and call key). When `implement` sees a
+  read-only call whose key was skipped on the previous step, it
+  substitutes `think` with a question that names the file and asks for
+  the exact next edit (path, old text, new text) or, if the file is not
+  what is needed, which other file to read. The core cap stays as the
+  backstop for the third strike.
+- **Why.** The model that re-reads what it can see has lost the thread,
+  not the file. Refusing it twice more and parking spends the run on a
+  message the model has already ignored once; the early-park and
+  repeated-failure thinks exist for exactly this kind of stall, and this
+  is the one shape they do not cover.
+- **Measure.** `refactor_signature` on the current arm; parks by the
+  repeated-skip cap across the battery.
 
 ## P2: worth doing, weaker or narrower evidence
 
@@ -289,7 +306,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Item 1.
 
 ### 11. Options and verdict at plan time
-- **Status.** Built (Milestone 26, `think {mode: "options"}`); `design_fork` bench task added; in the fifth gate. Measurement: `design_fork` with and without the plan-rules sentence.
+- **Status.** Committed (939d3d0; Milestone 26, `think {mode: "options"}`); `design_fork` bench task added. Measured on `arm_current_b4`: 1/2 landed, and neither seed called `think` with `mode: "options"` despite the plan rule; the mode is reachable only by harness trigger now that `think` is unlisted (D16), so it needs a plan-time trigger before it can be measured again. Measurement: `design_fork` with and without the plan-rules sentence.
 - **What.** A `think` mode for design forks: list approaches with
   trade-offs, pick one, store the verdict; the plan is written from it.
 - **Why.** Tree of Thoughts where no tool can judge; the deliberation
@@ -298,7 +315,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Needs a task with a real fork; none in the battery.
 
 ### 12. Grounded review critique
-- **Status.** Built (Milestone 24, `guards.grounded_findings`); in the fourth gate with items 13 and 14. Measurement: false send-backs on the battery, current arm against the switch off.
+- **Status.** Committed (939d3d0; Milestone 24, `guards.grounded_findings`). Measured (`ungrounded_review_b4` against `arm_current_b4`, 26 runs each): 21/26 against 18/26, but the review sent work back in only 2 of 52 runs and dropped no finding in either arm, so the landing gap is run noise and the false send-back rate is unmeasurable on this battery; the review approves almost everything it sees. Measurement: false send-backs on the battery, current arm against the switch off.
 - **What.** Review findings must cite a line and, where testable, a
   probe the harness runs; a finding with neither is dropped with a note.
 - **Why.** Adversarial framing showed nothing with this model; grounding
@@ -306,7 +323,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** False send-backs on the battery.
 
 ### 13. Automated paired-failure audit
-- **Status.** Built (Milestone 23); in the fourth gate with items 12 and 14. Window list not compared (derived state, never persisted).
+- **Status.** Committed (939d3d0; Milestone 23). Window list not compared (derived state, never persisted).
 - **What.** `statie audit` compares a landed and a failed run of the
   same task and reports where their contexts first diverge.
 - **Why.** ACON optimises compression guidelines from exactly such pairs
@@ -316,7 +333,7 @@ moves the metric it was built for. Ordered within each tier.
   will provide.
 
 ### 14. Does listing `think` cost anything
-- **Status.** Switch built (Milestone 25, `thinker.listed`); in the fourth gate. Measurement: current arm with `listed: false` on the eight short tasks.
+- **Status.** Measured (`think_unlisted_b4` against `arm_current_b4`, eight short tasks, two seeds): listed 13/16, unlisted 12/16; unlisted had 0 rejections against 2, 10 tool errors against 19, mean peak prompt 6423 against 6823, median 15 steps against 17. The eight `think` calls in the unlisted battery were all harness substitutions. Listing costs about 400 prompt tokens and a few tool errors and buys nothing measurable; `thinker.listed` now defaults to false (D16): the plan skill did not use options mode on either `design_fork` run. Measurement: current arm with `listed: false` on the eight short tasks.
 - **What.** Battery with `think` present in the tool list but never
   triggered, against absent. The model has never called it unprompted
   in 48 runs.

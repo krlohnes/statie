@@ -294,3 +294,32 @@ holds the resulting design; this file holds why.
 - **Check.** The re-run after items 19 and 20: `python_three_modules`
   and `refactor_signature` on the current arm, and `try_fixes` errors
   on the fixer arm.
+
+## D16. `think` stays listed only because the plan skill's options mode needs it
+- **Decision.** `thinker.listed` keeps its default of true. The
+  measurement (backlog item 14) found no landing effect either way and a
+  small cost to listing: about 400 prompt tokens at peak and a few more
+  tool errors on sixteen runs. Every useful `think` so far has been a
+  harness substitution. Listing survives because `think {mode:
+  "options"}` (item 11) is a model-initiated call at plan time; if the
+  `design_fork` measurement shows the model never uses it, the default
+  flips to false and `think` becomes a harness-only tool.
+- **Why.** Sixty-four runs across builds 5 to 9 without one unprompted
+  `think` that changed an outcome is the evidence; the triggers are
+  where the value has been (D9). Keeping a tool the model does not use
+  in the list is a cost with no return except the options mode, whose
+  own measurement is pending.
+- **Check.** `design_fork` on the current arm: does the plan skill call
+  `think` with `mode: "options"` at all, and does the verdict survive
+  into the plan.
+- **Applied (build 9).** `design_fork` on the current arm: neither seed
+  called `think` with `mode: "options"`. Default flipped to false;
+  `think` is now harness-triggered only. Options mode stays in the code
+  behind a future plan-time trigger.
+- **Addendum (gate 9).** A timing test (`run_in_timeout_kills_process_and_reports_promptly`)
+  failed once under a gate running alongside a bench battery and passed
+  alone. Its margins (2 s outer limit on a 1 s timeout, one 200 ms wait
+  for the reap) measured scheduler latency, not the behaviour; they are
+  now 10 s and a 3 s poll, with the same assertions. A test that fails
+  only under load is fixed by asserting the behaviour with margins the
+  machine can meet, never by running it twice.

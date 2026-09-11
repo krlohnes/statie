@@ -119,7 +119,7 @@ statie would actually use and where it came from.
 | `thinker.timeout_secs` | integer | `600` | Per-call timeout; a timeout comes back as a `think failed` observation, never a rejection. Thinking runs long on this model (a minute is typical on a 26b Gemma). |
 | `thinker.num_ctx` | integer or absent | `32768` unchunked, `model.num_ctx` chunked | The reasoning call's own context window, separate from the pinned `model.num_ctx`. Native thinking runs 8k to 11k tokens on this model; in a 16k window shared with a 5k prompt it hit the limit and answered nothing. Ollama reloads the model when `num_ctx` changes, so each `think` costs a reload each way; it fires rarely. |
 | `thinker.chunked` | bool | `true` | Runs the reasoning call as a loop of bounded chunks (Markovian Thinker shape): 6000 tokens of thinking per chunk, a thinking-off carry-over between chunks, at most four chunks, then a forced thinking-off answer. Lets `think` run inside the session's own `num_ctx` with no model reload; on the trap it answered in 46 seconds against 100 to 250 unchunked. `false` restores the single unbounded call in its own 32k window. |
-| `thinker.listed` | bool | `true` | Whether `think` appears in the tool list the model sees. `false` hides it; the harness's own repeated-failure and early-park substitutions still run it. For the listing-cost measurement (BACKLOG.md item 14). |
+| `thinker.listed` | bool | `false` | Whether `think` appears in the tool list the model sees. Off by default (D16); `false` hides it; the harness's own repeated-failure and early-park substitutions still run it. For the listing-cost measurement (BACKLOG.md item 14). |
 | `fixer` | object or absent | absent | The `try_fixes` tool's proposer (BACKLOG.md item 4). When present, a `try_fixes` call (or the repeated-failure trigger, which prefers it to `think` when a fixer is attached) samples `k` candidate edits with thinking off, verifies each in its own git worktree against the last failing test command, applies the one that passes, and records the losers in `decision`; none passing falls back to `think` with the losers in the question. |
 | `fixer.model` | object | the top-level `model` | Same shape as `model`; must be an Ollama backend. |
 | `fixer.timeout_secs` | integer | `600` | Per-candidate-call timeout. |
@@ -1454,6 +1454,26 @@ either a default or a config knob:
   Second, 176 of arm (c)'s 195 tool errors were `try_fixes` called
   before any test had failed, the model repeating it after each error
   (backlog item 20). The arms are re-run once both fixes are in.
+
+  The current arm re-run with the evicted-read fix (item 19) and the
+  new `design_fork` task landed 18 of 26 (python long task back to 2 of
+  2, `design_fork` 1 of 2) at a median of 16 steps and 42 minutes.
+  `refactor_signature` still parks on both seeds, now on the
+  repeated-skip cap: the model commits to re-reading a file it can see
+  and is refused three times (backlog item 21).
+
+  Listing `think` (backlog item 14, `thinker.listed`): on the eight
+  short tasks, listed landed 13 of 16 and unlisted 12 of 16; unlisted
+  had no rejections against two, ten tool errors against nineteen, and
+  a mean peak prompt 400 tokens lower. Every `think` in the unlisted
+  battery was a harness substitution. The model has still never called
+  `think` usefully on its own.
+
+  Grounded review findings (backlog item 12): switch off landed 21 of
+  26 against 18 of 26 with it on, but across all 52 runs the review
+  sent work back twice and no finding was dropped, so the gap is noise
+  and the guard has had nothing to act on. The review approves what it
+  is shown; the send-back is not where this battery loses runs.
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

@@ -119,6 +119,7 @@ statie would actually use and where it came from.
 | `thinker.timeout_secs` | integer | `600` | Per-call timeout; a timeout comes back as a `think failed` observation, never a rejection. Thinking runs long on this model (a minute is typical on a 26b Gemma). |
 | `thinker.num_ctx` | integer or absent | `32768` unchunked, `model.num_ctx` chunked | The reasoning call's own context window, separate from the pinned `model.num_ctx`. Native thinking runs 8k to 11k tokens on this model; in a 16k window shared with a 5k prompt it hit the limit and answered nothing. Ollama reloads the model when `num_ctx` changes, so each `think` costs a reload each way; it fires rarely. |
 | `thinker.chunked` | bool | `true` | Runs the reasoning call as a loop of bounded chunks (Markovian Thinker shape): 6000 tokens of thinking per chunk, a thinking-off carry-over between chunks, at most four chunks, then a forced thinking-off answer. Lets `think` run inside the session's own `num_ctx` with no model reload; on the trap it answered in 46 seconds against 100 to 250 unchunked. `false` restores the single unbounded call in its own 32k window. |
+| `thinker.listed` | bool | `true` | Whether `think` appears in the tool list the model sees. `false` hides it; the harness's own repeated-failure and early-park substitutions still run it. For the listing-cost measurement (BACKLOG.md item 14). |
 | `fixer` | object or absent | absent | The `try_fixes` tool's proposer (BACKLOG.md item 4). When present, a `try_fixes` call (or the repeated-failure trigger, which prefers it to `think` when a fixer is attached) samples `k` candidate edits with thinking off, verifies each in its own git worktree against the last failing test command, applies the one that passes, and records the losers in `decision`; none passing falls back to `think` with the losers in the question. |
 | `fixer.model` | object | the top-level `model` | Same shape as `model`; must be an Ollama backend. |
 | `fixer.timeout_secs` | integer | `600` | Per-candidate-call timeout. |
@@ -133,6 +134,7 @@ statie would actually use and where it came from.
 | `guards.seen_map` | bool | `true` | The harness writes `seen` from file tool calls. `false` leaves it empty for the session (the model still cannot write it). One half of the model-owned arm in the state-ownership experiment. |
 | `guards.decision_field` | bool | `true` | The harness writes `decision` from a `think` call and clears it on a passing `test`. `false` does neither; the `think` tool itself still runs. The other half of that arm. |
 | `guards.tests_field` | bool | `true` | The harness writes `tests` (`{cmd, pass, failing, first_error, step}`) on every `test` call, replaced whole. `false` never writes it. Off in the model-owned arm. |
+| `guards.grounded_findings` | bool | `true` | A review send-back keeps only findings that cite `path:line` for a file in `files` or `seen`, with the line inside the seen line count when one is recorded. Dropped findings are named in the note; a send-back with none left is refused. `false` passes every finding through. |
 | `max_autonomous_steps` | integer | `200` | Safety cap on consecutive autonomous steps (`Outcome::Continue`) before a run stops on its own. |
 
 ## Commands
@@ -236,8 +238,9 @@ for the prompt (the full output stays in the session log).
 | (all read/edit tools) | after a successful `read_file`, `edit_file`, `write_file`, or `revert_file` the harness updates the workspace's `seen` list: per file, its length and the line ranges read and edited, with the step; the model reads it before re-reading and cannot patch it |
 | `revert_file` | restore a file to its content from before this session's first `edit_file`/`write_file` of it (a file created this session is removed); the backup lives in `.statie/orig/`, is taken on first modification, cleared on a fresh start, kept on `--resume` |
 | `recall` | search the session log (never the model's reasoning) |
-| `think` | ask a reasoning subagent a question; it sees the caller's whole prompt, thinks with no tools and no schema, and returns a conclusion, which the harness also writes into the workspace's `decision` field (harness-owned, cleared when a test passes). Needs a `thinker` config section; available to `plan`, `implement`, and `review` |
+| `think` | ask a reasoning subagent a question; it sees the caller's whole prompt, thinks with no tools and no schema, and returns a conclusion, which the harness also writes into the workspace's `decision` field (harness-owned, cleared when a test passes). Needs a `thinker` config section; available to `plan`, `implement`, and `review`. Optional `mode: "options"` asks for two or three approaches with trade-offs and a verdict first (design forks, plan skill). |
 | `try_fixes` | propose `k` candidate edits for the last failing test with thinking off, verifies each in its own git worktree, apply the one that passes, and report the losers with their first error line (optional `k`; needs a `fixer` section; the repeated-failure trigger prefers it to `think` when one is attached) |
+| `probe` | run a short snippet against the current code in an isolated copy of the sandbox and return what it prints (a Rust test body or a Python module; use it to see real intermediate values instead of computing them) |
 
 The coding skills: `router` decides where to go, `plan` explores and writes
 a step list, `implement` works the plan with `edit_file`/`write_file` and
@@ -1424,6 +1427,33 @@ either a default or a config knob:
   inside the sandbox links a fresh test binary after every edit, each
   vetted by macOS before it runs (DECISIONS.md D7). The Python task
   runs took 24 to 26 seconds end to end.
+
+- **Ninth build, the three state-ownership arms (BACKLOG.md item 2,
+  DECISIONS.md D12).** Twelve tasks, two seeds each, on the binary
+  carrying the third batch (probe, edit_file checks, failure-shaped
+  question, shell reads, write after read). Arm (a) is model-owned:
+  maintainer off, `seen`/`decision`/`tests` off. Arm (b) is the current
+  build. Arm (c) is (b) plus a `fixer`, so `try_fixes` is listed. Two of
+  (b)'s runs were killed by a gate restart (D8 addendum) and count as
+  not landed; (c) was stopped one run short and picked up the new
+  `design_fork` task, so its rows are 23 runs over 13 tasks.
+
+  | arm | landed | parked | median steps | mean peak prompt | max peak | tool errors | minutes |
+  |---|---|---|---|---|---|---|---|
+  | (a) model-owned | 16/24 | 7 | 20 | 6515 | 9245 | 45 | 94 |
+  | (b) current | 16/24 | 6 | 13 | 7076 | 9707 | 31 | 31 |
+  | (c) harness-max (fixer) | 15/23 | 7 | 12 | 6903 | 9468 | 195 | 75 |
+
+  Same landing rate in every arm; the harness-owned arms do it in
+  two-thirds of the steps and a third of the wall clock, because the
+  model-owned arm spends its steps rewriting notes and re-reading.
+  Two defects, not the arms, decided the misses. First, every arm lost
+  `python_three_modules` and `refactor_signature` runs to the
+  redundant-read guard refusing a re-read of a window the working set
+  had already evicted, three refusals and a park (backlog item 19, D14).
+  Second, 176 of arm (c)'s 195 tool errors were `try_fixes` called
+  before any test had failed, the model repeating it after each error
+  (backlog item 20). The arms are re-run once both fixes are in.
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

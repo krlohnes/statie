@@ -134,6 +134,14 @@ holds the resulting design; this file holds why.
 - **Check.** Every README battery row was produced by a run that had
   the server to itself.
 
+- **Addendum (build 9).** Killing cargo by name (`pkill -f "cargo test"`)
+  while a battery runs also kills the sandbox `cargo test` of whichever
+  bench run is in flight: two runs of the first `arm_current` battery
+  (`rename_across_files` seed 2, `trap_rounding` seed 2) ended as
+  `crashed` at exactly the two moments a gate was restarted. A gate is
+  stopped by killing its own script and children by pid, never cargo by
+  name, and a battery whose runs were killed is re-run whole.
+
 ## D9. Unbounded thinking is the wall-clock cost; the question must fit the failure
 - **Decision.** Chunked thinking becomes the default for the `think`
   tool as soon as its measurement shows it answers at least as often
@@ -199,3 +207,90 @@ holds the resulting design; this file holds why.
 - **Check.** Diagnosis on the arithmetic traps with `probe` available
   against `think` alone, and how often the model reaches for it
   unprompted.
+
+## D12. The three state-ownership arms are pinned configs, run back to back
+- **Decision.** Backlog item 2's arms are files under `bench/configs/`:
+  `arm_model_owned.json` (maintainer off; `seen`, `decision`, `tests`
+  fields off; thinker on), `arm_current.json` (the thinker config: every
+  field on, maintainer on, no fixer), and `arm_harness_max.json` (the
+  current arm plus a `fixer` section, so `try_fixes` and `probe` are
+  available). `bench/run_arms.sh <label>` runs the three on the full
+  battery in that order, one at a time (D8), and appends to
+  `bench-runs/arms_<label>.done` as each finishes.
+- **Why.** The arms are the experiment the prime directive asks for; a
+  pinned file per arm keeps the comparison reproducible after the
+  binary changes, and a chained runner keeps the GPU busy across a
+  gate without anyone watching. The fixer belongs to the maximum arm,
+  not the current one, so the current arm measures the batch-2 and
+  batch-3 items alone and the maximum arm measures what `try_fixes`
+  adds on top.
+- **Interrupted.** The first run of arm (b) was stopped after five
+  tasks at the user's request (laptop needed for a call), as was the
+  third gate. Both restart from scratch; partial arm output is not
+  reported.
+- **Check.** The cross-arm table in the README: landing rate, median
+  steps, peak prompt, park rate, per arm, on all eleven tasks plus
+  `trap_interest`.
+
+## D13. Tests import shared strings; the gate covers the whole tree it runs on
+- **Decision.** A test that checks a harness-authored string imports the
+  constant (re-exported from the crate) instead of carrying a copy. The
+  gate runs on whatever the tree holds when it starts, so units accepted
+  while a gate is running are folded into the next gate rather than
+  copied in mid-run: gate 3 was killed and replaced by gate 4 over batch
+  3 plus items 12, 13, and 14.
+- **Why.** `think_trigger.rs` carried its own copy of
+  `REPEAT_FAILURE_QUESTION`; item 7 appended a sentence to the constant
+  in a different worktree and the test broke on the merged tree without
+  either agent seeing it. The item 14 agent found it by running the base
+  tree's test. Copying accepted units into the tree under a running
+  gate produced a gate that tested a mixture of trees, which is worth
+  nothing as evidence.
+- **Check.** Every gate log names the tree it ran on (the commit plus the
+  patches applied), and the commit that follows matches it.
+
+## D14. Guards defer to what the model can actually see
+- **Decision.** A guard that refuses an action because "you already have
+  that" must check the rendered prompt, not a bookkeeping map. The
+  redundant-read guard now skips a repeat read only when the earlier
+  window is still in the working set; a read of an evicted window runs
+  again and is logged as `reread_evicted` (backlog item 19). The same
+  rule applies to any future guard that reasons about the model's
+  context: the working set's own record of what it rendered is the
+  source of truth.
+- **Why.** The first `arm_current` battery parked `python_three_modules`
+  twice, `refactor_signature` once, and `trap_rounding` once, each after
+  three refused re-reads of a file the model had read many steps before.
+  The guard's message claimed the window was above; with four windows it
+  had been evicted. Re-reading evicted state is exactly the behaviour the
+  prime directive wants, and the harness was converting it into a park.
+  Item 16 (shell reads become `read_file`) widened the blast radius by
+  giving `cat file` the same key. This is the arm experiment's first
+  real result: harness-owned state is only as good as the harness's
+  honesty about what it has shown.
+- **Check.** `python_three_modules` returns to 2/2 on the current arm
+  and `reread_evicted` counts stay small (a run that re-reads the same
+  file five times is a different problem).
+
+## D15. The arms say: keep harness-owned state, and fix the harness's honesty first
+- **Decision.** The prime directive stands as the default: harness-owned
+  state (maintainer, `seen`, `decision`, `tests`) is kept on. The next
+  work is not more state but making the harness truthful about the state
+  it shows (D14) and about the tools it offers (backlog item 20), then
+  re-running the arms.
+- **Why.** Ninth build, twelve tasks, two seeds: model-owned and current
+  arms both landed 16 of 24, but model-owned took a median of 20 steps
+  against 13 and 94 minutes against 31. The misses in both arms were the
+  same tasks and the same shape: refused re-reads of evicted windows, a
+  harness defect that no amount of model-owned note-taking routes
+  around. The fixer arm added nothing to landing and 176 tool errors
+  from `try_fixes` being offered before a failure existed. So the
+  evidence is that state ownership is not the bottleneck; the harness's
+  claims about context are.
+- **Ruled out for now.** Backlog item 9 (model-pinned context blocks)
+  stays parked: with landing equal and steps worse in the model-owned
+  arm, there is no signal that the model manages its context better
+  when given the controls.
+- **Check.** The re-run after items 19 and 20: `python_three_modules`
+  and `refactor_signature` on the current arm, and `try_fixes` errors
+  on the fixer arm.

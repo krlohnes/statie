@@ -1489,6 +1489,86 @@ use `probe` to print them instead of computing them." The sandbox is
 never touched; the tests prove `git status` is unchanged and no probe
 file or worktree remains.
 
+## Milestone 23: `statie audit`, paired-run comparison (BACKLOG.md item 13)
+
+`statie audit <run_a_dir> <run_b_dir>` (`cli/src/audit.rs`) takes two
+bench output directories (`bench-runs/<label>/<task>/seed<N>/`) and
+prints where they part. It reads each run's `session.jsonl` (the
+`LogEntry` record bench writes) and `stdout.txt` (for the outcome line),
+then prints: a header per run (task, seed, outcome, steps); the first
+step whose action differs (tool name plus a primary argument: path, cmd,
+query, question, code, or pattern, else the first argument); the first
+step whose harness state differs, comparing `plan`, `files`, `decision`,
+and `tests` field by field with values cut at 200 characters; and a
+per-step table of both runs' actions and server prompt tokens from the
+first divergence to ten steps past it. State is reconstructed by
+replaying each run's `Patch` entries through the real
+`JsonMergePatch<CodingWorkspace>`, so keyed-array merges match what the
+harness did. The working-set window list is not compared: it is derived
+at run time from the tokenizer and budget and never persisted. Missing
+or unreadable inputs print `n/a` or `section unavailable: <reason>` and
+the command exits 0. This is the mechanised form of the paired-failure
+reading in the field notes.
+
+## Milestone 24: grounded review findings (BACKLOG.md item 12)
+
+`ReviewSkill::validate` runs `review_grounded_findings` after the
+send-back note. A finding is grounded when its first `path:line` word
+(wrapping punctuation stripped, digits after the colon) names a path in
+the merged workspace's `files` or `seen` and, when `seen` records a
+line count for it, the line is within it; line 0 never counts. Ungrounded
+findings are removed from the patch and the note names them: "Dropped N
+findings with no file:line citation. Every finding must name the line it
+is about. Dropped: ...". A send-back left with no grounded finding is
+refused as a rule violation with the same text, so the review continues
+instead of sending unverifiable work back. `guards.grounded_findings`
+(default on) threads from config through `CodingRegistry::with_guards`
+to `ReviewSkill::with_grounded_findings`; off restores the old behaviour
+exactly. Measured as false send-backs on the battery.
+
+## Milestone 25: `thinker.listed` (BACKLOG.md item 14)
+
+`thinker.listed` (default true) threads from config through
+`CodingRegistry::with_guards_and_listed` to `with_listed` on the plan,
+implement, and review skills; when false, `tools()` omits `think` so the
+prompt never offers it. The harness substitutions still construct
+`Action::Tool { name: "think" }` directly, so `Active::execute`'s
+active-tool check now exempts `think`: it is dispatched to
+`execute_think` regardless of the skill's list, never to the registry.
+That exemption is the one change outside the skills for this item and
+it means a model that names `think` unprompted is also let through.
+`REPEAT_FAILURE_QUESTION` is re-exported from `statie_skills` and the
+trigger tests import it instead of carrying a copy (the copy drifted
+when item 7 appended the `probe` sentence and broke `think_trigger`).
+
+## Milestone 26: `think` options mode (BACKLOG.md item 11)
+
+`think` takes an optional `mode`: `"trace"` (default, today's behaviour)
+or `"options"`. In options mode `execute_think` prepends
+`OPTIONS_MODE_INSTRUCTION` (`core/src/thinker.rs`): list two or three
+approaches with one line of trade-off each, pick one, state the verdict
+in one sentence, then reason and finish with `ANSWER:` whose first line
+is the verdict. The raw question is what the log and `decision` keep. An
+unknown mode is a tool error naming both modes, never a rejection. Only
+the plan skill's rules carry the sentence "For a design fork with more
+than one reasonable approach, call `think` with `mode: "options"` before
+writing the plan." The bench task `design_fork` (a `RateLimiter` whose
+behavioural tests accept a token bucket or a sliding window) gives the
+mode something to be measured on.
+
+## Milestone 27: a read of an evicted window runs again (BACKLOG.md item 19; DECISIONS.md D14)
+
+`WorkingSet` now records `window_steps`, the steps whose windows it
+actually rendered after budget fitting, and the session keeps the last
+rendered set. The redundant-read guard treats a repeat read as evicted
+when windows are on, the earlier step is not in that set, and it is not
+the newest tool output (which the model sees as the observation rather
+than as a window). An evicted repeat runs as an ordinary read and the
+log gets a `reread_evicted` system entry naming the earlier step; a
+repeat whose window is still rendered is refused as before, with the
+paged-read branch untouched. With windows off the guard is unchanged.
+`core/tests/evicted_reread.rs` pins all three cases.
+
 ## Testing conventions
 
 - Unit tests live beside code (`#[cfg(test)]`). Integration tests in `<crate>/tests/`.

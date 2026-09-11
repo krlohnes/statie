@@ -1475,6 +1475,33 @@ either a default or a config knob:
   and the guard has had nothing to act on. The review approves what it
   is shown; the send-back is not where this battery loses runs.
 
+  The fixer arm re-run with items 19 to 21 in (`arm_harness_max_b5`)
+  landed 20 of 26, the best battery so far, at a median of 15 steps.
+  `try_fixes` still threw 145 errors, all in one `rename_across_files`
+  seed: the gate in the skill saw the harness-owned failure, but the
+  core precondition read a session-local copy that had been reset, and
+  nothing capped the identical error repeating (backlog item 22).
+
+- **Maintainer sweep (BACKLOG.md item 10).** The five long and trap
+  tasks, two seeds each, on the build-10 binary: notes budget 200, 400
+  (the current arm's rows for the same tasks), 800, and maintainer off.
+
+  | maintainer | landed | median steps | mean peak prompt | max peak | tool errors | minutes |
+  |---|---|---|---|---|---|---|
+  | budget 200 | 6/10 | 18 | 8704 | 11832 | 152 | 117 |
+  | budget 400 (current) | 5/10 | 16 | 7857 | 9261 | 8 | 19 |
+  | budget 800 | 5/10 | 24 | 8627 | 11557 | 47 | 95 |
+  | off | 4/10 | 22 | 7877 | 10438 | 32 | 56 |
+
+  Landing is within a run of each other in every row; the budget does
+  not decide it. What the rows do show is the cost of the loops the
+  guards had not yet capped: budget 200's 152 tool errors are one run
+  repeating an `edit_file` refusal (the duplicate-insert check from
+  item 17 doing its job, the model not taking the hint) and `edit_file`
+  calls without a `path`, which the identical-error cap in item 22
+  ends at three. With the maintainer off the runs take a third more
+  steps for the same landing, the same shape as the model-owned arm.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

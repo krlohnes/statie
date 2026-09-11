@@ -323,3 +323,28 @@ holds the resulting design; this file holds why.
   now 10 s and a 3 s poll, with the same assertions. A test that fails
   only under load is fixed by asserting the behaviour with margins the
   machine can meet, never by running it twice.
+- **Second instance (build 10).** `try_fixes` refused 145 calls in one
+  run because its precondition read a session-local copy of "the last
+  test failed" that resets on activation, while the harness-owned
+  mirror said otherwise. The precondition now reads the harness record
+  (Milestone 30). Rule restated: when the harness owns a fact, every
+  guard reads the harness's copy; session-local bookkeeping is for
+  counters, never for decisions the model sees.
+
+## D17. The maintainer stays on at 400; the sweep measures loops, not notes
+- **Decision.** `maintainer.budget` stays at 400 and the maintainer stays
+  on. No further sweep of the budget until the guards stop the loops
+  that dominate the wall clock.
+- **Why.** On the five long and trap tasks, budgets 200, 400, and 800
+  landed 6, 5, and 5 of 10 and maintainer-off landed 4 of 10: one run
+  apart, which two seeds cannot separate. Off costs a third more steps
+  (median 22 against 16), the same shape the model-owned arm showed
+  (D15): the model spends steps rewriting what the maintainer would
+  have kept. The 117 and 95 minute rows are single runs looping on a
+  refused `edit_file`, which item 22's identical-error cap now ends at
+  three; the sweep would need re-running to say anything about the
+  budget itself, and the landing rows say it would not change the
+  decision.
+- **Check.** If a later battery shows the maintainer's notes crowding
+  out the working set at peak (mean peak prompt rises with the budget,
+  which the 800 row hints at: 8627 against 7857), revisit 200.

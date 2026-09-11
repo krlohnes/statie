@@ -1597,6 +1597,23 @@ next edit or a different file and why. `read_call_key` is public so both
 layers compute the same key. The core's third-strike park stays as the
 backstop. `skills/tests/skip_think.rs` drives the three cases.
 
+## Milestone 30: `try_fixes` reads the harness-owned failure; identical tool errors are capped (BACKLOG.md item 22)
+
+`execute_try_fixes` decides whether there is a failure from
+`HarnessState.last_failure_summary` and `last_test_cmd`, the persisted
+record, not from the session-local `last_test_failure`, which resets on
+every activation and only drives the repeated-failure counter. The
+mirror survives re-activation (a test failure is a fact about the
+sandbox) and clears on a passing `test`. The non-progress guard now
+counts consecutive identical `tool_error` steps by (tool, reason) the
+way it counts identical skips: the second gets the observation prefix
+"[harness] This is the same `<tool>` error as the previous step;
+repeating the call will not change it.", the third parks through the
+shared `park_non_progress_cap` with the shape "repeated tool error:
+<tool>". `core/tests/try_fixes_source.rs` covers the re-activation, the
+never-tested, and the passed-since cases; `core/tests/non_progress.rs`
+covers the cap and the reset.
+
 ## Testing conventions
 
 - Unit tests live beside code (`#[cfg(test)]`). Integration tests in `<crate>/tests/`.

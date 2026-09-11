@@ -248,7 +248,7 @@ moves the metric it was built for. Ordered within each tier.
   current arm before and after; count of `reread_evicted` events per run.
 
 ### 20. `try_fixes` is offered only when there is a failure to fix
-- **Status.** Committed (69a93a8; Milestone 28); measured by `arm_harness_max_b5`. Found in the `arm_harness_max` battery: 176 of its 195 tool errors were `try_fixes` called with no failing test ("no failing test to fix; run test first"), 113 of them in `design_fork` and 68 in `trap_interest`, the model repeating the call after each error.
+- **Status.** Committed (69a93a8; Milestone 28). Measured (`arm_harness_max_b5`): 20/26 landed against 15/23; `try_fixes` errors 176 to 145, but all 145 in one run where the skill gate passed the call (the `tests` record showed a failure) and core refused it from a stale session field; item 22 finishes the job. Found in the `arm_harness_max` battery: 176 of its 195 tool errors were `try_fixes` called with no failing test ("no failing test to fix; run test first"), 113 of them in `design_fork` and 68 in `trap_interest`, the model repeating the call after each error.
 - **What.** `implement` lists `try_fixes` only when the workspace's
   `tests` record shows a failure (`pass == false`) and a fixer is
   configured. A `try_fixes` call that arrives with no failing test is not
@@ -279,6 +279,25 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** `refactor_signature` on the current arm; parks by the
   repeated-skip cap across the battery.
 
+### 22. `try_fixes` reads the harness-owned failure; identical tool errors are capped
+- **Status.** Built (Milestone 30); in the tenth gate. First cut rejected: it cleared the mirror on re-activation and re-ran `test` in its own test, the very loop it was meant to end. Found in `arm_harness_max_b5`: `rename_across_files` seed 2 called `try_fixes` 145 times after a failing `test`, each refused with "no failing test to fix", no park.
+- **What.** Two parts. (a) `execute_try_fixes` decides whether there is a
+  failure from `HarnessState.last_failure_summary` and `last_test_cmd`
+  (persisted, mirrored from the session field) instead of the
+  session-local `last_test_failure`, which resets on activation and can
+  be `None` while the harness state says the last test failed. (b) The
+  non-progress guard counts consecutive identical `tool_error` steps
+  (same tool, same reason) the way it counts identical skips: the second
+  identical error is reported with the streak, the third parks with the
+  same `non_progress_cap` message, so no run can repeat one refused call
+  145 times.
+- **Why.** D14 again: the harness held two records of "did the last test
+  fail" and acted on the stale one. And a tool error the model repeats
+  is non-progress by any definition; only skips and continues were
+  counted.
+- **Measure.** `try_fixes` errors on the fixer arm; longest identical
+  tool-error streak across the battery.
+
 ## P2: worth doing, weaker or narrower evidence
 
 ### 9. Typed context blocks with keep or archive
@@ -292,13 +311,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Depends on.** Items 1, 2, 8.
 
 ### 10. Maintainer sweep
-- **Status.** First data point (maintainer off, thinker on, old
-  unchunked binary): Python long task 1 of 2 (14 steps and 45 s on the
-  landing seed, against 29 steps with the maintainer; the other seed
-  parked in the early-ask shape at call 9); trap 1 of 2 (the miss timed
-  out on three consecutive 284-second thinks that exhausted the 32k
-  window, two of them the model's own calls). Too noisy to call; the
-  sweep proper waits for the gated build with chunked thinking.
+- **Status.** Measured (`sweep_*_b5` against `arm_current_b4`, five tasks, two seeds; README "Maintainer sweep"; D17): budget 200 landed 6/10, 400 5/10, 800 5/10, off 4/10. Within noise on landing; off costs a third more steps; the wall-clock and tool-error spread is uncapped loops, not the maintainer. Budget stays at 400.
 - **What.** Maintainer on versus off, and the notes budget at 200, 400,
   800, on the long tasks.
 - **Why.** The trained systems say the updater matters most; the

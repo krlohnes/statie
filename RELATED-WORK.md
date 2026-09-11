@@ -224,6 +224,40 @@ spec's "Thinking as a tool" section.
   recurses over, rather than data it must hold. Handled inputs two
   orders of magnitude beyond the window.
 
+### Procedural graphs, and what localisation buys
+
+**Procedural Graphs: Self-Evolving Execution Structures for LLM Agents**
+(Lu, Chen, Wu, Arık; arXiv 2609.09153, 2026). Procedural knowledge as
+an editable directed graph of (procedure, relation, procedure) triples,
+each edge carrying `condition`, `guidance`, and `pitfalls` text. At each
+step the agent's last action is matched to a node, the 2-hop outgoing
+neighbourhood plus a three-step trajectory window goes to a guidance
+model, and its output is appended to the solver prompt as a soft bias.
+Offline, a refiner proposes graph edits from success and failure
+contrasts, a held-out validation set gates each candidate (accept only
+if the score does not fall), and rejected candidates are logged and fed
+back as negative evidence. Frontier models only (Claude Sonnet 4.6,
+Gemini 3.1 Pro and 3.5 Flash, Grok 4.1 Fast); first or joint first in
+21 of 24 benchmark-model settings; EnterpriseArena survival 0% to 85%
+after ten evolution rounds.
+
+What matters for statie is Table 3: injecting the whole graph hurts
+(ALFWorld minus 17 points and 73% more tokens with generative
+guidance), while the localised 2-hop neighbourhood gains 9 points and
+spends 71% fewer tokens than the full graph. That is the prime
+directive measured on someone else's system: what the model sees each
+step must be the neighbourhood of what it just did, not everything the
+harness knows. Their offline loop is what this repo does by hand: paired
+success and failure traces (item 13's audit), the gate and the battery
+as validation, and DECISIONS.md's "ruled out" entries as the rejection
+memory. Two things do not transfer: a second model call per step for
+guidance is what D9 ruled out on a 4090, and the graph edits are
+proposed by a frontier model. The cheap adoption is a static one: the
+skill's rules text is today shown whole every step; a per-action
+neighbourhood (after a failing `test`, only the failure rules; after an
+edit, "run `test` next" and the edit pitfalls) is the same localisation
+without the extra call (BACKLOG.md item 26).
+
 ### Compaction and context rot
 
 - **Anthropic, "Effective context engineering for AI agents", 2025.**

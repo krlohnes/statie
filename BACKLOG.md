@@ -397,6 +397,20 @@ moves the metric it was built for. Ordered within each tier.
 - **Why.** Build 5 showed higher rejections and tool errors with the
   tool listed; build 6 did not. Cheap to settle.
 
+### 26. Situational rules: the rules text follows the last action
+- **What.** The coding skills' rules block is rendered whole on every
+  step. Replace it with a small static procedure graph (nodes: read,
+  edit, test pass, test fail, think, review) whose edges carry
+  condition, guidance, and pitfalls; each step renders only the 2-hop
+  neighbourhood of the last action, with the full block as the fallback
+  when nothing matches. No extra model call.
+- **Why.** Procedural Graphs (RELATED-WORK.md): localised guidance beat
+  full-graph injection by 9 points and 71% fewer tokens on frontier
+  models; full injection hurt. Our rules block is a full injection.
+- **Measure.** Mean and peak prompt tokens, landing on the full battery,
+  the eight-short-task row.
+- **Depends on.** Nothing; P2 because the evidence is from other models.
+
 ## Not doing
 
 - Multi-agent debate as a thinking pattern: 0 of 6 here, and the

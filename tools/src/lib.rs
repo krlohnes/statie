@@ -6,6 +6,7 @@ mod common;
 mod edit_file;
 mod filter_last;
 mod list_files;
+mod probe;
 mod read_file;
 mod recall;
 mod revert_file;
@@ -25,6 +26,7 @@ use statie_core::ToolSet;
 pub use edit_file::EditFile;
 pub use filter_last::FilterLastToolCall;
 pub use list_files::ListFiles;
+pub use probe::{Probe, ProbeArgs};
 pub use read_file::ReadFile;
 pub use recall::Recall;
 pub use revert_file::RevertFile;
@@ -100,6 +102,10 @@ pub fn default_tools(cfg: &ToolConfig) -> ToolSet {
     }));
     tools.register(Arc::new(Think));
     tools.register(Arc::new(TryFixes));
+    tools.register(Arc::new(Probe {
+        default_timeout_secs: cfg.shell_timeout_secs,
+        max_output_bytes: cfg.max_output_bytes,
+    }));
 
     if cfg.allow_shell {
         tools.register(Arc::new(Shell {
@@ -141,6 +147,7 @@ mod tests {
                 "edit_file",
                 "filter_last_tool_call",
                 "list_files",
+                "probe",
                 "read_file",
                 "recall",
                 "revert_file",
@@ -169,6 +176,7 @@ mod tests {
                 "edit_file",
                 "filter_last_tool_call",
                 "list_files",
+                "probe",
                 "read_file",
                 "recall",
                 "revert_file",

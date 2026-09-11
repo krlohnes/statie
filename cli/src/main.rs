@@ -1,6 +1,7 @@
 //! `statie`: the binary. Config loading, session wiring, and the `statie`
 //! commands (ARCHITECTURE.md "Workspace layout" / "Configuration").
 
+mod audit;
 mod bench;
 mod coding;
 mod config;
@@ -147,6 +148,16 @@ enum Command {
         #[arg(long)]
         keep: bool,
     },
+    /// Compares two bench output directories (each
+    /// `bench-runs/<label>/<task>/seed<N>/`): headers, the first divergent
+    /// action, the first divergent harness state, and a per-step table
+    /// around the divergence.
+    Audit {
+        /// First run's directory.
+        run_a: PathBuf,
+        /// Second run's directory.
+        run_b: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -196,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
             let tasks_dir = tasks.unwrap_or_else(|| PathBuf::from("bench/tasks"));
             bench::cmd_bench(tasks_dir, task, seeds, cli.config, out, json, keep).await
         }
+        Some(Command::Audit { run_a, run_b }) => audit::cmd_audit(run_a, run_b),
         None => cmd_run(cli.config, cli.run).await,
     }
 }
@@ -495,6 +507,10 @@ async fn run_coding(
     let tokenizer = Box::new(TiktokenTokenizer);
     let maintainer = cfg.build_maintainer()?;
     let thinker = cfg.build_thinker()?;
+    // `thinker.listed` (default true when the `thinker` section itself is
+    // absent, same as `ThinkerConfig::default`) -- read before `thinker` is
+    // moved into `session.with_thinker` below.
+    let thinker_listed = cfg.thinker.as_ref().map(|t| t.listed).unwrap_or(true);
     let fixer = cfg.build_fixer()?;
 
     let session_config = SessionConfig {
@@ -559,8 +575,9 @@ async fn run_coding(
         );
     }
 
-    let registry: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> =
-        Arc::new(CodingRegistry::with_guards(cfg.guards));
+    let registry: Arc<dyn SkillRegistry<statie_skills::CodingWorkspace>> = Arc::new(
+        CodingRegistry::with_guards_and_listed(cfg.guards, thinker_listed),
+    );
 
     let opts = RunOptions {
         initial_skill: skill.to_string(),

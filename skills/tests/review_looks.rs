@@ -332,8 +332,14 @@ async fn review_approval_after_one_read_file_call_is_accepted() {
 async fn review_send_back_with_findings_and_no_tool_call_is_unaffected() {
     let root = tempfile::tempdir().unwrap();
 
+    // The finding cites `a.txt:1`, grounded via the `files` entry sent in
+    // the same patch (item 12: grounded review findings; grounding checks
+    // the merged, post-patch workspace) so this test's own concern is not
+    // accidentally defeated by the unrelated grounding guard (on by
+    // default) dropping the finding first.
     let turns = vec![done_turn(json!({
-        "findings": ["something is wrong"],
+        "files": [{"path": "a.txt", "note": "under review"}],
+        "findings": ["a.txt:1 something is wrong"],
         "next_skill": "implement",
     }))];
     let model = Arc::new(MockModel::new(turns));
@@ -354,7 +360,10 @@ async fn review_send_back_with_findings_and_no_tool_call_is_unaffected() {
 
     let (state, _version) = active.session().state().await.unwrap();
     assert!(!state.agent.done);
-    assert_eq!(state.agent.findings, vec!["something is wrong".to_string()]);
+    assert_eq!(
+        state.agent.findings,
+        vec!["a.txt:1 something is wrong".to_string()]
+    );
     assert_eq!(state.agent.next_skill.as_deref(), Some("implement"));
 }
 

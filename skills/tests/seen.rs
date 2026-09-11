@@ -93,6 +93,7 @@ async fn read_file_records_and_extends_the_range() {
             lines: 250,
             read: vec![[1, 100]],
             edited: vec![],
+            read_step: step1,
             step: step1.unwrap(),
         }]
     );
@@ -108,6 +109,7 @@ async fn read_file_records_and_extends_the_range() {
             lines: 250,
             read: vec![[1, 200]],
             edited: vec![],
+            read_step: step2,
             step: step2.unwrap(),
         }]
     );
@@ -157,6 +159,7 @@ async fn edit_file_records_the_edited_range() {
             lines: 0,
             read: vec![],
             edited: vec![[150, 156]],
+            read_step: None,
             step: 1,
         }]
     );
@@ -194,6 +197,7 @@ async fn write_file_of_a_new_file_records_its_own_entry() {
             lines: 12,
             read: vec![],
             edited: vec![[1, 12]],
+            read_step: None,
             step: 1,
         }]
     );
@@ -244,6 +248,7 @@ async fn revert_file_clears_read_and_edited() {
             lines: 250,
             read: vec![],
             edited: vec![],
+            read_step: None,
             step: step.unwrap(),
         }]
     );

@@ -86,6 +86,7 @@ pub fn harness(step: u64) -> HarnessState {
         try_fixes_available: false,
         last_try_fixes_step: None,
         consecutive_non_question_asks: 0,
+        last_failure_summary: None,
     }
 }
 

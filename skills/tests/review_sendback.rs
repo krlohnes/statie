@@ -144,9 +144,12 @@ async fn review_done_true_with_findings_hands_off_to_implement_and_forces_done_f
 
     let turns = vec![
         // One look first, so `review_looked_note`'s look-before-approve gate
-        // is not what is under test here.
+        // is not what is under test here. It also puts `a.txt` in `seen`
+        // with a known line count, so the finding below (citing `a.txt:1`)
+        // is grounded (item 12: grounded review findings) and not itself
+        // dropped by the unrelated grounding guard.
         read_file_turn_with_patch("a.txt", json!({})),
-        done_turn(json!({"done": true, "findings": ["the test still fails"]})),
+        done_turn(json!({"done": true, "findings": ["a.txt:1 the test still fails"]})),
     ];
     let model = Arc::new(MockModel::new(turns));
     let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
@@ -173,7 +176,7 @@ async fn review_done_true_with_findings_hands_off_to_implement_and_forces_done_f
     );
     assert_eq!(
         state.agent.findings,
-        vec!["the test still fails".to_string()],
+        vec!["a.txt:1 the test still fails".to_string()],
         "findings must be preserved"
     );
     assert_eq!(state.agent.next_skill.as_deref(), Some("implement"));
@@ -203,8 +206,15 @@ async fn review_tool_call_with_next_skill_implement_and_findings_hands_off_to_im
 
     let turns = vec![MockTurn::new(
         json!({
+            // The finding cites `a.txt:1`, grounded via the `files` entry
+            // set in the same patch (item 12: grounded review findings) --
+            // `seen` only gets `a.txt` from this step's own `read_file`
+            // call AFTER it executes, too late for this step's own
+            // grounding check, so `files` (checked directly, no line-count
+            // requirement) is what grounds it here instead.
             "patch": {
-                "findings": ["the test still fails"],
+                "files": [{"path": "a.txt", "note": "under review"}],
+                "findings": ["a.txt:1 the test still fails"],
                 "next_skill": "implement",
             },
             "action": {"type": "tool", "name": "read_file", "args": {"path": "a.txt"}},
@@ -229,7 +239,7 @@ async fn review_tool_call_with_next_skill_implement_and_findings_hands_off_to_im
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
         state.agent.findings,
-        vec!["the test still fails".to_string()]
+        vec!["a.txt:1 the test still fails".to_string()]
     );
     assert_eq!(state.agent.next_skill.as_deref(), Some("implement"));
     assert!(!state.agent.done);

@@ -113,8 +113,8 @@ pub use skill::{
 };
 pub use store::{ApplyFn, LoggedPatch, StateStore, apply_fn};
 pub use thinker::{
-    MockThinker, THINK_SYSTEM_PROMPT, ThinkCall, ThinkError, ThinkInput, ThinkOutput, Thinker,
-    extract_answer,
+    MockThinker, OPTIONS_MODE_INSTRUCTION, THINK_SYSTEM_PROMPT, ThinkCall, ThinkError, ThinkInput,
+    ThinkOutput, Thinker, extract_answer,
 };
 pub use tokenizer::{Budgets, HeuristicTokenizer, TiktokenTokenizer, TokenBudget, Tokenizer};
 pub use tool::{Tool, ToolCtx, ToolList, ToolSet};

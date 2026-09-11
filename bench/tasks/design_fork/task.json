@@ -1,0 +1,8 @@
+{
+  "name": "design_fork",
+  "prompt": "Implement `RateLimiter::allow` in src/lib.rs so tests/rate_limiter.rs passes. `RateLimiter::new(capacity, refill_per_sec)` should allow a burst of up to `capacity` calls, then refill at `refill_per_sec` calls per second (a token bucket and a sliding-window log are both acceptable designs). The stub always returns true. Verify with `cargo test`.",
+  "test_cmd": "cargo test",
+  "protected": ["tests/rate_limiter.rs"],
+  "timeout_secs": 900,
+  "tags": ["rust", "design-fork", "rate-limiter"]
+}

@@ -157,6 +157,16 @@ pub struct SeenFile {
     /// merged and sorted the same way as `read`.
     #[serde(default)]
     pub edited: Vec<[u32; 2]>,
+    /// The harness step of the most recent `read_file` of this path, or
+    /// `None` if it has never been read (or was last touched by a
+    /// `write_file`/`revert_file`, both of which clear this back to
+    /// `None` along with `read`). `edit_file` leaves this alone --
+    /// comparing it against `step` (the most recent change of ANY kind)
+    /// is how `write_file_confirmed_by_seen` tells whether the last
+    /// change to this entry was a read (this equals `step`) or an edit
+    /// (this is older than `step`, or `None`).
+    #[serde(default)]
+    pub read_step: Option<u64>,
     /// The harness step of the most recent change recorded for this entry.
     #[serde(default)]
     pub step: u64,
@@ -379,6 +389,54 @@ fn seen_entry<'a>(seen: &'a mut Vec<SeenFile>, path: &str) -> &'a mut SeenFile {
         ..Default::default()
     });
     seen.last_mut().expect("just pushed")
+}
+
+/// BACKLOG.md item 15: whether `seen` already establishes that a
+/// `write_file` on `path` is safe to allow past `tools/src/write_file.rs`'s
+/// whole-file-rewrite line cap -- the harness has recorded a `read_file` of
+/// the *whole* file (every line from 1 to the entry's `lines`, via one or
+/// several coalesced `read` ranges) since the last time any part of it was
+/// edited. That is: `read` (coalesced) covers 1..=lines, AND either
+/// `edited` is empty (never edited this session) or `read_step ==
+/// Some(entry.step)` -- the entry's most recent change of any kind was
+/// that full read, so it came after whatever edit(s) preceded it. An
+/// edit-then-full-reread of the same file is confirmed by the second half
+/// of that OR: the read is the latest change, even though `edited` itself
+/// is left non-empty (`edit_file` never clears it). A further edit after
+/// the read moves `step`/`entry.step` past `read_step` again, so it goes
+/// back to needing a fresh full read.
+pub fn write_file_confirmed_by_seen(seen: &[SeenFile], path: &str) -> bool {
+    let Some(entry) = seen.iter().find(|f| f.path == path) else {
+        return false;
+    };
+    if !entry.edited.is_empty() && entry.read_step != Some(entry.step) {
+        return false;
+    }
+    if entry.lines == 0 {
+        // A `lines: 0` entry means the length was never learned (or the
+        // file is empty) -- there is no target to check `read` coverage
+        // against, so this can't be a confirmed full read.
+        return false;
+    }
+    ranges_cover(&entry.read, entry.lines)
+}
+
+/// Whether the coalesced, sorted-by-construction `ranges` (see
+/// `merge_range`, which every writer of `SeenFile::read`/`edited` goes
+/// through) cover every line from 1 to `lines` inclusive with no gap.
+/// Empty `ranges` never covers a positive `lines`.
+fn ranges_cover(ranges: &[[u32; 2]], lines: u32) -> bool {
+    let mut next_needed: u32 = 1;
+    for r in ranges {
+        if r[0] > next_needed {
+            return false;
+        }
+        next_needed = next_needed.max(r[1].saturating_add(1));
+        if next_needed > lines {
+            return true;
+        }
+    }
+    next_needed > lines
 }
 
 /// Parses `edit_file`'s success output header for the `(lines a-b)` range
@@ -810,6 +868,7 @@ fn common_after_tool(
             entry.lines = header.total as u32;
             merge_range(&mut entry.read, [header.from as u32, header.to as u32]);
             entry.step = step;
+            entry.read_step = Some(step);
         }
         "edit_file" => {
             let range = parse_edit_header(output)?;
@@ -838,6 +897,7 @@ fn common_after_tool(
                 }
             }
             entry.read.clear();
+            entry.read_step = None;
             entry.step = step;
         }
         "revert_file" => {
@@ -854,6 +914,7 @@ fn common_after_tool(
                 }
                 entry.edited.clear();
                 entry.read.clear();
+                entry.read_step = None;
                 entry.step = step;
             }
         }
@@ -1044,11 +1105,122 @@ enum Reason {
 }
 
 /// The question the harness asks `think` on the model's behalf when
-/// [`implement_repeat_failure_thinks`] fires.
+/// [`implement_repeat_failure_thinks`] fires for an [`FailureKind::Assertion`]
+/// failure -- unchanged from before [`classify_failure`] existed, kept under
+/// this name since `skills/tests/think_trigger.rs` and
+/// `skills/src/coding/tests.rs` reference it directly.
 pub const REPEAT_FAILURE_QUESTION: &str = "The test failed the same way after my last edit. \
      Trace the failing test's input through the code with exact arithmetic, checking every \
      intermediate value against what the test expects: which function is actually wrong, and \
-     what is the exact change to make?";
+     what is the exact change to make? If the values are not obvious, use `probe` to print them \
+     instead of computing them.";
+
+/// DECISIONS.md D9 / BACKLOG.md item 18: which shape a test failure takes,
+/// used to pick the [`repeat_failure_question`] asked when
+/// [`implement_repeat_failure_thinks`] fires, instead of asking every repeat
+/// the same arithmetic-trace question written for a rounding-trap assertion.
+/// A calibration run showed that question asked about a Rust compile error:
+/// four `think` calls at 263 seconds each, three of them empty after
+/// exhausting a 32k window, tracing arithmetic that did not exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    CompileError,
+    Assertion,
+    Panic,
+    Timeout,
+    Other,
+}
+
+/// Classifies a normalized failure summary (`core/src/session.rs`'s
+/// `normalize_failure_summary`, as stored in
+/// `HarnessState::last_failure_summary`) into a [`FailureKind`], so
+/// [`repeat_failure_question`] can pick a question that fits the failure.
+///
+/// Order matters: a compile error wins over everything else (a build that
+/// doesn't compile makes any assertion/panic text in the same summary
+/// irrelevant), then a timeout, then an assertion, then a bare panic/
+/// exception; anything matching none of those is `Other`.
+pub fn classify_failure(summary: &str) -> FailureKind {
+    let is_rustc_compile_error = summary.contains("error[E")
+        || (summary
+            .lines()
+            .any(|l| l.trim_start().starts_with("error:"))
+            && (summary.contains("-->") || summary.contains("could not compile")));
+    let is_python_compile_error = [
+        "SyntaxError",
+        "NameError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "IndentationError",
+    ]
+    .iter()
+    .any(|needle| summary.contains(needle));
+    if is_rustc_compile_error || is_python_compile_error {
+        return FailureKind::CompileError;
+    }
+
+    if summary.contains("timed out") || summary.contains("timeout") {
+        return FailureKind::Timeout;
+    }
+
+    // A digit must appear SOMEWHERE in the summary for any of these to
+    // count as an assertion -- a bare "assertion failed: a == b" panic
+    // message with no values in it is a panic, not a traceable assertion
+    // (see `classify_failure_treats_a_digit_free_assertion_panic_as_panic_
+    // not_assertion` in `tests.rs`).
+    let has_digit = summary.chars().any(|c| c.is_ascii_digit());
+    let is_assertion = has_digit
+        && (summary.contains("assertion")
+            || summary.contains("AssertionError")
+            || summary.contains("assert_eq")
+            || summary.contains("left:")
+            || summary.contains("right:")
+            || summary.contains("expected"));
+    if is_assertion {
+        return FailureKind::Assertion;
+    }
+
+    if summary.contains("panicked at")
+        || summary.contains("Traceback")
+        || summary.contains("Exception")
+    {
+        return FailureKind::Panic;
+    }
+
+    FailureKind::Other
+}
+
+/// The question the harness asks `think` on the model's behalf when
+/// [`implement_repeat_failure_thinks`] fires, shaped to `kind` (DECISIONS.md
+/// D9, BACKLOG.md item 18): each caps the expected answer shape so the
+/// reasoning subagent doesn't spend its window tracing values a compile
+/// error, panic, or timeout gives it no reason to trace.
+pub fn repeat_failure_question(kind: FailureKind) -> &'static str {
+    match kind {
+        FailureKind::CompileError => {
+            "The build failed the same way after my last edit. Read the first error only: name \
+             the file and line it points at, say in one sentence what the compiler is objecting \
+             to, and give the one edit (old text and new text) that fixes it. Do not trace \
+             values or reason about the tests."
+        }
+        FailureKind::Assertion => REPEAT_FAILURE_QUESTION,
+        FailureKind::Panic => {
+            "The test failed the same way after my last edit. Name the line that panics or \
+             raises, the input that reaches it, and the one edit that stops it. Do not trace \
+             arithmetic unless the message contains numbers."
+        }
+        FailureKind::Timeout => {
+            "The test timed out the same way after my last edit. Name the loop or wait that \
+             does not finish and the condition that never becomes true, then the one edit that \
+             fixes it."
+        }
+        FailureKind::Other => {
+            "The test failed the same way after my last edit. Read the failure summary once, \
+             name the single most likely cause in one sentence, and give the one edit to make \
+             next."
+        }
+    }
+}
 
 /// `implement`-only: a bench trap fixture showed the acting model unanimous
 /// and wrong -- every edit it tried addressed the wrong function, the test
@@ -1130,8 +1302,12 @@ pub const REPEAT_FAILURE_QUESTION: &str = "The test failed the same way after my
 /// Effect: the action is replaced with `Action::Tool { name: "try_fixes",
 /// args: {} }` when `cur.harness.try_fixes_available` (a `Fixer` is
 /// attached, BACKLOG.md item 4), else `Action::Tool { name: "think", args:
-/// {"question": REPEAT_FAILURE_QUESTION} }` exactly as before. For the edit
-/// and `test` shapes, the raw patch is left exactly as the model sent it
+/// {"question": q} }` where `q` is `repeat_failure_question(classify_failure(
+/// cur.harness.last_failure_summary))` (DECISIONS.md D9, BACKLOG.md item 18)
+/// -- `REPEAT_FAILURE_QUESTION` only when that failure classifies as
+/// `FailureKind::Assertion`; a compile error, panic, or timeout gets a
+/// question shaped to it instead. For the edit and `test` shapes, the raw
+/// patch is left exactly as the model sent it
 /// (the model's action was already a tool call, so there is no `done`/
 /// `next_skill` to strip); for the `ask_user` shape, `next_skill` is
 /// stripped from the raw patch first, the same as `ask_user_empty_note`/
@@ -1233,9 +1409,12 @@ fn implement_repeat_failure_thinks(
         return Some(note);
     }
 
+    let question = repeat_failure_question(classify_failure(
+        cur.harness.last_failure_summary.as_deref().unwrap_or(""),
+    ));
     Some(substitute_think(
         out,
-        REPEAT_FAILURE_QUESTION,
+        question,
         note,
         matches!(shape, Shape::NonQuestionAsk),
     ))
@@ -1360,12 +1539,347 @@ fn substitute_think(
         obj.remove("next_skill");
     }
 
-    out.set_action(statie_core::Action::Tool {
-        name: "think".to_string(),
-        args: serde_json::json!({"question": question}),
-    });
+    substitute_action(
+        out,
+        statie_core::Action::Tool {
+            name: "think".to_string(),
+            args: serde_json::json!({"question": question}),
+        },
+        note,
+    )
+}
 
+/// Shared mechanism behind every action substitution in this module
+/// (`substitute_think`'s two callers, and [`shell_read_as_read_file`]'s
+/// wiring into `PlanSkill`/`ImplementSkill`/`ReviewSkill::validate`):
+/// replaces `out`'s action with `action` and returns `note` as the step's
+/// attached note, so every substitution is logged, prompted, and picked up
+/// by `common_after_tool` identically no matter which trigger fired it or
+/// what action it substitutes in.
+fn substitute_action(
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+    action: statie_core::Action,
+    note: String,
+) -> String {
+    out.set_action(action);
     note
+}
+
+/// The equivalent `read_file` call [`shell_read_as_read_file`] recognises a
+/// `shell` command as. Mirrors `tools::read_file::ReadFileArgs`'s shape
+/// (`path`/`offset`/`limit`), but is defined locally here rather than
+/// depending on the `statie-tools` crate (which itself depends on
+/// `statie-skills` for nothing, but pulling in a whole crate for one args
+/// struct would be a heavier dependency than this module needs) -- the
+/// fields serialise to exactly the JSON `read_file`'s schema expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFileArgs {
+    pub path: String,
+    pub offset: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// The note text [`shell_read_as_read_file`]'s substitution attaches,
+/// filled in with the exact `shell` command the model sent (BACKLOG.md
+/// item 16).
+fn shell_read_substitution_note(cmd: &str) -> String {
+    format!(
+        "`shell {cmd}` was a plain read, so the harness ran it as `read_file` instead: the \
+         read pages, lands in `seen`, and counts for the read guards. Use `read_file` directly \
+         next time."
+    )
+}
+
+/// Strips one layer of matching single or double quotes from `s`, if
+/// present at both ends. Used for a quoted path/`sed` program.
+fn strip_quotes(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
+    {
+        Some(&s[1..s.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Whether `path` is safe to treat as a single plain file argument: no
+/// glob metacharacter, and doesn't start with `-` (which would be an
+/// option, not a path -- e.g. `cat -- -weird` or a flag this parser
+/// doesn't otherwise recognise).
+fn is_plain_path(path: &str) -> bool {
+    !path.is_empty() && !path.starts_with('-') && !path.contains(['*', '?', '['])
+}
+
+/// Recognises ONLY a single-file, pipe-free, redirect-free shell read
+/// command (BACKLOG.md item 16), after trimming `cmd`, and returns the
+/// `read_file` call it is equivalent to. Anything else -- a pipeline, a
+/// redirect, a second path, a glob, an in-place edit, a non-read command --
+/// returns `None`.
+///
+/// Recognised forms:
+/// - `cat <path>`, `cat -n <path>`, `nl <path>` -- plain read (no
+///   offset/limit).
+/// - `head <path>` -- limit 10 (the harness cannot know the file's length
+///   ahead of time, so this maps to `head`'s own default of 10 lines from
+///   the start).
+/// - `head -n N <path>` / `head -N <path>` -- offset 1, limit N.
+/// - `tail <path>`, `tail -n N <path>` / `tail -N <path>` -- plain read (no
+///   offset/limit): the skill cannot know the file's length, so there is no
+///   way to compute the offset `tail`'s "last N lines" would need.
+/// - `sed -n 'A,Bp' <path>` / `sed -n "A,Bp" <path>` / `sed -n A,Bp <path>`
+///   -- offset A, limit B-A+1.
+///
+/// The path may be single- or double-quoted; it must not contain a glob
+/// (`*`, `?`, `[`), must not start with `-`, and `cmd` as a whole must
+/// contain none of `|`, `>`, `<`, `;`, `&&`, `||`, `$(`, a backtick, or a
+/// second path-shaped token.
+pub fn shell_read_as_read_file(cmd: &str) -> Option<ReadFileArgs> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    // Reject anything that could chain commands, redirect, substitute, or
+    // otherwise not be a single flat invocation, before tokenising at all.
+    if cmd.contains(['|', '>', '<', ';', '`'])
+        || cmd.contains("&&")
+        || cmd.contains("||")
+        || cmd.contains("$(")
+    {
+        return None;
+    }
+
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let (prog, rest) = tokens.split_first()?;
+
+    // Normalises a bare token into its path (stripping one layer of
+    // matching quotes), rejecting anything glob-shaped or option-shaped.
+    fn path_token(tok: &str) -> Option<String> {
+        let inner = strip_quotes(tok).unwrap_or(tok);
+        if is_plain_path(inner) {
+            Some(inner.to_string())
+        } else {
+            None
+        }
+    }
+
+    match *prog {
+        "cat" => {
+            // `cat <path>` or `cat -n <path>`: exactly one path token,
+            // optionally preceded by `-n`.
+            let path_args: Vec<&str> = match rest {
+                [only] => vec![only],
+                ["-n", only] => vec![only],
+                _ => return None,
+            };
+            let path = path_token(path_args[0])?;
+            Some(ReadFileArgs {
+                path,
+                offset: None,
+                limit: None,
+            })
+        }
+        "nl" => {
+            let [only] = rest else { return None };
+            let path = path_token(only)?;
+            Some(ReadFileArgs {
+                path,
+                offset: None,
+                limit: None,
+            })
+        }
+        "tail" => {
+            // Any of `tail <path>` / `tail -n N <path>` / `tail -N <path>`:
+            // the harness cannot know the file's length, so every shape
+            // maps to a plain read (no offset/limit) rather than guessing.
+            match rest {
+                [only] => {
+                    let path = path_token(only)?;
+                    Some(ReadFileArgs {
+                        path,
+                        offset: None,
+                        limit: None,
+                    })
+                }
+                ["-n", n, only] => {
+                    n.parse::<u64>().ok()?;
+                    let path = path_token(only)?;
+                    Some(ReadFileArgs {
+                        path,
+                        offset: None,
+                        limit: None,
+                    })
+                }
+                [flag, only] if flag.starts_with('-') => {
+                    flag[1..].parse::<u64>().ok()?;
+                    let path = path_token(only)?;
+                    Some(ReadFileArgs {
+                        path,
+                        offset: None,
+                        limit: None,
+                    })
+                }
+                _ => None,
+            }
+        }
+        "head" => match rest {
+            [only] => {
+                let path = path_token(only)?;
+                Some(ReadFileArgs {
+                    path,
+                    offset: None,
+                    limit: Some(10),
+                })
+            }
+            ["-n", n, only] => {
+                let limit: u64 = n.parse().ok()?;
+                let path = path_token(only)?;
+                Some(ReadFileArgs {
+                    path,
+                    offset: Some(1),
+                    limit: Some(limit),
+                })
+            }
+            [flag, only] if flag.starts_with('-') => {
+                let limit: u64 = flag[1..].parse().ok()?;
+                let path = path_token(only)?;
+                Some(ReadFileArgs {
+                    path,
+                    offset: Some(1),
+                    limit: Some(limit),
+                })
+            }
+            _ => None,
+        },
+        "sed" => {
+            // `sed -n 'A,Bp' <path>` / `sed -n "A,Bp" <path>` / `sed -n
+            // A,Bp <path>`: exactly `-n`, the range program, then one path
+            // token.
+            let (prog_tok, only) = match rest {
+                ["-n", prog_tok, only] => (*prog_tok, *only),
+                _ => return None,
+            };
+            let path = path_token(only)?;
+            let inner = strip_quotes(prog_tok).unwrap_or(prog_tok);
+            let inner = inner.strip_suffix('p')?;
+            let (a_str, b_str) = inner.split_once(',')?;
+            let a: u64 = a_str.trim().parse().ok()?;
+            let b: u64 = b_str.trim().parse().ok()?;
+            if b < a {
+                return None;
+            }
+            Some(ReadFileArgs {
+                path,
+                offset: Some(a),
+                limit: Some(b - a + 1),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `plan`/`implement`/`review`-shared trigger (BACKLOG.md item 16): when
+/// `out`'s action is `Tool { name: "shell", args }` and `args.cmd` (the
+/// `shell` tool's arg name, `tools/src/shell.rs`'s `ShellArgs::cmd`) parses
+/// with [`shell_read_as_read_file`], replaces the action with the
+/// equivalent `Tool { name: "read_file", args: {path, offset?, limit?} }`
+/// (omitting `offset`/`limit` keys entirely when `None`, rather than
+/// sending them as JSON `null` -- `read_file`'s own `Option<usize>` fields
+/// default the same way either way, but omitting matches what a model
+/// calling `read_file` directly would send) and returns the substitution
+/// note. Runs before every other trigger in each skill's `validate` (the
+/// think substitutions all require an edit/idle-test/ask_user shape a
+/// `shell` action never has, so ordering relative to them does not matter
+/// in practice; this still runs first so a substituted `read_file` call is
+/// visible to every guard downstream, e.g. `Skill::silent_read_cap`, the
+/// same as one the model sent directly).
+///
+/// Any other `shell` command, or any other action entirely, is left
+/// untouched (`None`) -- most notably `cargo test`/`cargo build` and every
+/// other non-read shell invocation, which must keep running as `shell`.
+fn shell_read_substitution(out: &mut statie_core::ParsedOutput<CodingWorkspace>) -> Option<String> {
+    let statie_core::Action::Tool { name, args } = out.action() else {
+        return None;
+    };
+    if name != "shell" {
+        return None;
+    }
+    let cmd = args
+        .get("cmd")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let read_args = shell_read_as_read_file(&cmd)?;
+
+    let mut read_file_args = serde_json::Map::new();
+    read_file_args.insert(
+        "path".to_string(),
+        serde_json::Value::String(read_args.path),
+    );
+    if let Some(offset) = read_args.offset {
+        read_file_args.insert("offset".to_string(), serde_json::json!(offset));
+    }
+    if let Some(limit) = read_args.limit {
+        read_file_args.insert("limit".to_string(), serde_json::json!(limit));
+    }
+
+    let note = shell_read_substitution_note(&cmd);
+    Some(substitute_action(
+        out,
+        statie_core::Action::Tool {
+            name: "read_file".to_string(),
+            args: serde_json::Value::Object(read_file_args),
+        },
+        note,
+    ))
+}
+
+/// `plan`/`implement`/`review`-shared trigger (BACKLOG.md item 15): when
+/// `out`'s action is `Tool { name: "write_file", args }`, first strips any
+/// `confirmed_full_read` key the model itself sent in `args` -- that flag is
+/// harness-set only (`tools/src/write_file.rs`'s `WriteFileArgs`, hidden
+/// from the model's schema with `#[schemars(skip)]`); the model must never
+/// be able to claim the confirmation on its own, so whatever it sent there
+/// is discarded before anything else looks at `args`. Then, if [`write_file_
+/// confirmed_by_seen`] says `cur.agent.seen` already shows a full, recent
+/// read of the target path, sets `args.confirmed_full_read = true` so the
+/// tool call skips its whole-file-rewrite line cap. Silent either way -- no
+/// note is attached; when the harness does NOT set the flag and the file is
+/// over the cap, `write_file`'s own refusal text explains the rule directly
+/// to the model.
+///
+/// A `write_file` call with no `path` (or a non-object `args`) is left
+/// alone -- that is a malformed call the tool itself will reject with its
+/// own error, not this function's to diagnose.
+fn write_file_auto_confirm(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) {
+    let statie_core::Action::Tool { name, args } = out.action() else {
+        return;
+    };
+    if name != "write_file" {
+        return;
+    }
+
+    let confirmed = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|p| write_file_confirmed_by_seen(&cur.agent.seen, p));
+
+    let statie_core::Action::Tool { name, mut args } = out.action().clone() else {
+        unreachable!("checked above")
+    };
+    if let serde_json::Value::Object(map) = &mut args {
+        map.remove("confirmed_full_read");
+        if confirmed {
+            map.insert(
+                "confirmed_full_read".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+    }
+    out.set_action(statie_core::Action::Tool { name, args });
 }
 
 /// Applies `out`'s raw patch to `cur` the same way `strip_malformed_next`
@@ -2148,6 +2662,191 @@ fn review_sendback_note(
     }
 }
 
+/// Parses the first `<path>:<digits>` token out of a review finding (item
+/// 12: grounded review findings) -- the location a grounded finding must
+/// cite. Scans whitespace-delimited words left to right; each word is first
+/// trimmed of a light shell of wrapping punctuation (`()[]{}"',;`) so shapes
+/// like `"(src/foo.rs:12)"` or `"src/foo.rs:12,"` still match. The first word
+/// left with a `:` is a candidate: `path` is everything before that `:` (must
+/// be non-empty), and `line` is the maximal run of ASCII digits right after
+/// it (so `"src/foo.rs:12:something"` and `"src/foo.rs:12."` both yield line
+/// `12` -- trailing non-digit text after the digits does not disqualify the
+/// match). A word whose text after the first `:` starts with a non-digit
+/// (e.g. a bare `"note:"`) is skipped in favor of the next word, not treated
+/// as a failed parse of the whole finding.
+fn parse_finding_location(finding: &str) -> Option<(&str, u32)> {
+    for raw_word in finding.split_whitespace() {
+        let word = raw_word.trim_matches(|c: char| "()[]{}\"',;".contains(c));
+        let Some(colon) = word.find(':') else {
+            continue;
+        };
+        let path = &word[..colon];
+        if path.is_empty() {
+            continue;
+        }
+        let rest = &word[colon + 1..];
+        let digit_len = rest.chars().take_while(char::is_ascii_digit).count();
+        if digit_len == 0 {
+            continue;
+        }
+        if let Ok(line) = rest[..digit_len].parse::<u32>() {
+            return Some((path, line));
+        }
+    }
+    None
+}
+
+/// Whether `path` is present in the sandbox per the workspace's own records
+/// -- `files` (the model's manifest of files touched/relevant) or `seen`
+/// (the harness's own read/edit ledger) -- and, if so, the line count to
+/// check `line` against: `seen`'s recorded `lines` when that entry has one
+/// (`> 0`; see `SeenFile::lines`'s doc -- `0` means never learned), else
+/// `None` (present, but no known length to check against -- see
+/// `finding_is_grounded`'s doc for what that means for the line check).
+fn known_file_line_count(ws: &CodingWorkspace, path: &str) -> Option<Option<u32>> {
+    if let Some(entry) = ws.seen.iter().find(|f| f.path == path) {
+        return Some((entry.lines > 0).then_some(entry.lines));
+    }
+    if ws.files.iter().any(|f| f.path == path) {
+        return Some(None);
+    }
+    None
+}
+
+/// Whether a review finding is grounded (item 12): it must contain a
+/// `<path:line>` citation (`parse_finding_location`) naming a file present
+/// in the sandbox (`ws.files` or `ws.seen`) with `line` within that file's
+/// known line count. When the file is known but its line count is not (no
+/// `seen` entry with a nonzero `lines`, e.g. a `files` entry never actually
+/// read), the citation is accepted on the path alone -- there is nothing to
+/// range-check yet, and the harness must not penalize a finding for citing a
+/// file it has not itself read the length of.
+fn finding_is_grounded(ws: &CodingWorkspace, finding: &str) -> bool {
+    let Some((path, line)) = parse_finding_location(finding) else {
+        return false;
+    };
+    if line == 0 {
+        return false;
+    }
+    match known_file_line_count(ws, path) {
+        Some(Some(lines)) => line <= lines,
+        Some(None) => true,
+        None => false,
+    }
+}
+
+/// `review`-only (item 12: grounded review findings; `guards.
+/// grounded_findings`, `core/src/guards.rs`, default on): on a send-back
+/// (the merged workspace's `findings` is non-empty), drops every ungrounded
+/// finding (`finding_is_grounded`) from the raw patch's `findings` array in
+/// place. Returns `Ok(None)` when nothing was dropped (including when
+/// `findings` was not sent in this patch at all, or the merged `findings` is
+/// empty -- an approval, not this rule's concern) or when the switch is off.
+/// Returns `Ok(Some(note))` when some (but not all) findings were dropped,
+/// the note naming exactly which ones and why -- the raw patch's `findings`
+/// is rewritten to the grounded subset, in its original order. Returns
+/// `Err(PatchError::RuleViolation(note))` when every finding was dropped:
+/// the send-back is refused outright, the same as any other rule violation
+/// (the step never commits, the model sees the reason and gets a retry) --
+/// unlike a partial drop, there is no grounded subset left to send back with.
+///
+/// Only inspects/rewrites `findings` when the raw patch actually carries the
+/// key (`out.patch().0.get("findings")`) -- a patch that leaves `findings`
+/// untouched (committed findings, if any, unchanged) is not this rule's
+/// concern either, matching `review_sendback_note`'s own pattern of only
+/// acting on what the model actually sent.
+///
+/// Called in `ReviewSkill::validate` after `review_sendback_note` has had a
+/// chance to normalize a send-back shape into a raw patch that actually
+/// carries `findings` (e.g. the `done: true` + findings shape needs no
+/// normalizing here since findings was already in the raw patch; see that
+/// function's doc for the shapes it rewrites). Grounding runs on whatever
+/// `findings` array is in the raw patch by that point, regardless of which
+/// path put it there.
+///
+/// Grounds each finding against the *merged* (post-patch) workspace, not
+/// just `cur` -- the same file this step's own patch just added to `files`
+/// (e.g. a tool-call step that both notes a file and cites it, in the same
+/// patch) is visible to the check, matching how `review_sendback_note`/
+/// `review_blind_approval_runs_test` already read `merged_workspace` rather
+/// than `cur` alone. A patch that fails to deserialize/apply is left alone
+/// (`Ok(None)`): it falls straight through to `validate_default`, which
+/// reports the real error.
+fn review_grounded_findings(
+    grounded_findings_enabled: bool,
+    cur: &CodingWorkspace,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Result<Option<String>, PatchError> {
+    if !grounded_findings_enabled {
+        return Ok(None);
+    }
+
+    let Some(sent) = out.patch().0.get("findings") else {
+        return Ok(None);
+    };
+    let Some(sent) = sent.as_array() else {
+        return Ok(None);
+    };
+    let sent: Vec<String> = sent
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if sent.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(merged) = merged_workspace(cur, out) else {
+        return Ok(None);
+    };
+
+    let mut grounded = Vec::with_capacity(sent.len());
+    let mut dropped = Vec::new();
+    for finding in &sent {
+        if finding_is_grounded(&merged, finding) {
+            grounded.push(finding.clone());
+        } else {
+            dropped.push(finding.clone());
+        }
+    }
+
+    if dropped.is_empty() {
+        return Ok(None);
+    }
+
+    if grounded.is_empty() {
+        return Err(PatchError::RuleViolation(format!(
+            "Dropped {} finding{} with no file:line citation. Every finding must name the line \
+             it is about.",
+            dropped.len(),
+            if dropped.len() == 1 { "" } else { "s" },
+        )));
+    }
+
+    if let Some(obj) = out.patch_mut().0.as_object_mut() {
+        obj.insert(
+            "findings".to_string(),
+            serde_json::Value::Array(
+                grounded
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+
+    let named: Vec<String> = dropped
+        .iter()
+        .map(|f| format!("\"{}\"", f.chars().take(60).collect::<String>()))
+        .collect();
+    Ok(Some(format!(
+        "Dropped {} finding{} with no file:line citation. Every finding must name the line it \
+         is about. Dropped: {}.",
+        dropped.len(),
+        if dropped.len() == 1 { "" } else { "s" },
+        named.join("; "),
+    )))
+}
+
 /// Case (b) alone, shared by `plan`/`implement`/`review`: `ask_user` with an
 /// empty/whitespace `message`. See `premature_done_note`'s doc.
 ///
@@ -2479,6 +3178,11 @@ pub struct PlanSkill {
     /// `guards.tests_field` (BACKLOG.md item 5); see [`PlanSkill::seen`].
     /// Set with [`PlanSkill::state_fields`].
     tests: bool,
+    /// `thinker.listed` (`cli/src/config.rs`); defaults to `true` (today's
+    /// behaviour). `false` omits `think` from [`PlanSkill::tools`] without
+    /// disabling it -- the harness's own substitutions still construct a
+    /// `think` action directly. Set with [`PlanSkill::with_listed`].
+    listed: bool,
 }
 
 impl Default for PlanSkill {
@@ -2490,6 +3194,7 @@ impl Default for PlanSkill {
             seen: true,
             decision: true,
             tests: true,
+            listed: true,
         }
     }
 }
@@ -2506,6 +3211,9 @@ pub struct ImplementSkill {
     decision: bool,
     /// `guards.tests_field` (BACKLOG.md item 5); see [`PlanSkill::seen`].
     tests: bool,
+    /// `thinker.listed`; see [`PlanSkill::listed`]. Set with
+    /// [`ImplementSkill::with_listed`].
+    listed: bool,
 }
 
 impl Default for ImplementSkill {
@@ -2517,6 +3225,7 @@ impl Default for ImplementSkill {
             seen: true,
             decision: true,
             tests: true,
+            listed: true,
         }
     }
 }
@@ -2534,6 +3243,12 @@ pub struct ReviewSkill {
     decision: bool,
     /// `guards.tests_field` (BACKLOG.md item 5); see [`PlanSkill::seen`].
     tests: bool,
+    /// `thinker.listed`; see [`PlanSkill::listed`]. Set with
+    /// [`ReviewSkill::with_listed`].
+    listed: bool,
+    /// `guards.grounded_findings` (`core/src/guards.rs`; item 12: grounded
+    /// review findings). Set with [`ReviewSkill::with_grounded_findings`].
+    grounded_findings: bool,
 }
 
 impl Default for ReviewSkill {
@@ -2545,6 +3260,8 @@ impl Default for ReviewSkill {
             seen: true,
             decision: true,
             tests: true,
+            listed: true,
+            grounded_findings: true,
         }
     }
 }
@@ -2724,6 +3441,7 @@ impl PlanSkill {
             seen: true,
             decision: true,
             tests: true,
+            listed: true,
         }
     }
 
@@ -2732,6 +3450,17 @@ impl PlanSkill {
     /// works: the rule audit").
     pub fn with_done_stays_done(mut self, enabled: bool) -> Self {
         self.done_stays_done = enabled;
+        self
+    }
+
+    /// Sets `thinker.listed` (default `true`). `false` omits `think` from
+    /// [`PlanSkill::tools`] -- the model can no longer choose it on its own
+    /// -- without disabling `think` itself: the harness's own
+    /// substitutions (`implement_repeat_failure_thinks`'s repeated-failure
+    /// trigger, the early-park trigger) still construct `Action::Tool {
+    /// name: "think", .. }` directly and are unaffected.
+    pub fn with_listed(mut self, listed: bool) -> Self {
+        self.listed = listed;
         self
     }
 
@@ -2778,7 +3507,9 @@ impl Skill for PlanSkill {
              - `notes` is kept by the harness from your previous reasoning: read it \
                before deciding; you cannot patch it.\n\
              - If you commit to a next step by setting `next`, the harness holds you to \
-               it -- change `next` (and say why in `recent_summary`) if the plan changes.\n\n\
+               it -- change `next` (and say why in `recent_summary`) if the plan changes.\n\
+             - For a design fork with more than one reasonable approach, call `think` with \
+               `mode: \"options\"` before writing the plan.\n\n\
              When to hand off: once the plan is solid, set `next_skill: \"implement\"` \
              and action `done`. The plan must be non-empty before you hand off to \
              `implement`.\n\n\
@@ -2797,15 +3528,18 @@ impl Skill for PlanSkill {
     }
 
     fn tools(&self) -> Vec<String> {
-        vec![
+        let mut tools = vec![
             "list_files".to_string(),
             "read_file".to_string(),
             "search".to_string(),
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
             "test".to_string(),
-            "think".to_string(),
-        ]
+        ];
+        if self.listed {
+            tools.push("think".to_string());
+        }
+        tools
     }
 
     fn allowed_transitions(&self) -> Vec<String> {
@@ -2919,7 +3653,13 @@ impl Skill for PlanSkill {
     /// `notes`/`reports`/`seen` commits the rest of the patch instead of
     /// being rejected outright. Also strips a malformed `next` (see
     /// `strip_malformed_next`) before `validate_default` runs, attaching the
-    /// note it returns to the resulting `ValidatedStep`, and converts an
+    /// note it returns to the resulting `ValidatedStep`; runs
+    /// `shell_read_substitution` (BACKLOG.md item 16), replacing a `shell`
+    /// action whose `cmd` is a pure single-file read with the equivalent
+    /// `read_file` call (see `ImplementSkill::validate`'s doc for why); runs
+    /// `write_file_auto_confirm` (BACKLOG.md item 15, harmless here since
+    /// `plan` has no `write_file` tool -- see `ImplementSkill::validate`'s
+    /// doc); and converts an
     /// empty `ask_user` into the harness-internal `Action::Continue` instead
     /// of rejecting the step (case (b) of `premature_done_note`'s doc;
     /// `plan` does not get case (a) -- its bare-`done` handling above
@@ -2931,6 +3671,8 @@ impl Skill for PlanSkill {
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
         let mut notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let note = strip_malformed_next(&cur.agent, &mut out);
+        let shell_read_note = shell_read_substitution(&mut out);
+        write_file_auto_confirm(cur, &mut out);
 
         if let Some(note) = ask_user_empty_note(&mut out) {
             out.set_action(statie_core::Action::Continue { note });
@@ -3006,6 +3748,7 @@ impl Skill for PlanSkill {
         let not_ours_note = plan_done_not_ours_note(&cur.agent, &mut out);
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
         notes.extend(note);
+        notes.extend(shell_read_note);
         notes.extend(not_ours_note);
         Ok(if notes.is_empty() {
             step
@@ -3031,6 +3774,7 @@ impl ImplementSkill {
             seen: true,
             decision: true,
             tests: true,
+            listed: true,
         }
     }
 
@@ -3039,6 +3783,12 @@ impl ImplementSkill {
     /// works: the rule audit").
     pub fn with_done_stays_done(mut self, enabled: bool) -> Self {
         self.done_stays_done = enabled;
+        self
+    }
+
+    /// Sets `thinker.listed`; see [`PlanSkill::with_listed`].
+    pub fn with_listed(mut self, listed: bool) -> Self {
+        self.listed = listed;
         self
     }
 
@@ -3113,7 +3863,7 @@ impl Skill for ImplementSkill {
     }
 
     fn tools(&self) -> Vec<String> {
-        vec![
+        let mut tools = vec![
             "list_files".to_string(),
             "read_file".to_string(),
             "search".to_string(),
@@ -3124,9 +3874,13 @@ impl Skill for ImplementSkill {
             "test".to_string(),
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
-            "think".to_string(),
-            "try_fixes".to_string(),
-        ]
+        ];
+        if self.listed {
+            tools.push("think".to_string());
+        }
+        tools.push("try_fixes".to_string());
+        tools.push("probe".to_string());
+        tools
     }
 
     fn allowed_transitions(&self) -> Vec<String> {
@@ -3237,6 +3991,19 @@ impl Skill for ImplementSkill {
     /// being rejected outright. Then strips a malformed `next` (see
     /// `strip_malformed_next`) before `validate_default` runs, attaching the
     /// note it returns to the resulting `ValidatedStep`. Then
+    /// `shell_read_substitution` (BACKLOG.md item 16): a `shell` action
+    /// whose `cmd` is a pure single-file read (`shell_read_as_read_file`)
+    /// is replaced with the equivalent `read_file` call, so it pages, lands
+    /// in `seen`, and counts for the read guards, instead of running as an
+    /// opaque `shell` call those guards cannot see. Then `write_file_auto_
+    /// confirm` (BACKLOG.md item 15): on a `write_file` action, strips any
+    /// model-supplied `confirmed_full_read` from `args` and, when
+    /// `write_file_confirmed_by_seen` says `seen` already shows a full,
+    /// recent read of the target path, sets it back to `true` -- the whole-
+    /// file rewrite guard (`tools/src/write_file.rs`'s line cap) then
+    /// consults the harness's own record of what the model has read instead
+    /// of a fixed line count, silently (no note either way; the tool's own
+    /// refusal explains the rule when the flag isn't set). Then
     /// `implement_repeat_failure_thinks`: with a repeated test failure open
     /// and no `think` since, an edit, an idle test rerun, or a non-question
     /// `ask_user` is replaced with a `think` call instead (see its doc for
@@ -3300,6 +4067,8 @@ impl Skill for ImplementSkill {
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
         let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let strip_note = strip_malformed_next(&cur.agent, &mut out);
+        let shell_read_note = shell_read_substitution(&mut out);
+        write_file_auto_confirm(cur, &mut out);
         let repeat_think_note = implement_repeat_failure_thinks(cur, &mut out);
         // Only reachable when `implement_repeat_failure_thinks` did not
         // already fire: that function replaces a matching `ask_user` action
@@ -3335,6 +4104,7 @@ impl Skill for ImplementSkill {
         let notes: Vec<String> = owned_notes
             .into_iter()
             .chain(strip_note)
+            .chain(shell_read_note)
             .chain(repeat_think_note)
             .chain(early_park_think_note)
             .chain(not_ours_note)
@@ -3364,6 +4134,8 @@ impl ReviewSkill {
             seen: true,
             decision: true,
             tests: true,
+            listed: true,
+            grounded_findings: true,
         }
     }
 
@@ -3375,12 +4147,27 @@ impl ReviewSkill {
         self
     }
 
+    /// Sets `thinker.listed`; see [`PlanSkill::with_listed`].
+    pub fn with_listed(mut self, listed: bool) -> Self {
+        self.listed = listed;
+        self
+    }
+
     /// Sets `guards.seen_map`/`guards.decision_field`/`guards.tests_field`;
     /// see [`PlanSkill::state_fields`].
     pub fn state_fields(mut self, seen: bool, decision: bool, tests: bool) -> Self {
         self.seen = seen;
         self.decision = decision;
         self.tests = tests;
+        self
+    }
+
+    /// Sets `guards.grounded_findings` (default `true`; `core/src/
+    /// guards.rs`, item 12: grounded review findings). `false` restores the
+    /// pre-grounding behaviour: every send-back finding passes through
+    /// unchanged, with no `path:line` check.
+    pub fn with_grounded_findings(mut self, enabled: bool) -> Self {
+        self.grounded_findings = enabled;
         self
     }
 }
@@ -3427,15 +4214,18 @@ impl Skill for ReviewSkill {
     }
 
     fn tools(&self) -> Vec<String> {
-        vec![
+        let mut tools = vec![
             "list_files".to_string(),
             "read_file".to_string(),
             "search".to_string(),
             "test".to_string(),
             "recall".to_string(),
             "filter_last_tool_call".to_string(),
-            "think".to_string(),
-        ]
+        ];
+        if self.listed {
+            tools.push("think".to_string());
+        }
+        tools
     }
 
     fn allowed_transitions(&self) -> Vec<String> {
@@ -3518,10 +4308,25 @@ impl Skill for ReviewSkill {
     /// `notes`/`reports`/`seen` commits the rest of the patch instead of
     /// being rejected outright. Then strips a malformed `next` (see
     /// `strip_malformed_next`) before `validate_default` runs, attaching the
-    /// note it returns to the resulting `ValidatedStep`; converts one of two
+    /// note it returns to the resulting `ValidatedStep`. Then
+    /// `shell_read_substitution` (BACKLOG.md item 16): a `shell` action
+    /// whose `cmd` is a pure single-file read is replaced with the
+    /// equivalent `read_file` call (see `ImplementSkill::validate`'s doc for
+    /// why). Then `write_file_auto_confirm` (BACKLOG.md item 15, harmless
+    /// here since `review` has no `write_file` tool -- see
+    /// `ImplementSkill::validate`'s doc). Then, converts one of two
     /// send-back shapes a live run sent (see `review_sendback_note`'s doc)
     /// into the intended
-    /// handoff to `implement` instead of a rejection; converts an empty
+    /// handoff to `implement` instead of a rejection; then, still ahead of
+    /// the three conversions below, `review_grounded_findings` (item 12:
+    /// grounded review findings; `guards.grounded_findings`) drops any
+    /// ungrounded finding from whatever `findings` array the raw patch now
+    /// carries (whether the model sent it directly or `review_sendback_note`
+    /// just normalized it there), attaching a note naming what was dropped
+    /// and why -- or, if every finding was ungrounded, propagating a
+    /// `PatchError::RuleViolation` straight out of `validate` (via `?`) to
+    /// refuse the whole step instead, before any of the further conversions
+    /// run; converts an empty
     /// `ask_user` into the harness-internal `Action::Continue` instead of
     /// rejecting the step (case (b) of `premature_done_note`'s doc;
     /// `review`'s `done` semantics -- `done: true` only with empty
@@ -3557,7 +4362,10 @@ impl Skill for ReviewSkill {
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
         let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let note = strip_malformed_next(&cur.agent, &mut out);
+        let shell_read_note = shell_read_substitution(&mut out);
+        write_file_auto_confirm(cur, &mut out);
         let sendback_note = review_sendback_note(self, &cur.agent, &mut out);
+        let grounded_note = review_grounded_findings(self.grounded_findings, &cur.agent, &mut out)?;
         let mut blind_approval_note = None;
         if sendback_note.is_none() {
             blind_approval_note = review_blind_approval_runs_test(cur, &mut out);
@@ -3579,7 +4387,9 @@ impl Skill for ReviewSkill {
         let notes: Vec<String> = owned_notes
             .into_iter()
             .chain(note)
+            .chain(shell_read_note)
             .chain(sendback_note)
+            .chain(grounded_note)
             .chain(blind_approval_note)
             .collect();
         Ok(if notes.is_empty() {
@@ -3612,9 +4422,9 @@ pub fn coding_skills() -> Vec<(
 /// `done_stays_done` defaults to `false` here (`coding_skills_configured`'s
 /// default path, the first bench battery's audit showed the switch off no
 /// worse -- see `plan_rules`'s doc); `seen_map`/`decision_field`/
-/// `tests_field` default to `true` (today's behaviour, like every other
-/// guard -- see `core/src/guards.rs`); use `coding_skills_configured`
-/// directly to opt any of these back.
+/// `tests_field`/`grounded_findings` default to `true` (today's behaviour,
+/// like every other guard -- see `core/src/guards.rs`); use
+/// `coding_skills_configured` directly to opt any of these back.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_with_delegates(
     delegates: Vec<String>,
@@ -3622,17 +4432,19 @@ pub fn coding_skills_with_delegates(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
 )> {
-    coding_skills_configured(delegates, false, true, true, true)
+    coding_skills_configured(delegates, false, true, true, true, true, true)
 }
 
 /// All four coding skills with every knob: `delegates` as in
 /// [`coding_skills_with_delegates`]; `done_stays_done` = `guards.
 /// done_stays_done` (statie-spec.md "10. After it works: the rule audit");
 /// `seen`/`decision`/`tests` = `guards.seen_map`/`guards.decision_field`/
-/// `guards.tests_field` (`core/src/guards.rs`; BACKLOG.md items 2 and 5) --
-/// all threaded into `plan`, `implement`, and `review` via
-/// [`PlanSkill::with_done_stays_done`]/[`PlanSkill::state_fields`] and
-/// their siblings. `router` is unaffected by all four: it has no plan-step
+/// `guards.tests_field` (`core/src/guards.rs`; BACKLOG.md items 2 and 5);
+/// `grounded_findings` = `guards.grounded_findings` (`core/src/guards.rs`,
+/// item 12: grounded review findings, `review`-only) -- all threaded into
+/// `plan`, `implement`, and `review` via [`PlanSkill::with_done_stays_done`]/
+/// [`PlanSkill::state_fields`]/[`ReviewSkill::with_grounded_findings`] and
+/// their siblings. `router` is unaffected by all five: it has no plan-step
 /// rules and no tools, so nothing in it reads any of them.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_configured(
@@ -3641,6 +4453,8 @@ pub fn coding_skills_configured(
     seen: bool,
     decision: bool,
     tests: bool,
+    grounded_findings: bool,
+    listed: bool,
 ) -> Vec<(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
@@ -3652,7 +4466,8 @@ pub fn coding_skills_configured(
             Arc::new(
                 PlanSkill::with_delegates(delegates.clone())
                     .with_done_stays_done(done_stays_done)
-                    .state_fields(seen, decision, tests),
+                    .state_fields(seen, decision, tests)
+                    .with_listed(listed),
             ),
         ),
         (
@@ -3660,7 +4475,8 @@ pub fn coding_skills_configured(
             Arc::new(
                 ImplementSkill::with_delegates(delegates.clone())
                     .with_done_stays_done(done_stays_done)
-                    .state_fields(seen, decision, tests),
+                    .state_fields(seen, decision, tests)
+                    .with_listed(listed),
             ),
         ),
         (
@@ -3668,7 +4484,9 @@ pub fn coding_skills_configured(
             Arc::new(
                 ReviewSkill::with_delegates(delegates)
                     .with_done_stays_done(done_stays_done)
-                    .state_fields(seen, decision, tests),
+                    .state_fields(seen, decision, tests)
+                    .with_grounded_findings(grounded_findings)
+                    .with_listed(listed),
             ),
         ),
     ]

@@ -36,7 +36,7 @@ use statie_core::{
     Schema, Session, SessionConfig, SessionLog, SessionLogExt, StepSink, ThinkOutput,
 };
 use statie_models::{MockModel, MockTurn};
-use statie_skills::{CodingWorkspace, ImplementSkill};
+use statie_skills::{CodingWorkspace, ImplementSkill, REPEAT_FAILURE_QUESTION};
 use statie_store::InMemoryStore;
 use statie_tools::{ToolConfig, default_tools};
 
@@ -147,12 +147,6 @@ fn last_action(log: &Arc<dyn SessionLog>) -> (String, Value) {
     )
 }
 
-/// The exact question `implement_repeat_failure_thinks` substitutes.
-const REPEAT_FAILURE_QUESTION: &str = "The test failed the same way after my last edit. Trace \
-     the failing test's input through the code with exact arithmetic, checking every \
-     intermediate value against what the test expects: which function is actually wrong, and \
-     what is the exact change to make?";
-
 const THINKER_ANSWER: &str = "the bug is in tax.rs: use 5000 not 500";
 
 #[tokio::test]
@@ -160,14 +154,24 @@ async fn repeat_failure_substitutes_think_once_then_lets_the_next_edit_through()
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.txt"), "content\n").unwrap();
 
+    // The failing command prints an assertion-shaped summary (rather than
+    // a bare nonzero exit) so `classify_failure` classifies it as
+    // `FailureKind::Assertion` and the substituted `think` call still
+    // carries `REPEAT_FAILURE_QUESTION`, same as before `classify_failure`
+    // existed (BACKLOG.md item 18). Each occurrence is preceded by a
+    // `write_file` (mutated_since_verify), so the redundant-verification
+    // guard (7.7, `core/src/session.rs`) never skips the repeat here even
+    // though the command string is identical every time.
+    const ASSERTION_CMD: &str = "printf 'assertion failed: left: 1 right: 2\\n'; exit 1";
+
     let turns = vec![
         // Step 1: fail (fresh failure).
-        test_turn("false"),
+        test_turn(ASSERTION_CMD),
         // Step 2: a real write (mutated flag set).
         write_file_turn("a.txt", "still wrong\n"),
         // Step 3: fail again, identical -- repeated_failure_step gets set
         // to this step.
-        test_turn("false"),
+        test_turn(ASSERTION_CMD),
         // Step 4: the model tries another edit -- must be substituted for
         // `think`.
         write_file_turn("a.txt", "second attempt\n"),
@@ -182,14 +186,14 @@ async fn repeat_failure_substitutes_think_once_then_lets_the_next_edit_through()
         // say -- all five came back empty, see `ModelThinker::think`'s
         // `done_reason: "length"` handling) blocks it because `seen` has no
         // edit recorded after the think call at step 4.
-        test_turn("false"),
+        test_turn(ASSERTION_CMD),
         // Step 6: a real edit -- this IS new information for the reasoning
         // subagent, so it re-arms the trigger for the next stuck action.
         write_file_turn("a.txt", "fourth attempt\n"),
         // Step 7: fail again, identical to steps 3/5 -- a fresh
         // repeated_failure_step, with an edit (step 6) now recorded after
         // the last think call (step 4).
-        test_turn("false"),
+        test_turn(ASSERTION_CMD),
         // Step 8: the model tries another edit -- must be substituted for
         // `think` AGAIN: the edit at step 6 happened after the last think
         // call (step 4), so the trigger re-arms. The mock thinker must have
@@ -371,26 +375,32 @@ async fn repeat_failure_substitutes_think_for_an_idle_test_rerun() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.txt"), "content\n").unwrap();
 
-    // Each `test` call below uses a DIFFERENT command (all failing the same
-    // way -- an empty-output nonzero exit -- so `normalize_failure_summary`
-    // treats them as an identical repeat) so the redundant-verification
-    // guard (7.7 in `Active::execute`, `core/src/session.rs`) never matches
-    // the previous call's exact `cmd` and skips it: a truly identical `test`
-    // call is skipped at execution time and never reaches `set_harness`'s
-    // `test` branch at all, so it could never set `repeated_failure_step`
-    // or exercise this trigger.
+    // Each `test` call below uses a DIFFERENT command (the redundant-
+    // verification guard, 7.7 in `Active::execute`/`core/src/session.rs`,
+    // matches on the exact `cmd` string and would skip a truly identical
+    // repeat before it ever reached `set_harness`'s `test` branch), but
+    // every one prints the SAME assertion-shaped stdout and exits non-zero,
+    // so `normalize_failure_summary` treats them as an identical repeat
+    // (classifying as `FailureKind::Assertion`, so the substituted `think`
+    // call still carries `REPEAT_FAILURE_QUESTION`, same as before
+    // `classify_failure` existed).
+    const ASSERTION_CMD_1: &str = "printf 'assertion failed: left: 1 right: 2\\n'; exit 1";
+    const ASSERTION_CMD_2: &str = "printf 'assertion failed: left: 1 right: 2\\n'; false; exit 1";
+    const ASSERTION_CMD_3: &str = "printf 'assertion failed: left: 1 right: 2\\n'; exit 1; true";
+    const ASSERTION_CMD_4: &str =
+        "printf 'assertion failed: left: 1 right: 2\\n'; exit 1; true; exit 1";
     let turns = vec![
         // Step 1: fail (fresh failure).
-        test_turn("false"),
+        test_turn(ASSERTION_CMD_1),
         // Step 2: fail again, same shape, with nothing edited in between --
         // repeated_failure_step gets set to this step.
-        test_turn("exit 1"),
+        test_turn(ASSERTION_CMD_2),
         // Step 3: the model reruns the test again with nothing edited --
         // must be substituted for `think` (edits_since_test == 0).
-        test_turn("false; exit 1"),
+        test_turn(ASSERTION_CMD_3),
         // Step 4: the model runs the test a fourth time -- must NOT be
         // substituted (a `think` already ran since the repeat).
-        test_turn("exit 1; true; exit 1"),
+        test_turn(ASSERTION_CMD_4),
     ];
     let model = Arc::new(MockModel::new(turns));
     let thinker = Arc::new(statie_core::MockThinker::new(vec![Ok(
@@ -481,4 +491,104 @@ async fn repeat_failure_substitutes_think_for_an_idle_test_rerun() {
         1,
         "the thinker must still have been called exactly once"
     );
+}
+
+/// DECISIONS.md D9 / BACKLOG.md item 18: the repeated-failure question is
+/// shaped to the kind of failure instead of asking every repeat the same
+/// arithmetic-trace question written for a rounding-trap assertion. On a
+/// Rust compile-error failure (the exact shape a calibration run showed
+/// costing four 263-second `think` calls, three of them empty), the
+/// substituted `think` call must carry the compile-error question, not
+/// `REPEAT_FAILURE_QUESTION`.
+#[tokio::test]
+async fn repeat_failure_substitutes_the_compile_error_question_for_a_compile_error() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "content\n").unwrap();
+
+    // A shell command that prints a rustc-style compile error to stdout and
+    // exits non-zero, so `tools/src/test_tool.rs`'s `failure_summary` picks
+    // up the `error[E0308]` line (and the `--> ...` line right after it, via
+    // `is_rustc_error_line`'s context-pull), and `core/src/session.rs`'s
+    // `normalize_failure_summary` carries it into `HarnessState::
+    // last_failure_summary`.
+    const COMPILE_ERROR_CMD: &str = "printf 'error[E0308]: mismatched types\\n --> \
+         src/lib.rs:3:5\\n'; exit 1";
+
+    let turns = vec![
+        // Step 1: fail (fresh compile-error failure).
+        test_turn(COMPILE_ERROR_CMD),
+        // Step 2: a real write (mutated flag set).
+        write_file_turn("a.txt", "still wrong\n"),
+        // Step 3: fail again, identical -- repeated_failure_step gets set.
+        test_turn(COMPILE_ERROR_CMD),
+        // Step 4: the model tries another edit -- must be substituted for
+        // `think` with the compile-error question.
+        write_file_turn("a.txt", "second attempt\n"),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let thinker = Arc::new(statie_core::MockThinker::new(vec![Ok(
+        ThinkOutput::answer(THINKER_ANSWER),
+    )]));
+    let (mut session, log) =
+        make_file_tools_session(Arc::clone(&model), config(&root), Arc::clone(&thinker) as _);
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    // Step 1: fail (fresh).
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome1 = log.append_record(rec1).unwrap();
+    assert!(matches!(outcome1, Outcome::Continue), "got {outcome1:?}");
+
+    // Step 2: write_file (real edit).
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome2 = log.append_record(rec2).unwrap();
+    assert!(matches!(outcome2, Outcome::Continue), "got {outcome2:?}");
+
+    // Step 3: fail again, identical -- repeated_failure_step must be set,
+    // one step behind the harness step counter (see the analogous comment
+    // in `repeat_failure_substitutes_think_once_then_lets_the_next_edit_
+    // through`, above).
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(matches!(outcome3, Outcome::Continue), "got {outcome3:?}");
+    let (state, _v) = active.session().state().await.unwrap();
+    let repeat_step = state
+        .harness
+        .repeated_failure_step
+        .expect("the second identical compile-error fail must set repeated_failure_step");
+    assert_eq!(repeat_step + 1, state.harness.step);
+    assert!(!any_rejected(&log));
+
+    // Step 4: the model sends another write_file -- must be substituted for
+    // `think` with the compile-error question, not REPEAT_FAILURE_QUESTION.
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome4 = log.append_record(rec4).unwrap();
+    assert!(matches!(outcome4, Outcome::Continue), "got {outcome4:?}");
+    assert!(!any_rejected(&log));
+
+    let (name4, args4) = last_action(&log);
+    assert_eq!(
+        name4, "think",
+        "step 4's write_file must be substituted for think"
+    );
+    let question = args4
+        .get("question")
+        .and_then(Value::as_str)
+        .expect("think args must carry a question");
+    assert!(
+        question.contains("Read the first error only"),
+        "expected the compile-error question, got: {question}"
+    );
+    assert_ne!(
+        question, REPEAT_FAILURE_QUESTION,
+        "a compile-error failure must not get the arithmetic-trace question"
+    );
+
+    assert_eq!(
+        thinker.calls().len(),
+        1,
+        "the mock thinker must have been called exactly once"
+    );
+    assert_eq!(thinker.calls()[0].question, question);
 }

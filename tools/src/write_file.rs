@@ -23,6 +23,16 @@ pub struct WriteFileArgs {
     pub path: String,
     /// The full contents to write.
     pub content: String,
+    /// Harness-set only (BACKLOG.md item 15): when true, the whole-file
+    /// rewrite guard (`MAX_EXISTING_FILE_LINES`) is skipped because the
+    /// harness's own `seen` record shows a full, recent read of this file.
+    /// Not part of the schema offered to the model -- `write_file_confirmed_
+    /// by_seen` (`skills/src/coding/mod.rs`) sets this on the args after
+    /// stripping whatever the model itself sent for it, so the model cannot
+    /// claim the confirmation on its own.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub confirmed_full_read: bool,
 }
 
 /// Writes a text file into the sandbox, creating parent directories and
@@ -61,9 +71,9 @@ impl Tool for WriteFile {
             // this guard, and the line count only needs to be a threshold
             // check, not an exact rendering.
             let n = bytecount_lines(&existing);
-            if n > MAX_EXISTING_FILE_LINES {
+            if n > MAX_EXISTING_FILE_LINES && !args.confirmed_full_read {
                 return Err(ToolError::ExecutionFailed(format!(
-                    "{} exists with {n} lines; write_file replaces the whole file and you would be writing it from memory. Use edit_file (old/new, or after/before + new) for changes to an existing file. If the file is beyond repair, `revert_file` restores its content from before this session's first edit.",
+                    "{} exists with {n} lines; write_file replaces the whole file and you would be writing it from memory. Use edit_file (old/new, or after/before + new) for changes to an existing file. If the file is beyond repair, `revert_file` restores its content from before this session's first edit. If you have read the whole file since your last edit of it, the harness allows the rewrite automatically.",
                     args.path
                 )));
             }

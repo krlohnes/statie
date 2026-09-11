@@ -300,7 +300,7 @@ async fn review_strips_notes_keeps_findings_and_tool_call() {
             json!({
                 "patch": {
                     "notes": "the model wrote this",
-                    "findings": ["the new function has no test"],
+                    "files": [{"path": "a.txt", "note": "under review"}], "findings": ["a.txt:1 the new function has no test"],
                 },
                 "action": {"type": "tool", "name": "list_files", "args": {}},
             })
@@ -335,7 +335,7 @@ async fn review_strips_notes_keeps_findings_and_tool_call() {
     );
     assert_eq!(
         state1.agent.findings,
-        vec!["the new function has no test".to_string()],
+        vec!["a.txt:1 the new function has no test".to_string()],
         "the real findings must land"
     );
 

@@ -180,6 +180,20 @@ pub struct HarnessState {
     /// existed still deserializes.
     #[serde(default)]
     pub consecutive_non_question_asks: u32,
+    /// The normalized failure summary (see `core/src/session.rs`'s
+    /// `normalize_failure_summary`) of the most recent FAILING `test` call,
+    /// capped at 600 characters. Set at the same `test` call site as
+    /// `repeated_failure_step`: `Some(summary)` on a fail, cleared back to
+    /// `None` on a pass. Harness-owned: patches cannot touch it. Read by the
+    /// coding skills' `implement_repeat_failure_thinks` (`skills/src/
+    /// coding/mod.rs`) via `classify_failure`/`repeat_failure_question` to
+    /// shape the substituted `think` question to the kind of failure
+    /// (compile error, assertion, panic, timeout) instead of asking every
+    /// repeat the same arithmetic-trace question (DECISIONS.md D9,
+    /// BACKLOG.md item 18). `#[serde(default)]` so state persisted before
+    /// this field existed still deserializes.
+    #[serde(default)]
+    pub last_failure_summary: Option<String>,
 }
 
 /// A guide pinned into the prompt's Pinned section, with a step-counted

@@ -86,6 +86,15 @@ pub struct Guards {
     /// call's `decision`-clearing half (when `decision_field` is on) still
     /// applies regardless of this switch.
     pub tests_field: bool,
+    /// `review`-only (item 12: grounded review findings): a send-back
+    /// finding must cite a `path:line` the harness can check -- `path`
+    /// present in the sandbox (`CodingWorkspace::files` or `::seen`) and
+    /// `line` within the file's known line count. On, an ungrounded finding
+    /// is dropped (with a note saying which ones and why), and a send-back
+    /// left with no grounded findings at all is refused instead. Off
+    /// restores the current behaviour exactly: every finding passes through
+    /// unchanged, with no grounding check at all.
+    pub grounded_findings: bool,
 }
 
 impl Default for Guards {
@@ -100,6 +109,7 @@ impl Default for Guards {
             seen_map: true,
             decision_field: true,
             tests_field: true,
+            grounded_findings: true,
         }
     }
 }

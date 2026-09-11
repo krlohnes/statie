@@ -8,7 +8,7 @@
 //! edit; a read/search window on P made after the newest edit of P is kept
 //! alongside it. See `WorkingSet::from_log` for the derivation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde_json::Value;
 
@@ -56,15 +56,33 @@ impl Default for WorkingSetConfig {
 /// replaces every earlier window -- read/search or edit -- on that path).
 /// Sealed `Promptable` like `Notes`; only `from_log` produces one.
 #[derive(Clone, Debug)]
-pub struct WorkingSet(String);
+pub struct WorkingSet {
+    text: String,
+    /// The step of each window actually rendered into `text` (the newest
+    /// `cfg.max_windows` distinct windows selected by `from_log`, after
+    /// edit-window replacement). Used by `Session`'s redundant-read guard
+    /// (item 19) to tell whether an earlier read's window is still visible
+    /// to the model or has been evicted.
+    window_steps: BTreeSet<u64>,
+}
 
 impl WorkingSet {
-    pub(crate) fn new(s: String) -> Self {
-        WorkingSet(s)
+    pub(crate) fn new(s: String, window_steps: BTreeSet<u64>) -> Self {
+        WorkingSet {
+            text: s,
+            window_steps,
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.text
+    }
+
+    /// Steps whose windows this working set actually rendered (see the
+    /// `window_steps` field doc). Empty when `from_log` returned no windows
+    /// (recent-calls-only, or `None` entirely).
+    pub fn window_steps(&self) -> &BTreeSet<u64> {
+        &self.window_steps
     }
 
     /// Builds the working set from the session log's own (non-agent)
@@ -250,8 +268,10 @@ impl WorkingSet {
         }
 
         // Render each window's body text once, so fitting can drop/truncate
-        // by rendered size without re-rendering.
-        let mut rendered_windows: Vec<String> = Vec::with_capacity(windows.len());
+        // by rendered size without re-rendering. Kept paired with its step
+        // so the surviving set after budget-fitting (`fit_to_budget`) can
+        // report exactly which windows made it into the final text.
+        let mut rendered_windows: Vec<(u64, String)> = Vec::with_capacity(windows.len());
         for (step, name, path, args) in &windows {
             let output = tool_output_by_step
                 .get(step)
@@ -275,7 +295,7 @@ impl WorkingSet {
                 String::new()
             };
             let header = format!("--- {name} {path}{range} (step {step}) ---");
-            rendered_windows.push(format!("{header}\n{output}"));
+            rendered_windows.push((*step, format!("{header}\n{output}")));
         }
 
         fit_to_budget(recent_lines, rendered_windows, budget, tokenizer)
@@ -290,25 +310,27 @@ impl WorkingSet {
 /// still overflows, cut recent-call lines oldest-first.
 fn fit_to_budget(
     recent_lines: Vec<String>,
-    mut rendered_windows: Vec<String>,
+    mut rendered_windows: Vec<(u64, String)>,
     budget: usize,
     tokenizer: &dyn Tokenizer,
 ) -> Option<WorkingSet> {
     // Drop the oldest window (whole) while more than one remains and it
     // still doesn't fit.
     while rendered_windows.len() > 1 {
-        let text = render(&recent_lines, &rendered_windows);
+        let bodies: Vec<&str> = rendered_windows.iter().map(|(_, s)| s.as_str()).collect();
+        let text = render(&recent_lines, &bodies);
         if tokenizer.count(&text) <= budget {
-            return Some(WorkingSet::new(text));
+            return Some(WorkingSet::new(text, window_steps_of(&rendered_windows)));
         }
         rendered_windows.pop();
     }
 
     // Zero or one window left. If it fits as-is (with the recent-call
     // lines), we're done.
-    let text = render(&recent_lines, &rendered_windows);
+    let bodies: Vec<&str> = rendered_windows.iter().map(|(_, s)| s.as_str()).collect();
+    let text = render(&recent_lines, &bodies);
     if !text.is_empty() && tokenizer.count(&text) <= budget {
-        return Some(WorkingSet::new(text));
+        return Some(WorkingSet::new(text, window_steps_of(&rendered_windows)));
     }
 
     // Still over budget (or nothing rendered because `text` was empty only
@@ -316,9 +338,10 @@ fn fit_to_budget(
     // oldest-first before giving up the window.
     let mut lines = recent_lines;
     loop {
-        let text = render(&lines, &rendered_windows);
+        let bodies: Vec<&str> = rendered_windows.iter().map(|(_, s)| s.as_str()).collect();
+        let text = render(&lines, &bodies);
         if !text.is_empty() && tokenizer.count(&text) <= budget {
-            return Some(WorkingSet::new(text));
+            return Some(WorkingSet::new(text, window_steps_of(&rendered_windows)));
         }
         if !lines.is_empty() {
             lines.remove(0);
@@ -329,12 +352,19 @@ fn fit_to_budget(
 
     // No recent-call lines left. A single remaining window that still
     // doesn't fit is head-truncated (never dropped) so it alone fits.
-    if let Some(only) = rendered_windows.first() {
+    if let Some((step, only)) = rendered_windows.first() {
         let truncated = truncate_window_to_budget(only, budget, tokenizer);
-        return Some(WorkingSet::new(truncated));
+        let mut steps = BTreeSet::new();
+        steps.insert(*step);
+        return Some(WorkingSet::new(truncated, steps));
     }
 
     None
+}
+
+/// The set of steps for the windows that survived budget-fitting.
+fn window_steps_of(rendered_windows: &[(u64, String)]) -> BTreeSet<u64> {
+    rendered_windows.iter().map(|(step, _)| *step).collect()
 }
 
 /// Head-truncates `window` (a full `"--- header ---\n<output>"` block) so
@@ -366,7 +396,7 @@ fn truncate_window_to_budget(window: &str, budget: usize, tokenizer: &dyn Tokeni
 /// Renders the section body: `recent calls:` header + lines, blank line,
 /// then each window newest-first (the caller keeps `windows` in that
 /// order). Empty when both are empty.
-fn render(recent_lines: &[String], windows: &[String]) -> String {
+fn render(recent_lines: &[String], windows: &[&str]) -> String {
     if recent_lines.is_empty() && windows.is_empty() {
         return String::new();
     }
@@ -410,6 +440,6 @@ fn cap_line(s: &str, cap: usize) -> String {
 impl sealed::Sealed for WorkingSet {}
 impl Promptable for WorkingSet {
     fn render(&self) -> String {
-        self.0.clone()
+        self.text.clone()
     }
 }

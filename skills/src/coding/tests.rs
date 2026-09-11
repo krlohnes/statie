@@ -9,10 +9,12 @@ use statie_core::{
 use statie_patch::JsonMergePatch;
 
 use super::{
-    CodingWorkspace, Decision, FileNote, ImplementSkill, PlanSkill, PlanStep, ReviewSkill,
-    RouterSkill, SeenFile, StepStatus, TestRecord, coding_skills, coding_skills_with_delegates,
-    common_after_tool, count_lines, failing_test_names, first_error_line, has_named_handoff,
-    merge_range, parse_edit_header, parse_revert_lines, seen_entry,
+    CodingWorkspace, Decision, FileNote, ImplementSkill, PlanSkill, PlanStep, ReadFileArgs,
+    ReviewSkill, RouterSkill, SeenFile, StepStatus, TestRecord, coding_skills,
+    coding_skills_with_delegates, common_after_tool, count_lines, failing_test_names,
+    finding_is_grounded, first_error_line, has_named_handoff, merge_range, parse_edit_header,
+    parse_finding_location, parse_revert_lines, seen_entry, shell_read_as_read_file,
+    write_file_confirmed_by_seen,
 };
 
 fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
@@ -35,6 +37,7 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             try_fixes_available: false,
             last_try_fixes_step: None,
             consecutive_non_question_asks: 0,
+            last_failure_summary: None,
         },
         agent,
     }
@@ -923,12 +926,23 @@ fn implement_handoff_to_review_with_all_done_is_accepted() {
 /// to `false`, `next_skill` injected as `implement` (nothing else was set),
 /// action stays `Done`. See `skills/tests/review_sendback.rs` for the
 /// session-level version of this same conversion.
+///
+/// The finding cites `src/foo.rs:1` (grounded via the `files` entry set on
+/// `cur`; item 12: grounded review findings) so this test's own concern --
+/// the `done`/`next_skill` conversion -- is not accidentally defeated by the
+/// unrelated grounding guard (on by default) dropping the finding first.
 #[test]
 fn review_done_true_with_findings_converts_to_handoff_instead_of_rejecting() {
     let skill = ReviewSkill::new();
-    let cur = committed(CodingWorkspace::default());
+    let cur = committed(CodingWorkspace {
+        files: vec![FileNote {
+            path: "src/foo.rs".to_string(),
+            note: String::new(),
+        }],
+        ..Default::default()
+    });
     let content = json!({
-        "patch": {"done": true, "findings": ["something is wrong"]},
+        "patch": {"done": true, "findings": ["src/foo.rs:1 something is wrong"]},
         "action": {"type": "done"},
         "ack_inbox": []
     });
@@ -1082,11 +1096,25 @@ fn review_done_true_with_findings_and_next_skill_and_no_tool_calls_is_unaffected
     // A `done` that sends the work back (non-empty findings, next_skill:
     // implement) is not an approval -- `review_looked_note` must not touch
     // it, even with zero tool calls.
+    //
+    // The finding cites `src/foo.rs:1` (grounded via the `files` entry set
+    // on `cur`; item 12: grounded review findings) so this test's own
+    // concern is not accidentally defeated by the unrelated grounding guard
+    // (on by default) dropping the finding first.
     let skill = ReviewSkill::new();
-    let cur = committed_with_tool_calls(CodingWorkspace::default(), 0);
+    let cur = committed_with_tool_calls(
+        CodingWorkspace {
+            files: vec![FileNote {
+                path: "src/foo.rs".to_string(),
+                note: String::new(),
+            }],
+            ..Default::default()
+        },
+        0,
+    );
     let content = json!({
         "patch": {
-            "findings": ["something is wrong"],
+            "findings": ["src/foo.rs:1 something is wrong"],
             "next_skill": "implement",
         },
         "action": {"type": "done"},
@@ -1341,6 +1369,7 @@ fn tools_exact_per_skill() {
             "filter_last_tool_call".to_string(),
             "think".to_string(),
             "try_fixes".to_string(),
+            "probe".to_string(),
         ])
     );
 
@@ -2202,6 +2231,179 @@ fn parse_revert_lines_none_for_the_removed_shape() {
     assert_eq!(parse_revert_lines(text), None);
 }
 
+// ---------------------------------------------------------------------
+// `parse_finding_location`/`finding_is_grounded` (item 12: grounded review
+// findings).
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_finding_location_reads_the_first_path_colon_digits_token() {
+    assert_eq!(
+        parse_finding_location("src/foo.rs:42 the loop never terminates"),
+        Some(("src/foo.rs", 42))
+    );
+}
+
+#[test]
+fn parse_finding_location_reads_a_citation_mid_sentence() {
+    assert_eq!(
+        parse_finding_location("the bug is in src/foo.rs:7, a stray unwrap"),
+        Some(("src/foo.rs", 7))
+    );
+}
+
+#[test]
+fn parse_finding_location_strips_wrapping_punctuation() {
+    assert_eq!(
+        parse_finding_location("see (src/foo.rs:12) for the bug"),
+        Some(("src/foo.rs", 12))
+    );
+    assert_eq!(
+        parse_finding_location("\"src/foo.rs:12\" is wrong"),
+        Some(("src/foo.rs", 12))
+    );
+}
+
+#[test]
+fn parse_finding_location_digit_run_stops_at_the_first_non_digit() {
+    // A second `:` right after the line number (a `path:line:col` shape)
+    // does not extend the digit run or get parsed as part of it.
+    assert_eq!(
+        parse_finding_location("src/foo.rs:12:5 bad column too"),
+        Some(("src/foo.rs", 12))
+    );
+    // Trailing punctuation right after the digits (no separating space)
+    // does not disqualify the match either.
+    assert_eq!(
+        parse_finding_location("src/foo.rs:12. that's the bug"),
+        Some(("src/foo.rs", 12))
+    );
+}
+
+#[test]
+fn parse_finding_location_skips_a_word_with_no_digits_after_the_colon() {
+    // "note:" has a `:` but nothing but letters after it -- not a match --
+    // so parsing continues to the next word instead of failing outright.
+    assert_eq!(
+        parse_finding_location("note: see src/foo.rs:9 for details"),
+        Some(("src/foo.rs", 9))
+    );
+}
+
+#[test]
+fn parse_finding_location_rejects_a_colon_with_an_empty_path() {
+    // A leading bare `:42` has no path before the colon -- not a match --
+    // so parsing continues to the next word.
+    assert_eq!(
+        parse_finding_location(":42 src/foo.rs:9 is the real citation"),
+        Some(("src/foo.rs", 9))
+    );
+}
+
+#[test]
+fn parse_finding_location_none_when_no_word_has_a_path_colon_digits_shape() {
+    assert_eq!(parse_finding_location("this finding cites nothing"), None);
+    assert_eq!(parse_finding_location(""), None);
+}
+
+fn workspace_with_seen(path: &str, lines: u32) -> CodingWorkspace {
+    CodingWorkspace {
+        seen: vec![SeenFile {
+            path: path.to_string(),
+            lines,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn workspace_with_files(path: &str) -> CodingWorkspace {
+    CodingWorkspace {
+        files: vec![FileNote {
+            path: path.to_string(),
+            note: String::new(),
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn finding_is_grounded_true_when_line_is_within_the_seen_line_count() {
+    let ws = workspace_with_seen("src/foo.rs", 100);
+    assert!(finding_is_grounded(
+        &ws,
+        "src/foo.rs:42 the loop never terminates"
+    ));
+    // The last line itself is in range.
+    assert!(finding_is_grounded(&ws, "src/foo.rs:100 the last line"));
+}
+
+#[test]
+fn finding_is_grounded_false_when_line_is_past_the_seen_line_count() {
+    let ws = workspace_with_seen("src/foo.rs", 100);
+    assert!(!finding_is_grounded(&ws, "src/foo.rs:101 past the end"));
+}
+
+#[test]
+fn finding_is_grounded_false_when_line_is_zero() {
+    // A `path:0` citation is never grounded, `seen`/`files` entry or not --
+    // there is no line 0.
+    let ws = workspace_with_seen("src/foo.rs", 100);
+    assert!(!finding_is_grounded(&ws, "src/foo.rs:0 nonsense"));
+}
+
+#[test]
+fn finding_is_grounded_true_on_path_alone_when_files_has_it_but_seen_does_not() {
+    // `files` carries no line count at all -- any positive line grounds the
+    // citation on the path alone (see `known_file_line_count`'s doc).
+    let ws = workspace_with_files("src/foo.rs");
+    assert!(finding_is_grounded(&ws, "src/foo.rs:999999 whatever line"));
+}
+
+#[test]
+fn finding_is_grounded_true_on_path_alone_when_seen_entry_has_no_recorded_length() {
+    // `seen` has the path, but `lines` is 0 (`SeenFile::lines`'s doc: never
+    // learned) -- accepted on the path alone, same as a `files`-only entry.
+    let ws = workspace_with_seen("src/foo.rs", 0);
+    assert!(finding_is_grounded(&ws, "src/foo.rs:5 whatever line"));
+}
+
+#[test]
+fn finding_is_grounded_false_when_the_path_is_unknown() {
+    let ws = CodingWorkspace::default();
+    assert!(!finding_is_grounded(
+        &ws,
+        "src/foo.rs:1 nothing knows this file"
+    ));
+}
+
+#[test]
+fn finding_is_grounded_false_when_the_finding_has_no_citation_at_all() {
+    let ws = workspace_with_seen("src/foo.rs", 100);
+    assert!(!finding_is_grounded(&ws, "the loop never terminates"));
+}
+
+#[test]
+fn finding_is_grounded_prefers_seens_line_count_over_files_when_both_have_the_path() {
+    // `src/foo.rs` is in both `files` (no line count) and `seen` (lines:
+    // 10) -- `seen`'s count wins, so a citation past it is ungrounded even
+    // though `files` alone would have accepted any line.
+    let ws = CodingWorkspace {
+        files: vec![FileNote {
+            path: "src/foo.rs".to_string(),
+            note: String::new(),
+        }],
+        seen: vec![SeenFile {
+            path: "src/foo.rs".to_string(),
+            lines: 10,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(finding_is_grounded(&ws, "src/foo.rs:10 in range"));
+    assert!(!finding_is_grounded(&ws, "src/foo.rs:11 past the end"));
+}
+
 #[test]
 fn count_lines_matches_str_lines_semantics() {
     assert_eq!(count_lines(""), 0);
@@ -2271,7 +2473,7 @@ fn after_tool_read_file_records_range_and_total() {
     .expect("read_file should produce a seen patch");
     assert_eq!(
         patch,
-        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 100]], "edited": [], "step": 7}]})
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 100]], "edited": [], "read_step": 7, "step": 7}]})
     );
 }
 
@@ -2283,6 +2485,7 @@ fn after_tool_read_file_second_read_extends_the_range() {
         lines: 250,
         read: vec![[1, 100]],
         edited: vec![],
+        read_step: Some(7),
         step: 7,
     });
     let output = "src/a.rs (250 lines, showing 101-200)\n";
@@ -2299,7 +2502,7 @@ fn after_tool_read_file_second_read_extends_the_range() {
     .expect("second read should produce a seen patch");
     assert_eq!(
         patch,
-        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 200]], "edited": [], "step": 9}]})
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 200]], "edited": [], "read_step": 9, "step": 9}]})
     );
 }
 
@@ -2311,6 +2514,7 @@ fn after_tool_edit_file_records_edited_range() {
         lines: 250,
         read: vec![[1, 200]],
         edited: vec![],
+        read_step: Some(9),
         step: 9,
     });
     let output = "edited src/a.rs: replaced 1 occurrence (lines 150-156)\n";
@@ -2327,7 +2531,7 @@ fn after_tool_edit_file_records_edited_range() {
     .expect("edit_file should produce a seen patch");
     assert_eq!(
         patch,
-        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 200]], "edited": [[150, 156]], "step": 10}]})
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 200]], "edited": [[150, 156]], "read_step": 9, "step": 10}]})
     );
 }
 
@@ -2352,7 +2556,7 @@ fn after_tool_write_file_replaces_the_entry() {
     .expect("write_file should produce a seen patch");
     assert_eq!(
         patch,
-        json!({"seen": [{"path": "new.rs", "lines": 12, "read": [], "edited": [[1, 12]], "step": 3}]})
+        json!({"seen": [{"path": "new.rs", "lines": 12, "read": [], "edited": [[1, 12]], "read_step": null, "step": 3}]})
     );
 }
 
@@ -2364,6 +2568,7 @@ fn after_tool_revert_file_clears_both_ranges() {
         lines: 250,
         read: vec![[1, 200]],
         edited: vec![[150, 156]],
+        read_step: Some(9),
         step: 10,
     });
     let output =
@@ -2381,7 +2586,7 @@ fn after_tool_revert_file_clears_both_ranges() {
     .expect("revert_file should produce a seen patch");
     assert_eq!(
         patch,
-        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [], "edited": [], "step": 11}]})
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [], "edited": [], "read_step": null, "step": 11}]})
     );
 }
 
@@ -2393,6 +2598,7 @@ fn after_tool_revert_file_removed_drops_the_entry() {
         lines: 12,
         read: vec![],
         edited: vec![[1, 12]],
+        read_step: None,
         step: 3,
     });
     let output = "removed new.rs; it did not exist before this session";
@@ -2892,7 +3098,7 @@ fn after_tool_decision_disabled_does_not_affect_seen() {
     .expect("seen_enabled = true must still record seen when decision_enabled is false");
     assert_eq!(
         patch,
-        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 100]], "edited": [], "step": 7}]})
+        json!({"seen": [{"path": "src/a.rs", "lines": 250, "read": [[1, 100]], "edited": [], "read_step": 7, "step": 7}]})
     );
 }
 
@@ -2933,6 +3139,7 @@ fn model_patch_touching_seen_is_stripped_and_noted() {
         lines: 10,
         read: vec![[1, 10]],
         edited: vec![],
+        read_step: Some(1),
         step: 1,
     });
     let cur = committed(cur_ws.clone());
@@ -3469,6 +3676,13 @@ const ASK_USER_THINK_NOTE: &str = "you had nothing to ask and a repeated test fa
      so the harness asked the reasoning subagent (its conclusion is below, and in `decision`). \
      Act on it.";
 
+/// A `last_failure_summary` that `classify_failure` classifies as
+/// `FailureKind::Assertion`, so `repeat_failure_question` returns
+/// `REPEAT_FAILURE_QUESTION` -- used by the substitution-mechanism tests
+/// below, which assert on that exact question text and predate
+/// `classify_failure`'s existence (BACKLOG.md item 18).
+const ASSERTION_SUMMARY: &str = "assertion failed: `(left == right)`\n  left: 1\n right: 2";
+
 fn edit_file_turn_content() -> serde_json::Value {
     json!({
         "patch": {},
@@ -3499,6 +3713,7 @@ fn repeat_failure_thinks_fires_for_edit_file_with_no_prior_think() {
     let mut cur = committed(CodingWorkspace::default());
     cur.harness.repeated_failure_step = Some(10);
     cur.harness.last_think_step = None;
+    cur.harness.last_failure_summary = Some(ASSERTION_SUMMARY.to_string());
 
     let step = parse_and_validate(&skill, &cur, edit_file_turn_content())
         .expect("the substituted think call must not be rejected");
@@ -3560,6 +3775,7 @@ fn repeat_failure_thinks_substitutes_think_when_try_fixes_unavailable() {
     cur.harness.repeated_failure_step = Some(10);
     cur.harness.last_think_step = None;
     cur.harness.try_fixes_available = false;
+    cur.harness.last_failure_summary = Some(ASSERTION_SUMMARY.to_string());
 
     let step = parse_and_validate(&skill, &cur, edit_file_turn_content())
         .expect("the substituted think call must not be rejected");
@@ -3581,6 +3797,7 @@ fn repeat_failure_thinks_fires_for_write_file_with_no_prior_think() {
     let mut cur = committed(CodingWorkspace::default());
     cur.harness.repeated_failure_step = Some(10);
     cur.harness.last_think_step = None;
+    cur.harness.last_failure_summary = Some(ASSERTION_SUMMARY.to_string());
 
     let step = parse_and_validate(&skill, &cur, write_file_turn_content())
         .expect("the substituted think call must not be rejected");
@@ -3846,6 +4063,7 @@ fn repeat_failure_thinks_fires_for_idle_test_with_no_edits_since_test() {
     cur.harness.repeated_failure_step = Some(10);
     cur.harness.last_think_step = None;
     cur.harness.edits_since_test = 0;
+    cur.harness.last_failure_summary = Some(ASSERTION_SUMMARY.to_string());
 
     let content = json!({
         "patch": {},
@@ -3935,6 +4153,7 @@ fn repeat_failure_thinks_fires_for_non_question_ask_user() {
     let mut cur = committed(CodingWorkspace::default());
     cur.harness.repeated_failure_step = Some(10);
     cur.harness.last_think_step = None;
+    cur.harness.last_failure_summary = Some(ASSERTION_SUMMARY.to_string());
 
     let content = json!({
         "patch": {},
@@ -4175,6 +4394,7 @@ fn repeat_failure_trigger_takes_precedence_over_early_park_when_both_conditions_
     cur.harness.consecutive_non_question_asks = 1;
     cur.harness.repeated_failure_step = Some(10);
     cur.harness.last_think_step = None;
+    cur.harness.last_failure_summary = Some(ASSERTION_SUMMARY.to_string());
 
     let content = json!({
         "patch": {},
@@ -4198,4 +4418,698 @@ fn repeat_failure_trigger_takes_precedence_over_early_park_when_both_conditions_
         &[ASK_USER_THINK_NOTE.to_string()],
         "the repeat-failure note must be attached, not the early-park one"
     );
+}
+
+// ---------------------------------------------------------------------
+// `classify_failure`/`repeat_failure_question` (`skills/src/coding/mod.rs`,
+// DECISIONS.md D9, BACKLOG.md item 18): the repeated-failure question is
+// shaped to the kind of failure instead of asking every repeat the same
+// arithmetic-trace question.
+// ---------------------------------------------------------------------
+
+use super::{FailureKind, classify_failure, repeat_failure_question};
+
+#[test]
+fn classify_failure_recognizes_a_rustc_compile_error() {
+    let summary = "error[E0308]: mismatched types\n --> src/lib.rs:3:5\n  |\n3 |     5\n  |     ^ \
+                    expected `()`, found integer";
+    assert_eq!(classify_failure(summary), FailureKind::CompileError);
+}
+
+#[test]
+fn classify_failure_recognizes_a_python_name_error() {
+    let summary = "NameError: name 'tax_rate' is not defined";
+    assert_eq!(classify_failure(summary), FailureKind::CompileError);
+}
+
+#[test]
+fn classify_failure_recognizes_an_assertion_with_numbers() {
+    let summary = "assertion `left == right` failed\n  left: 4600\n right: 4140";
+    assert_eq!(classify_failure(summary), FailureKind::Assertion);
+}
+
+#[test]
+fn classify_failure_recognizes_a_panic_without_numbers() {
+    let summary = "thread 'main' panicked at src/lib.rs:10:5:\ncalled `Option::unwrap()` on a \
+                    `None` value";
+    assert_eq!(classify_failure(summary), FailureKind::Panic);
+}
+
+#[test]
+fn classify_failure_treats_a_digit_free_assertion_panic_as_panic_not_assertion() {
+    // "assertion failed: a == b" contains the word "assertion" but no
+    // digit ANYWHERE in the summary (no file:line location either) and no
+    // left:/right:/assert_eq -- a digit must appear somewhere in the
+    // summary for the `assertion`/`AssertionError`/`assert_eq`/`left:`/
+    // `right:`/`expected` needles to count as an assertion, and this
+    // summary has none, so it must fall through to the `panicked at`
+    // check instead.
+    let summary = "thread 'main' panicked at 'assertion failed: a == b', src/lib.rs";
+    assert_eq!(classify_failure(summary), FailureKind::Panic);
+}
+
+#[test]
+fn classify_failure_recognizes_a_timeout() {
+    let summary = "test slow_test has been running for over 60 seconds\ntimed out after 600s";
+    assert_eq!(classify_failure(summary), FailureKind::Timeout);
+}
+
+#[test]
+fn classify_failure_empty_string_is_other() {
+    assert_eq!(classify_failure(""), FailureKind::Other);
+}
+
+#[test]
+fn repeat_failure_question_for_assertion_is_the_original_constant() {
+    assert_eq!(
+        repeat_failure_question(FailureKind::Assertion),
+        super::REPEAT_FAILURE_QUESTION
+    );
+}
+
+// ---------------------------------------------------------------------
+// `shell_read_as_read_file` (BACKLOG.md item 16): a pure `shell` command
+// classifier that recognises a single-file, pipe-free, redirect-free read
+// and returns the `read_file` call it is equivalent to.
+// ---------------------------------------------------------------------
+
+fn args(path: &str, offset: Option<u64>, limit: Option<u64>) -> ReadFileArgs {
+    ReadFileArgs {
+        path: path.to_string(),
+        offset,
+        limit,
+    }
+}
+
+#[test]
+fn cat_plain_path_is_a_plain_read() {
+    assert_eq!(
+        shell_read_as_read_file("cat pricing.py"),
+        Some(args("pricing.py", None, None))
+    );
+}
+
+#[test]
+fn cat_dash_n_is_a_plain_read() {
+    assert_eq!(
+        shell_read_as_read_file("cat -n pricing.py"),
+        Some(args("pricing.py", None, None))
+    );
+}
+
+#[test]
+fn nl_is_a_plain_read() {
+    assert_eq!(
+        shell_read_as_read_file("nl pricing.py"),
+        Some(args("pricing.py", None, None))
+    );
+}
+
+#[test]
+fn head_with_no_flag_defaults_to_limit_ten() {
+    assert_eq!(
+        shell_read_as_read_file("head a.rs"),
+        Some(args("a.rs", None, Some(10)))
+    );
+}
+
+#[test]
+fn head_dash_n_number_maps_to_offset_one_limit_n() {
+    assert_eq!(
+        shell_read_as_read_file("head -n 5 a.rs"),
+        Some(args("a.rs", Some(1), Some(5)))
+    );
+}
+
+#[test]
+fn head_dash_number_maps_to_offset_one_limit_n() {
+    assert_eq!(
+        shell_read_as_read_file("head -20 a.rs"),
+        Some(args("a.rs", Some(1), Some(20)))
+    );
+}
+
+#[test]
+fn tail_with_no_flag_is_a_plain_read() {
+    // The harness cannot know the file's length ahead of time, so this
+    // cannot be turned into an offset -- treated as a plain read.
+    assert_eq!(
+        shell_read_as_read_file("tail a.rs"),
+        Some(args("a.rs", None, None))
+    );
+}
+
+#[test]
+fn tail_dash_n_number_is_a_plain_read() {
+    assert_eq!(
+        shell_read_as_read_file("tail -n 5 a.rs"),
+        Some(args("a.rs", None, None))
+    );
+}
+
+#[test]
+fn tail_dash_number_is_a_plain_read() {
+    assert_eq!(
+        shell_read_as_read_file("tail -5 a.rs"),
+        Some(args("a.rs", None, None))
+    );
+}
+
+#[test]
+fn sed_range_single_quoted() {
+    assert_eq!(
+        shell_read_as_read_file("sed -n '10,20p' src/a.rs"),
+        Some(args("src/a.rs", Some(10), Some(11)))
+    );
+}
+
+#[test]
+fn sed_range_double_quoted() {
+    assert_eq!(
+        shell_read_as_read_file("sed -n \"10,20p\" src/a.rs"),
+        Some(args("src/a.rs", Some(10), Some(11)))
+    );
+}
+
+#[test]
+fn sed_range_unquoted() {
+    assert_eq!(
+        shell_read_as_read_file("sed -n 10,20p src/a.rs"),
+        Some(args("src/a.rs", Some(10), Some(11)))
+    );
+}
+
+#[test]
+fn cat_with_single_quoted_path() {
+    assert_eq!(
+        shell_read_as_read_file("cat 'src/a.rs'"),
+        Some(args("src/a.rs", None, None))
+    );
+}
+
+#[test]
+fn cat_with_double_quoted_path() {
+    assert_eq!(
+        shell_read_as_read_file("cat \"src/a.rs\""),
+        Some(args("src/a.rs", None, None))
+    );
+}
+
+#[test]
+fn leading_and_trailing_whitespace_is_trimmed() {
+    assert_eq!(
+        shell_read_as_read_file("   cat a.rs   "),
+        Some(args("a.rs", None, None))
+    );
+}
+
+// --- negatives ---
+
+#[test]
+fn cat_piped_to_grep_is_rejected() {
+    assert_eq!(shell_read_as_read_file("cat a.rs | grep x"), None);
+}
+
+#[test]
+fn cat_two_paths_is_rejected() {
+    assert_eq!(shell_read_as_read_file("cat a.rs b.rs"), None);
+}
+
+#[test]
+fn cat_redirect_is_rejected() {
+    assert_eq!(shell_read_as_read_file("cat > a.rs"), None);
+}
+
+#[test]
+fn cat_semicolon_chain_is_rejected() {
+    assert_eq!(shell_read_as_read_file("cat a.rs; ls"), None);
+}
+
+#[test]
+fn cat_glob_is_rejected() {
+    assert_eq!(shell_read_as_read_file("cat *.rs"), None);
+}
+
+#[test]
+fn cat_dash_dash_weird_path_is_rejected() {
+    assert_eq!(shell_read_as_read_file("cat -- -weird"), None);
+}
+
+#[test]
+fn ls_is_rejected() {
+    assert_eq!(shell_read_as_read_file("ls"), None);
+}
+
+#[test]
+fn cargo_test_is_rejected() {
+    assert_eq!(shell_read_as_read_file("cargo test"), None);
+}
+
+#[test]
+fn sed_in_place_edit_is_rejected() {
+    assert_eq!(shell_read_as_read_file("sed -i 's/a/b/' x"), None);
+}
+
+#[test]
+fn head_piped_to_tail_is_rejected() {
+    assert_eq!(shell_read_as_read_file("head -n 5 a.rs | tail -2"), None);
+}
+
+#[test]
+fn empty_string_is_rejected() {
+    assert_eq!(shell_read_as_read_file(""), None);
+}
+
+// ---------------------------------------------------------------------
+// `shell_read_substitution` wired into `PlanSkill`/`ImplementSkill`/
+// `ReviewSkill::validate` (BACKLOG.md item 16): a `shell` action recognised
+// by `shell_read_as_read_file` is replaced with the equivalent `read_file`
+// call, with the substitution note attached; any other `shell` command
+// commits unchanged.
+// ---------------------------------------------------------------------
+
+/// The exact note `shell_read_substitution` attaches, for the given `cmd`.
+fn shell_read_note_for(cmd: &str) -> String {
+    format!(
+        "`shell {cmd}` was a plain read, so the harness ran it as `read_file` instead: the \
+         read pages, lands in `seen`, and counts for the read guards. Use `read_file` directly \
+         next time."
+    )
+}
+
+fn shell_turn_content(cmd: &str) -> serde_json::Value {
+    json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "shell",
+            "args": {"cmd": cmd},
+        },
+    })
+}
+
+#[test]
+fn implement_substitutes_read_file_for_shell_cat() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(&skill, &cur, shell_turn_content("cat src/a.rs"))
+        .expect("should not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "read_file" && args == &json!({"path": "src/a.rs"})
+        ),
+        "expected a substituted read_file call, got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        &[shell_read_note_for("cat src/a.rs")],
+        "expected the substitution note"
+    );
+}
+
+#[test]
+fn implement_leaves_shell_cargo_test_untouched() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(&skill, &cur, shell_turn_content("cargo test"))
+        .expect("should not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "shell" && args == &json!({"cmd": "cargo test"})
+        ),
+        "a non-read shell command must commit unchanged, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+#[test]
+fn implement_substitution_carries_offset_and_limit_when_present() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(&skill, &cur, shell_turn_content("sed -n '10,20p' src/a.rs"))
+        .expect("should not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "read_file"
+                    && args == &json!({"path": "src/a.rs", "offset": 10, "limit": 11})
+        ),
+        "expected offset/limit to be carried through, got {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        &[shell_read_note_for("sed -n '10,20p' src/a.rs")]
+    );
+}
+
+#[test]
+fn plan_substitutes_read_file_for_shell_cat() {
+    let skill = PlanSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(&skill, &cur, shell_turn_content("cat src/a.rs"))
+        .expect("should not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "read_file" && args == &json!({"path": "src/a.rs"})
+        ),
+        "expected a substituted read_file call, got {:?}",
+        step.action()
+    );
+    assert_eq!(step.notes(), &[shell_read_note_for("cat src/a.rs")]);
+}
+
+#[test]
+fn plan_leaves_shell_cargo_test_untouched() {
+    let skill = PlanSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(&skill, &cur, shell_turn_content("cargo test"))
+        .expect("should not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "shell" && args == &json!({"cmd": "cargo test"})
+        ),
+        "a non-read shell command must commit unchanged, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+#[test]
+fn review_substitutes_read_file_for_shell_cat() {
+    let skill = ReviewSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(&skill, &cur, shell_turn_content("cat src/a.rs"))
+        .expect("should not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "read_file" && args == &json!({"path": "src/a.rs"})
+        ),
+        "expected a substituted read_file call, got {:?}",
+        step.action()
+    );
+    assert_eq!(step.notes(), &[shell_read_note_for("cat src/a.rs")]);
+}
+
+#[test]
+fn review_leaves_shell_cargo_test_untouched() {
+    let skill = ReviewSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(&skill, &cur, shell_turn_content("cargo test"))
+        .expect("should not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::Tool { name, args }
+                if name == "shell" && args == &json!({"cmd": "cargo test"})
+        ),
+        "a non-read shell command must commit unchanged, got {:?}",
+        step.action()
+    );
+    assert!(step.notes().is_empty());
+}
+
+// ---------------------------------------------------------------------
+// `write_file_confirmed_by_seen` (BACKLOG.md item 15): a `write_file` on an
+// existing file past `tools/src/write_file.rs`'s line cap is allowed
+// without a rewrite-from-memory risk when `seen` already shows a full read
+// of that file since the last time any part of it was edited. The rule:
+// `read` (coalesced) covers every line 1..=lines, AND either `edited` is
+// empty (never edited this session) or `read_step == Some(entry.step)`
+// (the entry's most recent change was that full read, i.e. it came after
+// whatever edit(s) preceded it) -- see `write_file_confirmed_by_seen`'s doc.
+// ---------------------------------------------------------------------
+
+fn seen_file(
+    path: &str,
+    lines: u32,
+    read: Vec<[u32; 2]>,
+    edited: Vec<[u32; 2]>,
+    read_step: Option<u64>,
+    step: u64,
+) -> SeenFile {
+    SeenFile {
+        path: path.to_string(),
+        lines,
+        read,
+        edited,
+        read_step,
+        step,
+    }
+}
+
+#[test]
+fn confirmed_true_for_a_single_range_covering_the_whole_file() {
+    let seen = vec![seen_file("a.rs", 62, vec![[1, 62]], vec![], Some(1), 1)];
+    assert!(write_file_confirmed_by_seen(&seen, "a.rs"));
+}
+
+#[test]
+fn confirmed_true_for_coalesced_ranges_covering_the_whole_file() {
+    let seen = vec![seen_file(
+        "a.rs",
+        62,
+        vec![[1, 30], [31, 62]],
+        vec![],
+        Some(1),
+        1,
+    )];
+    assert!(write_file_confirmed_by_seen(&seen, "a.rs"));
+}
+
+#[test]
+fn confirmed_false_when_the_read_is_one_line_short() {
+    let seen = vec![seen_file("a.rs", 62, vec![[1, 61]], vec![], Some(1), 1)];
+    assert!(!write_file_confirmed_by_seen(&seen, "a.rs"));
+}
+
+#[test]
+fn confirmed_false_when_edited_is_non_empty_and_the_last_change_was_an_edit() {
+    // The full read (step 1) predates the edit (step 2, the entry's
+    // current `step`): the last change to this entry was the edit, not the
+    // read, so this must be refused.
+    let seen = vec![seen_file(
+        "a.rs",
+        62,
+        vec![[1, 62]],
+        vec![[10, 12]],
+        Some(1),
+        2,
+    )];
+    assert!(!write_file_confirmed_by_seen(&seen, "a.rs"));
+}
+
+#[test]
+fn confirmed_true_when_edited_is_non_empty_but_the_last_change_was_the_read() {
+    // An edit (step 1) followed by a full reread (step 2, the entry's
+    // current `step`, and also `read_step`): `edited` is left non-empty
+    // (`edit_file` never clears it) but the full read came after the edit,
+    // so this must be confirmed.
+    let seen = vec![seen_file(
+        "a.rs",
+        62,
+        vec![[1, 62]],
+        vec![[10, 12]],
+        Some(2),
+        2,
+    )];
+    assert!(write_file_confirmed_by_seen(&seen, "a.rs"));
+}
+
+#[test]
+fn confirmed_false_when_last_change_was_the_read_but_coverage_is_short() {
+    // `read_step == step` (the read was the latest change) but the read
+    // itself doesn't cover the whole file -- coverage still governs.
+    let seen = vec![seen_file(
+        "a.rs",
+        62,
+        vec![[1, 61]],
+        vec![[10, 12]],
+        Some(2),
+        2,
+    )];
+    assert!(!write_file_confirmed_by_seen(&seen, "a.rs"));
+}
+
+#[test]
+fn confirmed_false_for_a_path_not_in_seen() {
+    let seen = vec![seen_file("other.rs", 62, vec![[1, 62]], vec![], Some(1), 1)];
+    assert!(!write_file_confirmed_by_seen(&seen, "a.rs"));
+    assert!(!write_file_confirmed_by_seen(&[], "a.rs"));
+}
+
+// ---------------------------------------------------------------------
+// `write_file_auto_confirm` wired into `PlanSkill`/`ImplementSkill`/
+// `ReviewSkill::validate` (BACKLOG.md item 15): on a `write_file` action,
+// strips a model-supplied `confirmed_full_read` unconditionally, then sets
+// it back to `true` only when `write_file_confirmed_by_seen` says so --
+// silently, no note either way.
+// ---------------------------------------------------------------------
+
+fn write_file_confirm_turn_content(path: &str, extra_args: serde_json::Value) -> serde_json::Value {
+    let mut args = json!({"path": path, "content": "new content"});
+    if let (Value::Object(map), Value::Object(extra)) = (&mut args, extra_args) {
+        for (k, v) in extra {
+            map.insert(k, v);
+        }
+    }
+    json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "write_file",
+            "args": args,
+        },
+    })
+}
+
+#[test]
+fn implement_sets_confirmed_full_read_on_a_fully_seen_path() {
+    let skill = ImplementSkill::new();
+    let ws = CodingWorkspace {
+        seen: vec![seen_file("a.rs", 62, vec![[1, 62]], vec![], Some(1), 1)],
+        ..Default::default()
+    };
+    let cur = committed(ws);
+
+    let step = parse_and_validate(
+        &skill,
+        &cur,
+        write_file_confirm_turn_content("a.rs", json!({})),
+    )
+    .expect("should not be rejected");
+    assert!(
+        matches!(
+            step.action(),
+            Action::Tool { name, args }
+                if name == "write_file"
+                    && args.get("confirmed_full_read") == Some(&Value::Bool(true))
+        ),
+        "expected confirmed_full_read: true, got {:?}",
+        step.action()
+    );
+}
+
+#[test]
+fn implement_does_not_set_confirmed_full_read_on_an_unseen_path() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(
+        &skill,
+        &cur,
+        write_file_confirm_turn_content("a.rs", json!({})),
+    )
+    .expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "write_file");
+            assert!(
+                args.get("confirmed_full_read").is_none(),
+                "expected no confirmed_full_read key, got {args:?}"
+            );
+        }
+        other => panic!("expected a write_file tool call, got {other:?}"),
+    }
+}
+
+#[test]
+fn implement_strips_a_model_supplied_confirmed_full_read_on_an_unseen_path() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+
+    let step = parse_and_validate(
+        &skill,
+        &cur,
+        write_file_confirm_turn_content("a.rs", json!({"confirmed_full_read": true})),
+    )
+    .expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "write_file");
+            assert!(
+                args.get("confirmed_full_read").is_none(),
+                "a model-supplied confirmed_full_read on an unseen path must be stripped, got {args:?}"
+            );
+        }
+        other => panic!("expected a write_file tool call, got {other:?}"),
+    }
+}
+
+#[test]
+fn implement_strips_a_model_supplied_confirmed_full_read_even_on_a_seen_path() {
+    // The model must never be trusted to set the flag itself, even when the
+    // harness would have set it too -- the harness's own decision, not the
+    // model's claim, is what reaches the tool.
+    let skill = ImplementSkill::new();
+    let ws = CodingWorkspace {
+        seen: vec![seen_file("a.rs", 62, vec![[1, 62]], vec![], Some(1), 1)],
+        ..Default::default()
+    };
+    let cur = committed(ws);
+
+    let step = parse_and_validate(
+        &skill,
+        &cur,
+        write_file_confirm_turn_content("a.rs", json!({"confirmed_full_read": false})),
+    )
+    .expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "write_file");
+            assert_eq!(
+                args.get("confirmed_full_read"),
+                Some(&Value::Bool(true)),
+                "the harness's own true must win over the model's false, got {args:?}"
+            );
+        }
+        other => panic!("expected a write_file tool call, got {other:?}"),
+    }
+}
+
+#[test]
+fn plan_write_file_auto_confirm_is_a_no_op_without_write_file_tool() {
+    // `plan` has no `write_file` tool, but `write_file_auto_confirm` still
+    // runs harmlessly in its `validate` (it only acts on a `Tool { name:
+    // "write_file", .. }` action, which `plan` never legitimately produces).
+    let skill = PlanSkill::new();
+    let ws = CodingWorkspace {
+        seen: vec![seen_file("a.rs", 62, vec![[1, 62]], vec![], Some(1), 1)],
+        ..Default::default()
+    };
+    let cur = committed(ws);
+
+    let step = parse_and_validate(
+        &skill,
+        &cur,
+        write_file_confirm_turn_content("a.rs", json!({})),
+    )
+    .expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "write_file");
+            assert_eq!(args.get("confirmed_full_read"), Some(&Value::Bool(true)));
+        }
+        other => panic!("expected a write_file tool call, got {other:?}"),
+    }
 }

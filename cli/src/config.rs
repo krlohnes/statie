@@ -172,6 +172,16 @@ pub struct ThinkerConfig {
     /// 100 to 250 unchunked with a reload each way (DECISIONS.md D9). When
     /// `true`, built with `ChunkConfig::default()`.
     pub chunked: bool,
+    /// Whether `think` is advertised in the tool list the model sees
+    /// (`skills/src/coding/mod.rs`'s `PlanSkill`/`ImplementSkill`/
+    /// `ReviewSkill::tools()`). Default `true` (today's behaviour). `false`
+    /// hides `think` from the prompt's tool list without disabling it: the
+    /// harness's own triggers (`implement_repeat_failure_thinks`'s
+    /// repeated-failure substitution, the early-park substitution) still
+    /// construct `Action::Tool { name: "think", .. }` directly and keep
+    /// firing exactly as before -- only the model's own ability to choose
+    /// `think` on its own is removed.
+    pub listed: bool,
 }
 
 impl Default for ThinkerConfig {
@@ -181,6 +191,7 @@ impl Default for ThinkerConfig {
             timeout_secs: 600,
             num_ctx: None,
             chunked: true,
+            listed: true,
         }
     }
 }
@@ -977,6 +988,8 @@ mod tests {
         assert!(parsed.guards.commitment_read_cap);
         assert!(parsed.guards.seen_map);
         assert!(parsed.guards.decision_field);
+        assert!(parsed.guards.tests_field);
+        assert!(parsed.guards.grounded_findings);
 
         // Round-trips through serialize -> deserialize unchanged.
         let json = serde_json::to_string(&parsed).unwrap();
@@ -1053,6 +1066,46 @@ mod tests {
             "decision_field is a separate switch from tests_field and keeps its own default"
         );
         assert!(!parsed.guards.tests_field);
+
+        // Round-trips through serialize -> deserialize unchanged.
+        let json = serde_json::to_string(&parsed).unwrap();
+        let round_tripped: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.guards, parsed.guards);
+    }
+
+    /// Item 12 (grounded review findings): `guards.grounded_findings` picks
+    /// up a config value the same way every other `Guards` field does, with
+    /// the rest at default.
+    #[test]
+    fn guards_grounded_findings_false_parses_with_other_fields_at_default() {
+        let text = serde_json::json!({
+            "guards": {"grounded_findings": false}
+        })
+        .to_string();
+        let parsed: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.guards,
+            Guards {
+                grounded_findings: false,
+                ..Guards::default()
+            }
+        );
+        assert!(parsed.guards.redundant_reads);
+        assert!(parsed.guards.silent_reads);
+        assert!(parsed.guards.read_guard);
+        assert!(parsed.guards.redundant_verify);
+        assert!(
+            !parsed.guards.done_stays_done,
+            "done_stays_done defaults to false, unlike the other rules"
+        );
+        assert!(parsed.guards.commitment_read_cap);
+        assert!(parsed.guards.seen_map);
+        assert!(
+            parsed.guards.decision_field,
+            "decision_field is a separate switch from grounded_findings and keeps its own default"
+        );
+        assert!(parsed.guards.tests_field);
+        assert!(!parsed.guards.grounded_findings);
 
         // Round-trips through serialize -> deserialize unchanged.
         let json = serde_json::to_string(&parsed).unwrap();
@@ -1488,6 +1541,19 @@ mod tests {
             cfg.model.num_ctx,
             "chunked, effective num_ctx must follow the session's model.num_ctx"
         );
+    }
+
+    /// Item 14: `thinker.listed` absent must default to `true` (`think`
+    /// stays advertised in the tool list, today's behaviour).
+    #[test]
+    fn thinker_listed_absent_defaults_true() {
+        let cfg: Config = serde_json::from_str(r#"{"thinker":{"timeout_secs":30}}"#).unwrap();
+        let t = cfg.thinker.clone().expect("thinker section should parse");
+        assert!(t.listed, "thinker.listed must default to true");
+
+        let cfg: Config = serde_json::from_str(r#"{"thinker":{"listed":false}}"#).unwrap();
+        let t = cfg.thinker.clone().expect("thinker section should parse");
+        assert!(!t.listed);
     }
 
     #[test]

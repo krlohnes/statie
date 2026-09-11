@@ -1,7 +1,7 @@
 //! The session loop: `Session<W>`, activation typestate (`Active<'a, K>`),
 //! and the `step` algorithm (ARCHITECTURE.md "Loop, session, activation").
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ use crate::report::ReportOutcome;
 use crate::sandbox::SandboxRoot;
 use crate::skill::{Commitment, ParsedOutput, Skill, ValidatedStep, validate_user_patch};
 use crate::store::{LoggedPatch, StateStore, apply_fn};
-use crate::thinker::{ThinkInput, Thinker};
+use crate::thinker::{OPTIONS_MODE_INSTRUCTION, ThinkInput, Thinker};
 use crate::tokenizer::{Budgets, TokenBudget, Tokenizer};
 use crate::tool::ToolSet;
 use crate::version::{CommittedState, HarnessState, InboxItem, Version};
@@ -603,6 +603,15 @@ pub struct Session<W> {
     /// `max_windows: 0` (via `with_working_set`) disables the section and
     /// restores pre-working-set behaviour.
     working_set: WorkingSetConfig,
+    /// The step of each window rendered into the working set the last time
+    /// `Active::step` built one (empty before the first step, or whenever
+    /// `WorkingSet::from_log` returned `None`/rendered no windows). Item 19's
+    /// redundant-read guard consults this: a repeat read whose earlier
+    /// window's step is NOT in this set has been evicted from what the model
+    /// can currently see and must run again, rather than being refused as a
+    /// no-op. Updated once per step, right after the working set is built,
+    /// the same way `last_prompt` is.
+    last_window_steps: BTreeSet<u64>,
     /// Rule-audit switches (statie-spec.md "10. After it works: the rule
     /// audit", milestone 12). Defaults to `Guards::default()` (all `true`
     /// except `done_stays_done`, off by default since the first bench
@@ -741,6 +750,7 @@ impl<W> Session<W> {
             try_fixes_output_cap: 200_000,
             last_prompt: None,
             working_set: WorkingSetConfig::default(),
+            last_window_steps: BTreeSet::new(),
             guards: Guards::default(),
             green_checkpoint: None,
             last_test_result: None,
@@ -910,6 +920,7 @@ impl<W> Session<W> {
                         try_fixes_available: self.fixer.is_some(),
                         last_try_fixes_step: None,
                         consecutive_non_question_asks: 0,
+                        last_failure_summary: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -1241,6 +1252,26 @@ impl<'a, K: Skill + ?Sized> Active<'a, K>
 where
     K::Workspace: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
+    /// The step of the most recent own (non-agent) `ToolOutput` log entry
+    /// at or before `step_at_start`, mirroring `WorkingSet::from_log`'s own
+    /// `newest_output_step` -- that entry is THIS step's Observation
+    /// section, never itself rendered as a working-set window. Item 19's
+    /// eviction check (below) uses this instead of comparing `at_step` to
+    /// `step_at_start` directly: an `after_tool`/maintainer hook can commit
+    /// its own harness-only step in between a read and the next model
+    /// turn, so the read's own step number can trail `step_at_start` by
+    /// more than one even though its output is still what the model just
+    /// saw. `None` when the log has no own `ToolOutput` entries yet.
+    fn newest_tool_output_step(&self, step_at_start: u64) -> Option<u64> {
+        self.session
+            .log
+            .entries(Some(LogKind::ToolOutput), READ_HEADER_LOOKUP_LIMIT)
+            .into_iter()
+            .filter(|e| e.agent.is_none() && e.step <= step_at_start)
+            .map(|e| e.step)
+            .max()
+    }
+
     /// Looks up the `read_file` `ToolOutput` logged at `step` (as recorded
     /// in `Session::reads_since_mutation`) and parses its header, for 7.8's
     /// read-paging special case. `None` when no matching entry is found
@@ -1431,6 +1462,15 @@ where
             &self.session.working_set,
             step_at_start,
         );
+        // Item 19: remember which windows this step's working set actually
+        // rendered, so the redundant-read guard (7.8, below) can tell an
+        // evicted window from one still visible to the model. Consulted,
+        // not rebuilt, by the guard -- rebuilding from the log there would
+        // reflect a step that hasn't happened yet.
+        self.session.last_window_steps = working_set
+            .as_ref()
+            .map(|ws| ws.window_steps().clone())
+            .unwrap_or_default();
 
         let notes = self.skill.notes(&cur.agent).map(Notes::new);
         let mut builder = PromptBuilder::new(
@@ -1748,6 +1788,29 @@ where
         // below, and the "do NOT skip" handling in `execute`). A window
         // that already reached the end of the file (`b == total`), or whose
         // header can't be parsed, falls through to the ordinary skip.
+        // Item 19: when windows are on, a repeat read is only truly
+        // redundant if the earlier call's window is still rendered in the
+        // working set the model just saw (`last_window_steps`, set right
+        // above the prompt was built this step). One that's been evicted
+        // is no longer visible to the model at all, so skipping it would
+        // hide real information behind a refusal the model can't act on --
+        // let it run normally instead, and note the re-run with a
+        // `reread_evicted` System entry (pushed after commit, alongside
+        // `paged_read`) rather than `skipped_redundant`.
+        //
+        // `at_step` equal to the most recent own `ToolOutput` step
+        // (`newest_tool_output_step`) is a special case, not an omission in
+        // `last_window_steps`: that's the read whose output is what the
+        // model just saw as THIS step's Observation section (`WorkingSet::
+        // from_log`'s `newest_output_step` deliberately excludes it from
+        // the windows -- it's not repeated there because the Observation
+        // section already showed it). Visible-via-Observation is still
+        // visible, so this is not an eviction. Compared by looking up the
+        // log directly rather than assuming `at_step == step_at_start - 1`:
+        // an `after_tool`/maintainer hook can commit its own harness-only
+        // step in between, advancing `step_at_start` past the read's own
+        // step without producing a newer `ToolOutput`.
+        let mut reread_evicted: Option<(String, u64)> = None;
         let mut paged: Option<PagedRead> = None;
         if skip.is_none()
             && self.session.guards.redundant_reads
@@ -1757,7 +1820,12 @@ where
         {
             let key = read_call_key(name, args);
             if let Some(&at_step) = self.session.reads_since_mutation.get(&key) {
-                if name == "read_file"
+                let evicted = self.session.working_set.max_windows > 0
+                    && Some(at_step) != self.newest_tool_output_step(step_at_start)
+                    && !self.session.last_window_steps.contains(&at_step);
+                if evicted {
+                    reread_evicted = Some((name.clone(), at_step));
+                } else if name == "read_file"
                     && let Some(header) = self.previous_read_file_header(at_step)
                     && !header.at_end()
                 {
@@ -1895,6 +1963,18 @@ where
                     "to_offset": p.to_offset,
                     "args": p.original_args,
                 }),
+            ));
+        }
+        if let Some((name, at_step)) = &reread_evicted {
+            // Item 19: this call is an exact repeat of an earlier read, but
+            // that read's window has since been evicted from the working
+            // set, so it ran again for real (no `skipped_redundant`,
+            // ordinary `tool_output` below) -- note that for anyone reading
+            // the log back.
+            entries.push(system_entry(
+                next_harness.step,
+                "reread_evicted",
+                serde_json::json!({"name": name, "at_step": at_step}),
             ));
         }
 
@@ -2314,9 +2394,21 @@ where
                 // Enforce the active tool set (the same list the prompt
                 // showed the model via `self.skill.tools()`): a tool that is
                 // registered in the full `ToolSet` but not active for this
-                // skill must still be rejected, not silently run.
+                // skill must still be rejected, not silently run. `think`
+                // is exempt (`thinker.listed`, `cli/src/config.rs`, item
+                // 14): when `listed` is false it is left out of
+                // `skill.tools()` so the model does not see it as a choice,
+                // but the harness's own substitutions
+                // (`implement_repeat_failure_thinks`'s repeated-failure
+                // trigger, the early-park trigger) construct `Action::Tool
+                // { name: "think", .. }` directly and must keep working
+                // unchanged either way -- by the time this action reaches
+                // `execute`, a harness substitution is indistinguishable
+                // from the model choosing `think` itself, and it is always
+                // specially dispatched via `execute_think` right below
+                // regardless, never reaching the real tool registry.
                 let active = self.skill.tools();
-                if !active.iter().any(|a| a == &name) {
+                if name != "think" && !active.iter().any(|a| a == &name) {
                     entries.push(system_entry(
                         step,
                         "tool_rejected",
@@ -2656,6 +2748,17 @@ where
                             } else {
                                 None
                             };
+                            // `last_failure_summary` (`core/src/
+                            // version.rs`): mirrors `last_test_failure`
+                            // (this session's in-memory copy, set by
+                            // `note_test_result` above), capped to 600
+                            // characters so the harness-owned copy stays
+                            // bounded -- `Some` on a fail, `None` on a pass.
+                            harness.last_failure_summary = self
+                                .session
+                                .last_test_failure
+                                .as_ref()
+                                .map(|s| s.chars().take(600).collect::<String>());
                         } else if matches!(
                             name.as_str(),
                             "edit_file" | "write_file" | "revert_file"
@@ -3104,6 +3207,72 @@ where
             return Ok(Outcome::Continue);
         }
 
+        // Unit 11 ("options-and-verdict mode for `think`"): an optional
+        // `mode` argument, `"trace"` (today's behaviour, the default when
+        // `mode` is absent) or `"options"` (prepends
+        // `OPTIONS_MODE_INSTRUCTION` to the question sent to the thinker).
+        // Any other value is a tool error, same shape as the empty-question
+        // path above (loop-guarded, truncated, never a rejection), whose
+        // message names the two valid modes.
+        let mode = args.get("mode").and_then(Value::as_str).unwrap_or("trace");
+        if mode != "trace" && mode != "options" {
+            let reason = format!(
+                "invalid tool arguments: mode must be \"trace\" or \"options\", got {mode:?}"
+            );
+            entries.push(system_entry(
+                step,
+                "tool_error",
+                serde_json::json!({"name": name, "reason": reason}),
+            ));
+            let schema_str = self
+                .session
+                .tools
+                .get(&name)
+                .map(|t| render_schema_compact(&t.args_schema()))
+                .unwrap_or_else(|| "{}".to_string());
+            let mut message = format!(
+                "tool `think` rejected its arguments: mode must be \"trace\" or \"options\", got \
+                 {mode:?}. Expected arguments (JSON schema): {schema_str}. Fix the arguments and \
+                 call `think` again."
+            );
+
+            let current = (name.clone(), args.clone(), reason);
+            let prior_occurrences = self
+                .session
+                .recent_tool_calls
+                .iter()
+                .filter(|entry| **entry == current)
+                .count();
+            if prior_occurrences >= 2 {
+                let occurrence = prior_occurrences + 1;
+                message = format!(
+                    "[harness] This is occurrence #{occurrence} of `{name}` with identical \
+                     arguments and identical output within the last {TOOL_CALL_HISTORY} tool \
+                     calls; nothing has changed. Record what you learned in the workspace and \
+                     take a different action (if the work is finished, hand off with \
+                     `next_skill` or set the terminal field).\n\n{message}"
+                );
+            }
+            self.session.recent_tool_calls.push_back(current);
+            if self.session.recent_tool_calls.len() > TOOL_CALL_HISTORY {
+                self.session.recent_tool_calls.pop_front();
+            }
+
+            let (obs, _overflow) = Observation::truncate_with_report(
+                &crate::promptable::ToolOutputFull::new(message),
+                self.session.config.budgets.observation,
+                self.session.tokenizer.as_ref(),
+            );
+            self.session.pending_observation = Some(obs);
+            self.session.record_tool_call().await?;
+            return Ok(Outcome::Continue);
+        }
+        let sent_question = if mode == "options" {
+            format!("{OPTIONS_MODE_INSTRUCTION}{question}")
+        } else {
+            question.to_string()
+        };
+
         let thinker = self.session.thinker.clone();
         let (system, user) = self
             .session
@@ -3128,7 +3297,7 @@ where
                     let input = ThinkInput {
                         system: &system,
                         user: &user,
-                        question,
+                        question: &sent_question,
                     };
                     match thinker.think(input, token.clone()).await {
                         Ok(out) => {

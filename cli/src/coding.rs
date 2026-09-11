@@ -23,9 +23,20 @@ impl CodingRegistry {
     /// The four coding skills with the rule-audit switches applied
     /// (`guards.done_stays_done`; statie-spec.md "10. After it works: the
     /// rule audit"; `guards.seen_map`/`guards.decision_field`; BACKLOG.md
-    /// item 2; `guards.tests_field`; BACKLOG.md item 5). `Guards::default()`
-    /// gives exactly [`CodingRegistry::new`].
+    /// item 2; `guards.tests_field`; BACKLOG.md item 5;
+    /// `guards.grounded_findings`; item 12, grounded review findings).
+    /// `Guards::default()` gives exactly [`CodingRegistry::new`].
     pub fn with_guards(guards: Guards) -> Self {
+        Self::with_guards_and_listed(guards, true)
+    }
+
+    /// [`CodingRegistry::with_guards`] plus `thinker.listed`
+    /// (`cli/src/config.rs`; BACKLOG.md item 14): `false` omits `think` from
+    /// the tool list the model sees (`PlanSkill`/`ImplementSkill`/
+    /// `ReviewSkill::tools()`) without disabling `think` itself -- the
+    /// harness's own substitutions (repeated-failure, early-park) still
+    /// construct a `think` action directly and are unaffected.
+    pub fn with_guards_and_listed(guards: Guards, listed: bool) -> Self {
         CodingRegistry {
             skills: coding_skills_configured(
                 vec![],
@@ -33,6 +44,8 @@ impl CodingRegistry {
                 guards.seen_map,
                 guards.decision_field,
                 guards.tests_field,
+                guards.grounded_findings,
+                listed,
             ),
         }
     }

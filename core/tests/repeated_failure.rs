@@ -759,3 +759,97 @@ async fn repeated_failure_step_set_on_the_second_identical_fail_then_cleared_on_
         "a passing test call must clear repeated_failure_step"
     );
 }
+
+// =======================================================================
+// (g) `HarnessState.last_failure_summary` (BACKLOG.md item 18): set to the
+// normalized failure summary (capped at 600 characters) on a failing `test`
+// call, at the same call site as `repeated_failure_step`; cleared back to
+// `None` on a pass. Independent of whether the failure is a REPEAT -- unlike
+// `repeated_failure_step`, this is set on every fail, including the first
+// one, since `implement_repeat_failure_thinks`'s question-shaping needs the
+// summary of the CURRENT failure, not just of a repeat.
+// =======================================================================
+
+#[tokio::test]
+async fn last_failure_summary_set_on_fail_and_cleared_on_pass() {
+    let root = tempfile::tempdir().unwrap();
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), test_action("cargo test 1")), // step 1: fail
+        step_output(serde_json::json!({}), test_action("cargo test 2")), // step 2: pass
+    ]);
+
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        tool_set(vec![fail_output(SAME_SUMMARY), pass_output()]),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+    let mut active = session.activate(Arc::new(RepeatSkill)).await.unwrap();
+
+    // Step 1: fail -- last_failure_summary must hold the normalized
+    // summary, even though this is not yet a repeat (repeated_failure_step
+    // stays None).
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.repeated_failure_step, None,
+        "the first fail must not set repeated_failure_step"
+    );
+    assert_eq!(
+        state.harness.last_failure_summary.as_deref(),
+        Some(SAME_SUMMARY),
+        "the first fail must still set last_failure_summary to the normalized summary"
+    );
+
+    // Step 2: pass -- last_failure_summary must clear back to None.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.last_failure_summary, None,
+        "a passing test call must clear last_failure_summary"
+    );
+}
+
+/// The 600-character cap: a failure summary longer than that must be
+/// truncated to exactly 600 chars, not stored in full.
+#[tokio::test]
+async fn last_failure_summary_is_capped_at_600_characters() {
+    let root = tempfile::tempdir().unwrap();
+    let long_summary: String = "x".repeat(1000);
+
+    let model = ScriptedModel::new(vec![step_output(
+        serde_json::json!({}),
+        test_action("cargo test 1"),
+    )]);
+
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        tool_set(vec![fail_output(&long_summary)]),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+    let mut active = session.activate(Arc::new(RepeatSkill)).await.unwrap();
+
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    let summary = state
+        .harness
+        .last_failure_summary
+        .expect("a fail must set last_failure_summary");
+    assert_eq!(
+        summary.chars().count(),
+        600,
+        "the summary must be capped at 600 characters, got {} chars",
+        summary.chars().count()
+    );
+}

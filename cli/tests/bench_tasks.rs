@@ -41,9 +41,11 @@ const EXPECTED_TASKS: &[&str] = &[
     "new_module",
     "python_method",
     "trap_rounding",
+    "trap_interest",
     "multi_file_feature",
     "refactor_signature",
     "python_three_modules",
+    "design_fork",
 ];
 
 /// `bench/tasks`, resolved relative to this crate's manifest dir so the
@@ -230,6 +232,11 @@ fn trap_rounding_fixture_fails_then_solution_passes() {
 }
 
 #[test]
+fn trap_interest_fixture_fails_then_solution_passes() {
+    run_one("trap_interest");
+}
+
+#[test]
 fn add_struct_field_fixture_fails_then_solution_passes() {
     run_one("add_struct_field");
 }
@@ -257,6 +264,11 @@ fn refactor_signature_fixture_fails_then_solution_passes() {
 #[test]
 fn python_three_modules_fixture_fails_then_solution_passes() {
     run_one("python_three_modules");
+}
+
+#[test]
+fn design_fork_fixture_fails_then_solution_passes() {
+    run_one("design_fork");
 }
 
 /// Every directory under `bench/tasks/` must have all three parts

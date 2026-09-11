@@ -652,7 +652,7 @@ async fn review_sendback_with_findings_and_no_green_run_is_unaffected() {
     let root = tempfile::tempdir().unwrap();
 
     let turns = vec![done_turn(json!({
-        "findings": ["something is wrong"],
+        "files": [{"path": "a.txt", "note": "under review"}], "findings": ["a.txt:1 something is wrong"],
         "next_skill": "implement",
     }))];
     let model = Arc::new(MockModel::new(turns));
@@ -676,7 +676,10 @@ async fn review_sendback_with_findings_and_no_green_run_is_unaffected() {
 
     let (state, _version) = active.session().state().await.unwrap();
     assert!(!state.agent.done);
-    assert_eq!(state.agent.findings, vec!["something is wrong".to_string()]);
+    assert_eq!(
+        state.agent.findings,
+        vec!["a.txt:1 something is wrong".to_string()]
+    );
     assert_eq!(state.agent.next_skill.as_deref(), Some("implement"));
 }
 
@@ -842,7 +845,7 @@ async fn review_sendback_with_findings_and_filtered_pass_is_unaffected() {
     let turns = vec![
         test_turn(FILTERED_PASS_CMD),
         done_turn(json!({
-            "findings": ["something is wrong"],
+            "files": [{"path": "a.txt", "note": "under review"}], "findings": ["a.txt:1 something is wrong"],
             "next_skill": "implement",
         })),
     ];
@@ -869,7 +872,10 @@ async fn review_sendback_with_findings_and_filtered_pass_is_unaffected() {
 
     let (state, _version) = active.session().state().await.unwrap();
     assert!(!state.agent.done);
-    assert_eq!(state.agent.findings, vec!["something is wrong".to_string()]);
+    assert_eq!(
+        state.agent.findings,
+        vec!["a.txt:1 something is wrong".to_string()]
+    );
     assert_eq!(state.agent.next_skill.as_deref(), Some("implement"));
 }
 

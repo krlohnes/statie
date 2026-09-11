@@ -29,6 +29,7 @@
     "commitment_read_cap": false
   },
   "thinker": {
-    "timeout_secs": 600
+    "timeout_secs": 600,
+    "listed": true
   }
 }

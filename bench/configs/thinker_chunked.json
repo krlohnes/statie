@@ -35,6 +35,7 @@
   },
   "thinker": {
     "timeout_secs": 600,
-    "chunked": true
+    "chunked": true,
+    "listed": true
   }
 }

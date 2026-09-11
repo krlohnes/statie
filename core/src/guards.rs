@@ -7,11 +7,16 @@
 //! times over for moving its "run cargo test" plan step back to
 //! in-progress after an edit, until the retry cap parked it as a failure
 //! with the crate already green, and the audit showed the switch off no
-//! worse.
+//! worse; and `situational_rules` (unit 26), which defaults to `false` --
+//! an unproven, opt-in rendering change (localised per-step guidance
+//! instead of the skill's whole rules block) a battery can compare against
+//! today's behaviour, not yet a rule with a battery-backed default of its
+//! own to keep.
 
 use serde::{Deserialize, Serialize};
 
-/// One switch per audited rule. All default `true`; flipping one to `false`
+/// One switch per audited rule. All default `true` except `done_stays_done`
+/// and `situational_rules` (see the module doc); flipping one to `false`
 /// disables that rule and nothing else. See each field's doc comment for
 /// what "off" means precisely, and `ARCHITECTURE.md` "Guards against
 /// non-progress" for what each rule is guarding against.
@@ -95,6 +100,18 @@ pub struct Guards {
     /// restores the current behaviour exactly: every finding passes through
     /// unchanged, with no grounding check at all.
     pub grounded_findings: bool,
+    /// Unit 26 (situational rules): `plan`/`implement`/`review`'s
+    /// instructions (`skills/src/coding/mod.rs`'s `spec()`) render only the
+    /// universal bullets (what holds in every situation), and each skill's
+    /// `Skill::situational` returns `procedure::render(procedure::
+    /// situation(cur))` -- localised, 2-hop guidance derived from harness-
+    /// owned state (`skills/src/coding/procedure.rs`), rendered as its own
+    /// `## Now` section (`core/src/session.rs`). Off (the default): the
+    /// spec's instructions are byte-identical to before this switch
+    /// existed (every bullet moved to `procedure.rs` stays in the spec
+    /// text too, verbatim), and `situational` returns `None` -- no `## Now`
+    /// section, nothing changes anywhere.
+    pub situational_rules: bool,
 }
 
 impl Default for Guards {
@@ -110,6 +127,7 @@ impl Default for Guards {
             decision_field: true,
             tests_field: true,
             grounded_findings: true,
+            situational_rules: false,
         }
     }
 }

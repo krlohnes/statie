@@ -489,6 +489,7 @@ fn harness_view_marks_filtered_pass() {
         last_skip: None,
         last_tool_error: None,
         last_stall: None,
+        last_tool: None,
     };
 
     let view = HarnessView::new(&state);

@@ -960,7 +960,8 @@ mod tests {
             parsed.guards,
             Guards::default(),
             "an absent guards section must match Guards::default() exactly (every rule on \
-             except done_stays_done, off by default since the first bench battery's audit)"
+             except done_stays_done, off by default since the first bench battery's audit, \
+             and situational_rules, off by default as an unproven opt-in rendering change)"
         );
     }
 
@@ -990,6 +991,10 @@ mod tests {
         assert!(parsed.guards.decision_field);
         assert!(parsed.guards.tests_field);
         assert!(parsed.guards.grounded_findings);
+        assert!(
+            !parsed.guards.situational_rules,
+            "situational_rules defaults to false, like done_stays_done"
+        );
 
         // Round-trips through serialize -> deserialize unchanged.
         let json = serde_json::to_string(&parsed).unwrap();
@@ -1106,6 +1111,47 @@ mod tests {
         );
         assert!(parsed.guards.tests_field);
         assert!(!parsed.guards.grounded_findings);
+
+        // Round-trips through serialize -> deserialize unchanged.
+        let json = serde_json::to_string(&parsed).unwrap();
+        let round_tripped: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.guards, parsed.guards);
+    }
+
+    /// Unit 26 (situational rules): `guards.situational_rules` picks up a
+    /// config value the same way every other `Guards` field does, with the
+    /// rest at default. Unlike `grounded_findings` (default `true`), this
+    /// field defaults to `false` -- the meaningful override direction is
+    /// turning it ON, mirroring `done_stays_done`'s own default-`false`
+    /// treatment.
+    #[test]
+    fn guards_situational_rules_true_parses_with_other_fields_at_default() {
+        let text = serde_json::json!({
+            "guards": {"situational_rules": true}
+        })
+        .to_string();
+        let parsed: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.guards,
+            Guards {
+                situational_rules: true,
+                ..Guards::default()
+            }
+        );
+        assert!(parsed.guards.redundant_reads);
+        assert!(parsed.guards.silent_reads);
+        assert!(parsed.guards.read_guard);
+        assert!(parsed.guards.redundant_verify);
+        assert!(
+            !parsed.guards.done_stays_done,
+            "done_stays_done defaults to false, unlike the other rules"
+        );
+        assert!(parsed.guards.commitment_read_cap);
+        assert!(parsed.guards.seen_map);
+        assert!(parsed.guards.decision_field);
+        assert!(parsed.guards.tests_field);
+        assert!(parsed.guards.grounded_findings);
+        assert!(parsed.guards.situational_rules);
 
         // Round-trips through serialize -> deserialize unchanged.
         let json = serde_json::to_string(&parsed).unwrap();

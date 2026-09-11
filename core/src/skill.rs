@@ -841,6 +841,25 @@ pub trait Skill: Send + Sync + 'static {
         None
     }
 
+    /// Unit 26 (situational rules): localised, per-step guidance derived
+    /// from the harness's own state (`cur.harness`) and the workspace --
+    /// the 2-hop neighbourhood of "what just happened" in a procedure
+    /// graph, rather than the skill's whole rules block repeated every
+    /// step (RELATED-WORK.md: localised guidance beat whole-procedure
+    /// injection by 9 points and 71% fewer tokens in that study).
+    /// `SkillSpec` is immutable per activation (C1) and so cannot carry
+    /// this -- it must be recomputed fresh each step from `cur`, hence a
+    /// method taking `&CommittedState` rather than a field on the spec.
+    /// Default `None`: a skill that has no situational guidance (or has
+    /// the switch controlling it turned off) renders no `## Now` section
+    /// at all, identical to today's prompt. `Some(text)` is rendered as
+    /// its own section headed `## Now`, placed right after the harness
+    /// view (`core/src/session.rs`'s prompt builder), truncated to the
+    /// same budget rule `notes` gets.
+    fn situational(&self, _cur: &CommittedState<Self::Workspace>) -> Option<String> {
+        None
+    }
+
     /// Called by the session right after a tool call has executed
     /// successfully -- not on a tool error, not on a skipped-redundant
     /// call, but a paged `read_file` repeat counts as executed (with its

@@ -16,7 +16,7 @@ use crate::tool::ToolList;
 use crate::version::{HarnessState, Version};
 use crate::working_set::WorkingSet;
 
-/// One of the nine fixed prompt sections.
+/// One of the ten fixed prompt sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Section {
     System,
@@ -25,6 +25,9 @@ pub enum Section {
     AgentState,
     Notes,
     HarnessView,
+    /// Unit 26 (situational rules): `Skill::situational`'s localised,
+    /// per-step guidance, rendered right after the harness view.
+    Situational,
     WorkingSet,
     Augmentation,
     Observation,
@@ -39,6 +42,7 @@ impl Section {
             Section::AgentState => "Agent State",
             Section::Notes => "notes (kept by the harness from your previous reasoning)",
             Section::HarnessView => "Harness View",
+            Section::Situational => "Now",
             Section::WorkingSet => {
                 "working set (what you read recently; derived from the log, not state):"
             }
@@ -60,13 +64,13 @@ pub struct OverBudget {
 
 /// Builds a `BoundedPrompt`. Sections may be supplied in any call order;
 /// they are always emitted in the fixed order System, Spec, Tools,
-/// AgentState, Notes, HarnessView, Augmentation, Observation. A section
-/// that was never supplied is simply omitted.
+/// AgentState, Notes, HarnessView, Situational, WorkingSet, Augmentation,
+/// Observation. A section that was never supplied is simply omitted.
 pub struct PromptBuilder<'t> {
     tokenizer: &'t dyn Tokenizer,
     budgets: Budgets,
     version: Version,
-    rendered: [Option<String>; 9],
+    rendered: [Option<String>; 10],
 }
 
 const IDX_SYSTEM: usize = 0;
@@ -75,17 +79,19 @@ const IDX_TOOLS: usize = 2;
 const IDX_AGENT: usize = 3;
 const IDX_NOTES: usize = 4;
 const IDX_HARNESS: usize = 5;
-const IDX_WORKING_SET: usize = 6;
-const IDX_AUGMENTATION: usize = 7;
-const IDX_OBSERVATION: usize = 8;
+const IDX_SITUATIONAL: usize = 6;
+const IDX_WORKING_SET: usize = 7;
+const IDX_AUGMENTATION: usize = 8;
+const IDX_OBSERVATION: usize = 9;
 
-const SECTION_ORDER: [Section; 9] = [
+const SECTION_ORDER: [Section; 10] = [
     Section::System,
     Section::Spec,
     Section::Tools,
     Section::AgentState,
     Section::Notes,
     Section::HarnessView,
+    Section::Situational,
     Section::WorkingSet,
     Section::Augmentation,
     Section::Observation,
@@ -144,6 +150,20 @@ impl<'t> PromptBuilder<'t> {
         self.set(IDX_HARNESS, text)
     }
 
+    /// Renders `Skill::situational`'s localised, per-step guidance (unit
+    /// 26), placed right after the harness view. `None` or empty text
+    /// renders nothing -- the same as never calling this method, so a
+    /// skill with the switch off (or with no situational text for this
+    /// step) leaves the prompt byte-identical to before this section
+    /// existed. Budgeted the same as `notes` (see `build`'s per-section
+    /// check).
+    pub fn situational(self, s: Option<&str>) -> Self {
+        match s {
+            Some(text) if !text.is_empty() => self.set(IDX_SITUATIONAL, text.to_string()),
+            _ => self,
+        }
+    }
+
     /// Renders the working-set section (statie-spec.md "10. Working set").
     /// `None` (disabled, or nothing to show) renders nothing -- the same as
     /// never calling this method.
@@ -200,6 +220,19 @@ impl<'t> PromptBuilder<'t> {
                 });
             }
         }
+        // Unit 26: `situational` (the `## Now` section) is budgeted the
+        // same as `notes` -- both are short, harness-derived guidance text
+        // with no section-specific budget field of their own.
+        if let Some(text) = &self.rendered[IDX_SITUATIONAL] {
+            let tokens = self.tokenizer.count(text);
+            if tokens > self.budgets.notes {
+                return Err(OverBudget {
+                    section: Section::Situational,
+                    tokens,
+                    limit: self.budgets.notes,
+                });
+            }
+        }
         if let Some(text) = &self.rendered[IDX_WORKING_SET] {
             let tokens = self.tokenizer.count(text);
             if tokens > self.budgets.working_set {
@@ -212,7 +245,7 @@ impl<'t> PromptBuilder<'t> {
         }
 
         // Headed text per slot, indexed the same way as `self.rendered`.
-        let mut headed: [Option<String>; 9] = Default::default();
+        let mut headed: [Option<String>; 10] = Default::default();
         for (idx, section) in SECTION_ORDER.iter().enumerate() {
             if let Some(text) = &self.rendered[idx] {
                 headed[idx] = Some(format!("## {}\n{}", section.heading(), text));
@@ -254,6 +287,7 @@ impl<'t> PromptBuilder<'t> {
             IDX_AGENT,
             IDX_NOTES,
             IDX_HARNESS,
+            IDX_SITUATIONAL,
             IDX_WORKING_SET,
             IDX_AUGMENTATION,
             IDX_OBSERVATION,

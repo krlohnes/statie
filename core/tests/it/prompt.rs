@@ -54,6 +54,7 @@ fn harness_state() -> HarnessState {
         last_skip: None,
         last_tool_error: None,
         last_stall: None,
+        last_tool: None,
     }
 }
 

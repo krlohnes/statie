@@ -24,7 +24,8 @@ impl CodingRegistry {
     /// (`guards.done_stays_done`; statie-spec.md "10. After it works: the
     /// rule audit"; `guards.seen_map`/`guards.decision_field`; BACKLOG.md
     /// item 2; `guards.tests_field`; BACKLOG.md item 5;
-    /// `guards.grounded_findings`; item 12, grounded review findings).
+    /// `guards.grounded_findings`; item 12, grounded review findings;
+    /// `guards.situational_rules`; unit 26, situational rules).
     /// `Guards::default()` gives exactly [`CodingRegistry::new`].
     pub fn with_guards(guards: Guards) -> Self {
         Self::with_guards_and_listed(guards, true)
@@ -46,6 +47,7 @@ impl CodingRegistry {
                 guards.tests_field,
                 guards.grounded_findings,
                 listed,
+                guards.situational_rules,
             ),
         }
     }

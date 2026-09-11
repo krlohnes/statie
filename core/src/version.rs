@@ -284,6 +284,30 @@ pub struct HarnessState {
     /// `park_non_progress_cap` path to park at `count >= 6`.
     #[serde(default)]
     pub last_stall: Option<Stall>,
+    /// Unit 26 (situational rules): the name of the most recently
+    /// SUCCESSFULLY executed tool call this activation -- e.g.
+    /// `"read_file"`, `"edit_file"`, `"test"`, `"think"`, `"try_fixes"` --
+    /// set at each of the three success-commit sites that already
+    /// increment `tool_calls` inline (`Active::execute`'s generic success
+    /// path, `execute_think`, `execute_try_fixes`; `core/src/session.rs`),
+    /// right alongside that increment. Deliberately NOT set on a
+    /// `skipped_redundant` call (`record_tool_call`'s three callers) or a
+    /// `tool_error` -- those are `last_skip`/`last_tool_error`'s job, and a
+    /// skip/error is not "the tool ran", it's the harness declining to run
+    /// it or the tool itself failing. Never cleared back to `None` (unlike
+    /// `last_skip`/`last_tool_error`/`last_stall`, which reset on an
+    /// unrelated step) -- there is always a well-defined "most recent
+    /// successful tool call" once one has happened, and nothing needs it to
+    /// go stale. `None` until the first tool call succeeds this
+    /// activation. Harness-owned: patches cannot touch it. Read by
+    /// `skills/src/coding/procedure.rs`'s `situation()` to distinguish the
+    /// `read`/`search`/`edit_ok`/`test_pass`/`test_fail_*` nodes (paired
+    /// with `cur.agent.tests` for the test outcome) from one another when
+    /// none of `last_skip`/`last_tool_error`/`last_stall`/`last_think_step`
+    /// already pins the situation. `#[serde(default)]` so state persisted
+    /// before this field existed still deserializes.
+    #[serde(default)]
+    pub last_tool: Option<String>,
 }
 
 /// One skipped-redundant read, recorded on `HarnessState::last_skip`. See

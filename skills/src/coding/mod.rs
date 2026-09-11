@@ -10,6 +10,8 @@
 #[cfg(test)]
 mod tests;
 
+pub mod procedure;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -329,6 +331,22 @@ fn common_notes(ws: &CodingWorkspace) -> Option<String> {
     } else {
         Some(ws.notes.clone())
     }
+}
+
+/// `Skill::situational` shared by `plan`/`implement`/`review` (unit 26,
+/// `guards.situational_rules`): `enabled = false` (the switch off) always
+/// returns `None` -- no `## Now` section, identical to today's prompt.
+/// `enabled = true` returns `procedure::render(procedure::situation(cur))`,
+/// with an empty rendered string (a node with no outgoing edges, e.g.
+/// `read`/`search`/`test_pass`) folded to `None` the same way
+/// `PromptBuilder::situational` already treats an empty string -- so a
+/// skill's own `None`-vs-`Some("")` distinction never has to be made twice.
+fn common_situational(enabled: bool, cur: &CommittedState<CodingWorkspace>) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let text = procedure::render(procedure::situation(cur));
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// Tools `next.tool` may name: the mutating calls a commitment is allowed to
@@ -3535,6 +3553,10 @@ pub struct PlanSkill {
     /// disabling it -- the harness's own substitutions still construct a
     /// `think` action directly. Set with [`PlanSkill::with_listed`].
     listed: bool,
+    /// `guards.situational_rules` (`core/src/guards.rs`; unit 26). Defaults
+    /// to `false` (today's behaviour: the full rules block every step).
+    /// Set with [`PlanSkill::with_situational_rules`].
+    situational: bool,
 }
 
 impl Default for PlanSkill {
@@ -3547,6 +3569,7 @@ impl Default for PlanSkill {
             decision: true,
             tests: true,
             listed: true,
+            situational: false,
         }
     }
 }
@@ -3566,6 +3589,9 @@ pub struct ImplementSkill {
     /// `thinker.listed`; see [`PlanSkill::listed`]. Set with
     /// [`ImplementSkill::with_listed`].
     listed: bool,
+    /// `guards.situational_rules`; see [`PlanSkill::situational`]. Set with
+    /// [`ImplementSkill::with_situational_rules`].
+    situational: bool,
 }
 
 impl Default for ImplementSkill {
@@ -3578,6 +3604,7 @@ impl Default for ImplementSkill {
             decision: true,
             tests: true,
             listed: true,
+            situational: false,
         }
     }
 }
@@ -3601,6 +3628,12 @@ pub struct ReviewSkill {
     /// `guards.grounded_findings` (`core/src/guards.rs`; item 12: grounded
     /// review findings). Set with [`ReviewSkill::with_grounded_findings`].
     grounded_findings: bool,
+    /// `guards.situational_rules`; see [`PlanSkill::situational`]. Set with
+    /// [`ReviewSkill::with_situational_rules`]. `review`'s instructions had
+    /// no "after X" bullet against unit 26's node set, so this switch only
+    /// affects `spec()`'s doc note and `situational()`'s (empty) return --
+    /// see `ReviewSkill::spec`.
+    situational: bool,
 }
 
 impl Default for ReviewSkill {
@@ -3614,6 +3647,7 @@ impl Default for ReviewSkill {
             tests: true,
             listed: true,
             grounded_findings: true,
+            situational: false,
         }
     }
 }
@@ -3794,6 +3828,7 @@ impl PlanSkill {
             decision: true,
             tests: true,
             listed: true,
+            situational: false,
         }
     }
 
@@ -3802,6 +3837,18 @@ impl PlanSkill {
     /// works: the rule audit").
     pub fn with_done_stays_done(mut self, enabled: bool) -> Self {
         self.done_stays_done = enabled;
+        self
+    }
+
+    /// Sets `guards.situational_rules` (default `false`; `core/src/
+    /// guards.rs`, unit 26: situational rules). `true`: `spec()` renders
+    /// only the universal bullets and `situational()` returns
+    /// `procedure::render(procedure::situation(cur))` as the prompt's
+    /// `## Now` section. `false` (default): `spec()` is byte-identical to
+    /// before this switch existed, and `situational()` returns `None` --
+    /// no `## Now` section.
+    pub fn with_situational_rules(mut self, enabled: bool) -> Self {
+        self.situational = enabled;
         self
     }
 
@@ -3842,8 +3889,14 @@ impl Skill for PlanSkill {
     }
 
     fn spec(&self) -> Arc<SkillSpec> {
-        let instructions = format!(
-            "You are the planner for a coding task. Use `search` to find definitions and \
+        // Unit 26 (situational rules): with the switch on, the "design
+        // fork" bullet moves to `procedure.rs`'s `start` edge
+        // (`START_THINK_OPTIONS`) and `situational()` renders it instead --
+        // left out of the universal spec text entirely, not duplicated.
+        // With the switch off, `head` + `tail` concatenate to exactly the
+        // instructions string this skill has always had (byte-identical;
+        // see `skills/tests/it/situational.rs`'s snapshot test).
+        let head = "You are the planner for a coding task. Use `search` to find definitions and \
              usages before reading whole files; use `list_files` and `read_file` \
              (with `offset`/`limit` for files longer than ~200 lines) until you \
              understand what needs to change. Do not write or run code yet.\n\n\
@@ -3859,9 +3912,10 @@ impl Skill for PlanSkill {
              - `notes` is kept by the harness from your previous reasoning: read it \
                before deciding; you cannot patch it.\n\
              - If you commit to a next step by setting `next`, the harness holds you to \
-               it -- change `next` (and say why in `recent_summary`) if the plan changes.\n\
-             - For a design fork with more than one reasonable approach, call `think` with \
-               `mode: \"options\"` before writing the plan.\n\n\
+               it -- change `next` (and say why in `recent_summary`) if the plan changes.\n";
+        let think_options_bullet = "- For a design fork with more than one reasonable approach, call \
+             `think` with `mode: \"options\"` before writing the plan.\n";
+        let tail = "\n\
              When to hand off: once the plan is solid, set `next_skill: \"implement\"` \
              and action `done`. The plan must be non-empty before you hand off to \
              `implement`.\n\n\
@@ -3869,9 +3923,14 @@ impl Skill for PlanSkill {
              earlier step already found. `recent_summary` is the only memory that \
              survives across steps and across skill handoffs. If a tool output overflowed \
              (the observation says so), call `filter_last_tool_call` with a regex instead \
-             of re-running the command.{}",
-            delegate_paragraph(&self.delegates)
-        );
+             of re-running the command.";
+        let mut instructions = String::new();
+        instructions.push_str(head);
+        if !self.situational {
+            instructions.push_str(think_options_bullet);
+        }
+        instructions.push_str(tail);
+        instructions.push_str(&delegate_paragraph(&self.delegates));
         self.spec.get("plan", instructions)
     }
 
@@ -3956,6 +4015,10 @@ impl Skill for PlanSkill {
 
     fn notes(&self, ws: &Self::Workspace) -> Option<String> {
         common_notes(ws)
+    }
+
+    fn situational(&self, cur: &CommittedState<Self::Workspace>) -> Option<String> {
+        common_situational(self.situational, cur)
     }
 
     fn after_tool(
@@ -4127,6 +4190,7 @@ impl ImplementSkill {
             decision: true,
             tests: true,
             listed: true,
+            situational: false,
         }
     }
 
@@ -4152,6 +4216,13 @@ impl ImplementSkill {
         self.tests = tests;
         self
     }
+
+    /// Sets `guards.situational_rules`; see
+    /// [`PlanSkill::with_situational_rules`].
+    pub fn with_situational_rules(mut self, enabled: bool) -> Self {
+        self.situational = enabled;
+        self
+    }
 }
 
 impl Skill for ImplementSkill {
@@ -4163,41 +4234,62 @@ impl Skill for ImplementSkill {
     }
 
     fn spec(&self) -> Arc<SkillSpec> {
-        let instructions = format!(
-            "You are implementing the plan for a coding task, one step at a time.\n\n\
+        // Unit 26 (situational rules): with the switch on, four bullets
+        // move to `procedure.rs` edges and `situational()` renders them
+        // instead -- left out of the universal spec text entirely, not
+        // duplicated:
+        //   - the `edit_file`-not-found retry clause -> `edit_error`
+        //     (`EDIT_ERROR_RETRY`)
+        //   - the "tool reports a line number" clause -> `edit_error`
+        //     (`READ_FROM_REPORTED_OFFSET`)
+        //   - the after-edit "run `test`" bullet -> `edit_ok`
+        //     (`EDIT_OK_RUN_TEST`)
+        //   - the `think`-when-stuck bullet -> `test_fail_*`
+        //     (`THINK_WHEN_STUCK`)
+        //   - the `try_fixes`-after-failure bullet -> `start`/`test_fail_*`
+        //     (`TRY_FIXES_AFTER_FAILURE`)
+        // With the switch off, `head`/`edit_retry_clause`/`mid`/
+        // `line_number_clause`/`mid2`/`run_test_bullet`/`mid3`/
+        // `think_bullet`/`try_fixes_bullet`/`tail` concatenate to exactly
+        // the instructions string this skill has always had (byte-
+        // identical; see `skills/tests/it/situational.rs`'s snapshot test).
+        let head = "You are implementing the plan for a coding task, one step at a time.\n\n\
              What to put in the workspace:\n\
              - Mark the step you are working `in_progress`, then `done` once it is \
                finished; use `skipped` only when a step turns out unnecessary.\n\
              - Prefer `edit_file` for changes to existing files: give it a small \
                anchored `old` text copied exactly from a `read_file` result, including \
-               indentation. Use `write_file` only for new files or full rewrites. If \
+               indentation. Use `write_file` only for new files or full rewrites. ";
+        let edit_retry_clause = "If \
                `edit_file` reports the text was not found or ambiguous, re-read the \
                file and retry with a more specific anchor -- never fall back to \
-               rewriting the whole file. To add code, anchor on one line you can see: \
+               rewriting the whole file. ";
+        let mid = "To add code, anchor on one line you can see: \
                `edit_file` with `after` (or `before`) and `new`, instead of a \
-               multi-line `old`. When a tool reports a line number, read from that \
-               offset (`read_file` with `offset`) instead of paging from the top. \
-               Use `shell` for other changes.\n\
+               multi-line `old`. ";
+        let line_number_clause = "When a tool reports a line number, read from that \
+               offset (`read_file` with `offset`) instead of paging from the top. ";
+        let mid2 = "Use `shell` for other changes.\n\
              - Commit before you look: when you decide what to change, set `next` \
                (tool, path, what) in the same patch, where `tool` is the mutating call \
                you will make -- `edit_file`, `write_file`, `shell`, or `test`, never \
                `read_file`. While `next` is set you may read that file at most twice; \
                then the harness expects the call. If the plan changes, change `next` \
-               and say why in `recent_summary`.\n\
-             - After finishing a step that changes code, run `test` and read the \
+               and say why in `recent_summary`.\n";
+        let run_test_bullet = "- After finishing a step that changes code, run `test` and read the \
                `result:` line; do not mark a step `done` while `test` reports `fail` \
                unless the failure predates your change (check with `recall`, e.g. \
-               query \"test output\" to see the last test run).\n\
-             - Keep `files` and `recent_summary` up to date as you go.\n\
+               query \"test output\" to see the last test run).\n";
+        let mid3 = "- Keep `files` and `recent_summary` up to date as you go.\n\
              - `notes` is kept by the harness from your previous reasoning: read it \
-               before deciding; you cannot patch it.\n\
-             - `think` asks a reasoning subagent that sees what you see; use it when a \
+               before deciding; you cannot patch it.\n";
+        let think_bullet = "- `think` asks a reasoning subagent that sees what you see; use it when a \
                fix did not change the failure or you cannot tell which cause is real, \
-               then act on its `decision`.\n\
-             - `try_fixes` is only useful after a failing `test`: it proposes and verifies \
+               then act on its `decision`.\n";
+        let try_fixes_bullet = "- `try_fixes` is only useful after a failing `test`: it proposes and verifies \
                candidate fixes for the most recent failure, so call `test` first if none has \
-               failed yet.\n\
-             - If you are blocked (missing information only the user can give you), use \
+               failed yet.\n";
+        let tail = "- If you are blocked (missing information only the user can give you), use \
                action `ask_user` rather than guessing -- it is the only way to pause; \
                `yield` is rejected in this skill.\n\n\
              When to hand off: once every plan step is `done` or `skipped`, set \
@@ -4207,9 +4299,27 @@ impl Skill for ImplementSkill {
              earlier step already tried or found. `recent_summary` is the only memory \
              that survives across steps and across skill handoffs. If a tool output \
              overflowed (the observation says so), call `filter_last_tool_call` with a \
-             regex instead of re-running the command.{}",
-            delegate_paragraph(&self.delegates)
-        );
+             regex instead of re-running the command.";
+        let mut instructions = String::new();
+        instructions.push_str(head);
+        if !self.situational {
+            instructions.push_str(edit_retry_clause);
+        }
+        instructions.push_str(mid);
+        if !self.situational {
+            instructions.push_str(line_number_clause);
+        }
+        instructions.push_str(mid2);
+        if !self.situational {
+            instructions.push_str(run_test_bullet);
+        }
+        instructions.push_str(mid3);
+        if !self.situational {
+            instructions.push_str(think_bullet);
+            instructions.push_str(try_fixes_bullet);
+        }
+        instructions.push_str(tail);
+        instructions.push_str(&delegate_paragraph(&self.delegates));
         self.spec.get("implement", instructions)
     }
 
@@ -4310,6 +4420,10 @@ impl Skill for ImplementSkill {
 
     fn notes(&self, ws: &Self::Workspace) -> Option<String> {
         common_notes(ws)
+    }
+
+    fn situational(&self, cur: &CommittedState<Self::Workspace>) -> Option<String> {
+        common_situational(self.situational, cur)
     }
 
     fn after_tool(
@@ -4530,6 +4644,7 @@ impl ReviewSkill {
             tests: true,
             listed: true,
             grounded_findings: true,
+            situational: false,
         }
     }
 
@@ -4562,6 +4677,16 @@ impl ReviewSkill {
     /// unchanged, with no `path:line` check.
     pub fn with_grounded_findings(mut self, enabled: bool) -> Self {
         self.grounded_findings = enabled;
+        self
+    }
+
+    /// Sets `guards.situational_rules`; see
+    /// [`PlanSkill::with_situational_rules`]. `review`'s instructions have
+    /// no "after X" bullet against unit 26's node set (see
+    /// [`ReviewSkill::situational`]'s doc), so this only changes `spec()`'s
+    /// doc note; `situational()` always returns `None` for `review`.
+    pub fn with_situational_rules(mut self, enabled: bool) -> Self {
+        self.situational = enabled;
         self
     }
 }
@@ -4674,6 +4799,10 @@ impl Skill for ReviewSkill {
 
     fn notes(&self, ws: &Self::Workspace) -> Option<String> {
         common_notes(ws)
+    }
+
+    fn situational(&self, cur: &CommittedState<Self::Workspace>) -> Option<String> {
+        common_situational(self.situational, cur)
     }
 
     fn after_tool(
@@ -4817,8 +4946,9 @@ pub fn coding_skills() -> Vec<(
 /// default path, the first bench battery's audit showed the switch off no
 /// worse -- see `plan_rules`'s doc); `seen_map`/`decision_field`/
 /// `tests_field`/`grounded_findings` default to `true` (today's behaviour,
-/// like every other guard -- see `core/src/guards.rs`); use
-/// `coding_skills_configured` directly to opt any of these back.
+/// like every other guard -- see `core/src/guards.rs`); `situational_rules`
+/// (unit 26) defaults to `false`, like `guards.situational_rules` itself.
+/// Use `coding_skills_configured` directly to opt any of these back.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_with_delegates(
     delegates: Vec<String>,
@@ -4826,7 +4956,7 @@ pub fn coding_skills_with_delegates(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
 )> {
-    coding_skills_configured(delegates, false, true, true, true, true, true)
+    coding_skills_configured(delegates, false, true, true, true, true, true, false)
 }
 
 /// All four coding skills with every knob: `delegates` as in
@@ -4835,12 +4965,16 @@ pub fn coding_skills_with_delegates(
 /// `seen`/`decision`/`tests` = `guards.seen_map`/`guards.decision_field`/
 /// `guards.tests_field` (`core/src/guards.rs`; BACKLOG.md items 2 and 5);
 /// `grounded_findings` = `guards.grounded_findings` (`core/src/guards.rs`,
-/// item 12: grounded review findings, `review`-only) -- all threaded into
-/// `plan`, `implement`, and `review` via [`PlanSkill::with_done_stays_done`]/
-/// [`PlanSkill::state_fields`]/[`ReviewSkill::with_grounded_findings`] and
-/// their siblings. `router` is unaffected by all five: it has no plan-step
-/// rules and no tools, so nothing in it reads any of them.
+/// item 12: grounded review findings, `review`-only); `situational` =
+/// `guards.situational_rules` (`core/src/guards.rs`, unit 26: situational
+/// rules) -- all threaded into `plan`, `implement`, and `review` via
+/// [`PlanSkill::with_done_stays_done`]/[`PlanSkill::state_fields`]/
+/// [`ReviewSkill::with_grounded_findings`]/[`PlanSkill::
+/// with_situational_rules`] and their siblings. `router` is unaffected by
+/// all six: it has no plan-step rules, no tools, and no procedure-graph
+/// text, so nothing in it reads any of them.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub fn coding_skills_configured(
     delegates: Vec<String>,
     done_stays_done: bool,
@@ -4849,6 +4983,7 @@ pub fn coding_skills_configured(
     tests: bool,
     grounded_findings: bool,
     listed: bool,
+    situational: bool,
 ) -> Vec<(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
@@ -4861,7 +4996,8 @@ pub fn coding_skills_configured(
                 PlanSkill::with_delegates(delegates.clone())
                     .with_done_stays_done(done_stays_done)
                     .state_fields(seen, decision, tests)
-                    .with_listed(listed),
+                    .with_listed(listed)
+                    .with_situational_rules(situational),
             ),
         ),
         (
@@ -4870,7 +5006,8 @@ pub fn coding_skills_configured(
                 ImplementSkill::with_delegates(delegates.clone())
                     .with_done_stays_done(done_stays_done)
                     .state_fields(seen, decision, tests)
-                    .with_listed(listed),
+                    .with_listed(listed)
+                    .with_situational_rules(situational),
             ),
         ),
         (
@@ -4880,7 +5017,8 @@ pub fn coding_skills_configured(
                     .with_done_stays_done(done_stays_done)
                     .state_fields(seen, decision, tests)
                     .with_grounded_findings(grounded_findings)
-                    .with_listed(listed),
+                    .with_listed(listed)
+                    .with_situational_rules(situational),
             ),
         ),
     ]

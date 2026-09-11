@@ -1224,6 +1224,7 @@ impl<W> Session<W> {
                         last_skip: None,
                         last_tool_error: None,
                         last_stall: None,
+                        last_tool: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -1854,6 +1855,19 @@ where
             .unwrap_or_default();
 
         let notes = self.skill.notes(&cur.agent).map(Notes::new);
+        // Unit 26 (situational rules): localised, per-step guidance derived
+        // from harness-owned state, rendered as its own `## Now` section
+        // right after the harness view. `None` (switch off, or the skill
+        // has nothing to say this step) omits the section entirely --
+        // identical to today's prompt. Its token count is not logged
+        // separately: unlike `notes_tokens` (`StepSink::maintainer_done`),
+        // there is no per-section breakdown in the worker step's own
+        // usage-style payload to fold it into -- only the maintainer
+        // subsystem (a separate call) logs a section's token count on its
+        // own. `BoundedPrompt::tokens()` (`self.session.last_prompt_tokens`,
+        // set below) already includes this section's contribution to the
+        // total.
+        let situational = self.skill.situational(&cur);
         let mut builder = PromptBuilder::new(
             self.session.tokenizer.as_ref(),
             cur.harness.budgets,
@@ -1865,6 +1879,7 @@ where
         .agent(&agent_state)
         .notes(notes.as_ref())
         .harness(&harness_view)
+        .situational(situational.as_deref())
         .working_set(working_set.as_ref());
         if let Some(aug) = &augmentation {
             builder = builder.augmentation(aug);
@@ -3433,6 +3448,9 @@ where
                         // `record_tool_call` call, avoiding a second
                         // round-trip.
                         harness.tool_calls += 1;
+                        // Unit 26: `last_tool` records which one, for the
+                        // situational-rules procedure graph. See its doc.
+                        harness.last_tool = Some(name.clone());
                         self.session.store.set_harness(harness).await?;
 
                         // Milestone 10: `Skill::after_tool` (see
@@ -4062,6 +4080,9 @@ where
         let mut harness = cur.harness;
         harness.tool_calls += 1;
         harness.last_think_step = Some(step);
+        // Unit 26: `last_tool` records which tool, for the
+        // situational-rules procedure graph. See its doc.
+        harness.last_tool = Some(name.clone());
         self.session.store.set_harness(harness).await?;
 
         // Milestone 10: `Skill::after_tool` (see `call_after_tool_hook`'s
@@ -4391,6 +4412,9 @@ where
         harness.tool_calls += 1;
         harness.last_try_fixes_step = Some(step);
         harness.last_think_step = Some(step);
+        // Unit 26: `last_tool` records which tool, for the
+        // situational-rules procedure graph. See its doc.
+        harness.last_tool = Some(name.clone());
         self.session.store.set_harness(harness).await?;
 
         self.call_after_tool_hook(step, &name, &args, &raw_output)

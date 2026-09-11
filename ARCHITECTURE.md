@@ -1680,3 +1680,36 @@ decides whether the localisation matters.
   prompt size stays flat across steps.
 - `cargo test --workspace` and `cargo clippy --workspace --all-targets -D warnings`
   must both pass at every milestone.
+
+## Milestone 34: the no-green cap (BACKLOG.md item 27)
+
+`HarnessState.fails_since_green` counts `test` runs that failed since the
+last pass in this activation. It is written at the same site as
+`green_step` in the `test` branch of `Active::execute`, reset to zero on
+a pass and on activation, and harness-owned like the other counters.
+
+Two constants in `core/src/session.rs` set the thresholds:
+`NO_GREEN_THINK_AT` (12) and `NO_GREEN_PARK_AT` (16). At the park
+threshold the failing `test` call itself parks through
+`park_non_progress_cap` with the shape `"no green in 16 test runs"`,
+logged as `non_progress_cap`. At the think threshold the coding
+`implement` skill's `implement_no_green_thinks` trigger, run after the
+stalled-path trigger, substitutes `think` with `NO_GREEN_QUESTION`
+("{n} test runs have failed since the last pass. Is the plan itself
+wrong? ...") for any action other than `test` or `think`, once per
+failing test (it does not fire again until another test fails).
+
+Why this guard exists when six others already do: every earlier guard is
+keyed on a repeat (same read, same error shape, same path, same failure
+summary). The `refactor_signature` misses repeat nothing. Each edit
+applies, each test fails with a different compile error, and the run
+spends 132 steps and the whole 900 s budget. The only signal those runs
+share is the count of failing tests without a pass. The thresholds sit
+above every landed run in the record (most failing tests before the
+first pass across 79 landed runs: 13), so on the evidence the cap costs
+nothing and ends the worst misses at half their length.
+
+Tests: `core/tests/it/no_green_cap.rs` (the count climbs 1 to 16 and the
+sixteenth parks with the exact shape; a pass resets it) and
+`skills/tests/it/no_green_think.rs` (twelve failures then a read becomes
+the exact question; a `test` action at the same point is left alone).

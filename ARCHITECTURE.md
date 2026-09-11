@@ -1631,6 +1631,22 @@ so a model that ignores the answer gets at most two thinks and three
 errors (or skips) before the core cap parks the run;
 `skills/tests/error_think.rs` and `skip_think.rs` pin that bound.
 
+## Milestone 32: repeat guards key on the shape of an error (BACKLOG.md item 25)
+
+`error_shape` reduces a tool error's reason to its shape: digits become
+`#`, path-like tokens `<path>`, backtick spans `` `…` ``, whitespace
+collapsed, cut at 120 characters. The identical-error streak keys on
+(tool, shape), so nine `edit_file` failures that differ only in line
+numbers are one streak; `RepeatedToolError` keeps the latest full
+reason for the question and gains `shape`. The skill trigger fires on
+the identical call, or on any call of that tool once the shape has
+repeated (`count >= 2`); a corrected call after a single error runs. A
+third record, `HarnessState.last_stall { path, count, step }`, counts a
+refused read and a failed edit on the same path as one streak;
+`implement_stall_thinks` asks `STALLED_PATH_QUESTION` at the second
+strike and the core parks at six with the shape "stalled on <path>".
+Think steps keep every count (D19).
+
 ## Testing conventions
 
 - Unit tests live beside code (`#[cfg(test)]`). Integration tests in

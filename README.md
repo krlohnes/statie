@@ -1528,6 +1528,7 @@ either a default or a config knob:
   | 10, current arm | 13/16 | new guards turning loops into parks |
   | 10, fixer arm with cap | 12/16 | cap parked at the third strike |
   | 11, fixer arm | 15/16 | second strike is a `think` (items 21, 23) |
+  | 11, current arm | 15/16 | same binary, no fixer |
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

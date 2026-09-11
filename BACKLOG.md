@@ -326,7 +326,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Gate wall clock and `Running` lines before and after.
 
 ### 25. Repeat guards key on the shape of an error, not its text
-- **Status.** Found in `arm_harness_max_b7`: `refactor_signature` ran 116 and 153 steps before the mixed-shape cap parked it.
+- **Status.** Built (Milestone 32); in the thirteenth gate. First cut rejected: its error trigger fired on any call of the tool after one error, which would have blocked the corrected edit; now identical call or repeated shape. Found in `arm_harness_max_b7`: `refactor_signature` ran 116 and 153 steps before the mixed-shape cap parked it.
 - **What.** The identical-error streak keys on (tool, reason text), so
   nine `edit_file` failures in a row with different line numbers in the
   reason count as nine different errors, and a run that alternates a

@@ -404,6 +404,39 @@ impl Tool for NoopEditFile {
     }
 }
 
+/// A tool named `edit_file` that always fails with the SAME SHAPE of error
+/// (the exact wording `tools/src/edit_file.rs`'s `check_no_duplicate_
+/// definition` reports for a duplicate-insert refusal), but with a
+/// DIFFERENT line number each call, read from `args.line` -- used by unit
+/// 25's own acceptance test to drive the repeated-tool-error guard's
+/// identical-SHAPE-error streak (`error_shape`, `core/src/session.rs`) with
+/// reasons that are never byte-identical to each other, only same-shaped.
+struct ShapeVaryingEditFile;
+
+#[async_trait]
+impl Tool for ShapeVaryingEditFile {
+    fn name(&self) -> &str {
+        "edit_file"
+    }
+    fn description(&self) -> &str {
+        "always fails with a same-shape, different-line-number error"
+    }
+    fn args_schema(&self) -> Schema {
+        Schema::of::<Value>()
+    }
+    async fn call(
+        &self,
+        args: Value,
+        _ctx: &ToolCtx,
+    ) -> Result<statie_core::ToolOutputFull, statie_core::ToolError> {
+        let line = args.get("line").and_then(Value::as_u64).unwrap_or(1);
+        Err(statie_core::ToolError::ExecutionFailed(format!(
+            "line {line} of src/lib.rs already has `pub fn new(...)`; your insert would \
+             duplicate it. Use old/new to replace the existing code instead."
+        )))
+    }
+}
+
 /// A tool that always errors with the SAME `ExecutionFailed` reason,
 /// regardless of its arguments -- used to drive the repeated-tool-error
 /// guard's identical-error streak without depending on a specific tool's
@@ -440,6 +473,18 @@ fn tool_set(shell_calls: Arc<AtomicU64>) -> ToolSet {
     tools
 }
 
+/// Same shape as `tool_set`, but registers `ShapeVaryingEditFile` in place
+/// of the always-succeeding `NoopEditFile` -- used by unit 25's own
+/// acceptance test, which needs `edit_file` itself to fail with a
+/// same-shape, different-line-number error.
+fn shape_varying_tool_set(shell_calls: Arc<AtomicU64>) -> ToolSet {
+    let mut tools = ToolSet::new();
+    tools.register(Arc::new(CountingShell { calls: shell_calls }));
+    tools.register(Arc::new(ShapeVaryingEditFile));
+    tools.register(Arc::new(AlwaysErrorsTool));
+    tools
+}
+
 fn shell_action(cmd: &str) -> Value {
     serde_json::json!({"type": "tool", "name": "shell", "args": {"cmd": cmd}})
 }
@@ -450,6 +495,18 @@ fn lint_action() -> Value {
 
 fn edit_action() -> Value {
     serde_json::json!({"type": "tool", "name": "edit_file", "args": {"path": "f", "content": "x"}})
+}
+
+/// An `edit_file` call naming a specific `line` argument -- read by
+/// `ShapeVaryingEditFile` to build a same-shape error citing that line
+/// number, so consecutive calls with DIFFERENT `line`s still count as the
+/// SAME error shape (unit 25's own acceptance test).
+fn edit_action_with_line(line: u64) -> Value {
+    serde_json::json!({
+        "type": "tool",
+        "name": "edit_file",
+        "args": {"path": "src/lib.rs", "line": line},
+    })
 }
 
 fn empty_ask_user_action() -> Value {
@@ -833,5 +890,156 @@ async fn two_identical_tool_errors_separated_by_a_success_do_not_park() {
             "step {i}: must not log non_progress_cap when the identical-error streak never \
              reaches the cap"
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Unit 25: `error_shape` -- the repeated-tool-error guard keys on the SHAPE
+// of the reason, not its exact text, so a model that re-issues the same
+// KIND of failing edit with a different line number is still recognized as
+// repeating itself.
+// ---------------------------------------------------------------------
+
+/// Three consecutive `edit_file` errors with the SAME SHAPE ("line # of
+/// <path> already has `…`") but DIFFERENT line numbers (1, 2, 3) park at the
+/// third, proving `error_shape` -- not the exact reason text -- is what the
+/// repeated-tool-error guard's identity is keyed on. Before unit 25 this did
+/// NOT park (each error's exact reason string differed, so `(tool, reason)`
+/// never matched twice in a row): this test proves the "today they do not"
+/// half explicitly by asserting `HarnessState.last_tool_error.count` goes
+/// 1, 2, 3 across the three steps, not 1, 1, 1.
+#[tokio::test]
+async fn three_edit_file_errors_with_the_same_shape_but_different_line_numbers_park_at_the_third() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+    let shell_calls = Arc::new(AtomicU64::new(0));
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), edit_action_with_line(1)),
+        step_output(serde_json::json!({}), edit_action_with_line(2)),
+        step_output(serde_json::json!({}), edit_action_with_line(3)),
+    ]);
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        shape_varying_tool_set(Arc::clone(&shell_calls)),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+
+    let skill = Arc::new(NonProgressSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let mut outcomes = Vec::new();
+    let mut counts = Vec::new();
+    let mut shapes = Vec::new();
+    let mut reasons = Vec::new();
+    let mut cap_shapes: Vec<Option<String>> = Vec::new();
+    for _ in 0..3 {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        cap_shapes.push(non_progress_cap_shapes(&rec));
+        let outcome = SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+        outcomes.push(outcome);
+
+        let (state, _v) = active.session().state().await.unwrap();
+        let err = state
+            .harness
+            .last_tool_error
+            .clone()
+            .expect("each edit_file error must set last_tool_error");
+        counts.push(err.count);
+        shapes.push(err.shape);
+        reasons.push(err.reason);
+    }
+
+    // The count goes 1, 2, 3 -- proving the three DIFFERENT-line-number
+    // errors are recognized as ONE streak (today, before unit 25, three
+    // differently-worded reasons would never match `(tool, reason)` twice
+    // in a row, so this would read 1, 1, 1 and never park).
+    assert_eq!(
+        counts,
+        vec![1, 2, 3],
+        "the repeated-tool-error guard must advance the SAME streak across all three \
+         different-line-number errors, not start a fresh streak each time"
+    );
+
+    // The reason text itself is NOT identical across the three steps (each
+    // names its own line number) -- proving the streak survived DESPITE the
+    // exact text differing, because the SHAPE stayed the same.
+    assert_eq!(
+        reasons[0],
+        "tool execution failed: line 1 of src/lib.rs already has `pub fn new(...)`; \
+                     your insert would duplicate it. Use old/new to replace the existing code \
+                     instead."
+    );
+    assert_eq!(
+        reasons[2],
+        "tool execution failed: line 3 of src/lib.rs already has `pub fn new(...)`; \
+                     your insert would duplicate it. Use old/new to replace the existing code \
+                     instead."
+    );
+    assert_ne!(
+        reasons[0], reasons[2],
+        "the three errors' exact reason text must differ (different line numbers) even though \
+         they are the SAME shape"
+    );
+
+    // All three shapes are identical -- the SAME shape recorded every time.
+    // Note `error_shape` treats `old/new` (from the tool's own message text)
+    // as path-like too (it contains `/`, the same rule that normalizes a
+    // real file path), which is why `<path>` appears twice below -- and the
+    // 120-character cut lands mid-word ("exist..."), matching `error_shape`'s
+    // own doc'd behaviour exactly.
+    assert_eq!(shapes[0], shapes[1]);
+    assert_eq!(shapes[1], shapes[2]);
+    assert_eq!(
+        shapes[0],
+        "tool execution failed: line # of <path> already has `…`; your insert would duplicate \
+         it. Use <path> to replace the exist",
+        "the recorded shape must be error_shape's own normalized form, cut to 120 characters"
+    );
+    assert_eq!(shapes[0].chars().count(), 120);
+
+    // Steps 0 and 1: ordinary `Continue` outcomes (the cap has not been
+    // reached yet).
+    assert!(
+        matches!(outcomes[0], Outcome::Continue),
+        "step 0: got {:?}",
+        outcomes[0]
+    );
+    assert!(
+        matches!(outcomes[1], Outcome::Continue),
+        "step 1: got {:?}",
+        outcomes[1]
+    );
+    assert!(
+        cap_shapes[0].is_none(),
+        "step 0 must not log non_progress_cap"
+    );
+    assert!(
+        cap_shapes[1].is_none(),
+        "step 1 must not log non_progress_cap"
+    );
+
+    // Step 2 (the third same-shape error): parks, with a non_progress_cap
+    // log entry naming the tool.
+    let shape = cap_shapes[2]
+        .as_ref()
+        .expect("step 2 should log a non_progress_cap System entry with a shapes string");
+    assert_eq!(shape, "repeated tool error: edit_file");
+    match &outcomes[2] {
+        Outcome::Parked(Park::AskUser(msg)) => {
+            assert!(
+                msg.contains("3 steps in a row without progress"),
+                "park message should say 3 steps in a row without progress: {msg}"
+            );
+            assert!(
+                msg.contains("repeated tool error: edit_file"),
+                "park message should contain the shape: {msg}"
+            );
+        }
+        other => panic!("step 2: expected Parked(AskUser(_)), got {other:?}"),
     }
 }

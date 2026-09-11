@@ -1211,42 +1211,49 @@ pub const REPEATED_ERROR_QUESTION: &str = "Your last `{tool}` call failed with: 
      different exact next action: for an edit, the path, the old text as it appears in the \
      file, and the new text; otherwise the file or range to read and why.";
 
-/// `implement`-only (unit 23 part (b)): the second time in a row the model
-/// repeats the SAME tool call that just failed -- identity is `(tool name,
-/// args)`, matched against `HarnessState::last_tool_error`
-/// (`core/src/version.rs`), which core's own repeated-tool-error guard
-/// (`core/src/session.rs`) already tracks by `(tool name, reason string)` --
-/// this substitutes a `think` call instead of letting the model repeat the
-/// identical failing call again. Mirrors [`implement_repeated_skip_thinks`]'s
-/// once-per-streak shape and wiring (run right after it in `ImplementSkill::
-/// validate`), but keyed off `HarnessState::last_tool_error` instead of
-/// `HarnessState::last_skip`.
+/// `implement`-only (unit 23 part (b), reshaped by unit 25, corrected after
+/// review): substitutes a `think` call in place of a tool call that is
+/// either the EXACT SAME failing call repeating, or the same KIND of call
+/// recurring after it has already failed with the same error shape twice.
+/// A corrected call -- same tool, different args, the FIRST occurrence of
+/// its error shape -- is left alone to run: the harness told the model to
+/// re-read and fix the call, so the corrected retry must actually execute,
+/// not be diverted to `think`. Mirrors [`implement_repeated_skip_thinks`]'s
+/// once-per-streak shape and wiring (run right after it in
+/// `ImplementSkill::validate`), but keyed off `HarnessState::last_tool_error`
+/// instead of `HarnessState::last_skip`.
 ///
 /// Fires when all of these hold:
 /// - `out.action()` is `Action::Tool { name, args }`.
 /// - `cur.harness.last_tool_error` (`core/src/version.rs`) is `Some(err)`
-///   with `err.count >= 1`, `err.tool == name`, and `err.args == args` --
-///   this call's own arguments equal exactly the failing call's, so a call
-///   to a DIFFERENT tool, or the SAME tool with DIFFERENT arguments, is left
-///   alone (it cannot be the same call recurring).
+///   with `err.tool == name` -- a call to a DIFFERENT tool is left alone (it
+///   cannot be the same kind of call recurring).
+/// - EITHER `err.args == args` (the identical call repeating, item 23's
+///   original rule) OR `err.count >= 2` (this error SHAPE has already
+///   repeated once -- the model has had a chance to correct and has not, so
+///   even a differently-shaped retry of the same kind of call is diverted).
+///   A call with different args whose shape has failed only ONCE so far
+///   (`err.count < 2`) is left alone to run: that is the corrected retry the
+///   `REPEATED_ERROR_QUESTION`/prior error message asked for.
 /// - No `think` has run since that error: `cur.harness.last_think_step` is
 ///   `None`, or `Some(t)` with `t < err.step` -- the same `last_think_step`
 ///   rule [`implement_repeated_skip_thinks`] uses.
 ///
 /// A first error is left alone (core's own repeated-tool-error guard already
 /// prefixes the observation the second time -- see that guard's doc,
-/// `core/src/session.rs`); a DIFFERENT call after an error, or the SAME call
-/// once a `think` has already run since it, is also left alone. The core cap
-/// (`CONTINUE_REPEAT_CAP`, "the core cap... parks" -- the THIRD identical
-/// error) is unchanged: this only ever intercepts the SECOND.
+/// `core/src/session.rs`); a call to a DIFFERENT tool after an error, a
+/// corrected call (different args, shape failed only once), or the SAME
+/// tool once a `think` has already run since it, is also left alone.
 ///
 /// Effect: same substitution mechanism as [`implement_repeated_skip_thinks`]
 /// (`substitute_think`), replacing the action with `Action::Tool { name:
 /// "think", args: {"question": q} }` where `q` is [`REPEATED_ERROR_QUESTION`]
-/// with `{tool}`/`{reason}` filled from `err.tool`/`err.reason` (cut to 300
-/// characters via `cap_reason`). The model's action was already a tool call,
-/// so there is no `next_skill` to strip (`strip_next_skill_if_ask_user:
-/// false`), the same as the skip trigger.
+/// with `{tool}`/`{reason}` filled from `err.tool`/`err.reason` -- the FULL
+/// text of the latest error (cut to 300 characters via `cap_reason`), not
+/// its shape, so the model still sees the exact failing message. The
+/// model's action was already a tool call, so there is no `next_skill` to
+/// strip (`strip_next_skill_if_ask_user: false`), the same as the skip
+/// trigger.
 /// Cuts `text` to at most 300 characters (unit 23 part (b)'s brief: "reason
 /// cut to 300 characters"), with no truncation marker appended -- unlike
 /// [`truncate_decision_answer`], which is capping a `think` ANSWER for
@@ -1271,7 +1278,14 @@ fn implement_repeated_error_thinks(
     };
 
     let err = cur.harness.last_tool_error.as_ref()?;
-    if err.count < 1 || err.tool != *name || err.args != *args {
+    if err.tool != *name {
+        return None;
+    }
+    // The identical call recurring (item 23) always fires; otherwise the
+    // same error SHAPE must have already repeated once (`count >= 2`) --
+    // a corrected call (different args, first occurrence of this shape)
+    // is left alone to run so the model's fix actually takes effect.
+    if *args != err.args && err.count < 2 {
         return None;
     }
     if let Some(think_step) = cur.harness.last_think_step
@@ -1289,6 +1303,101 @@ fn implement_repeated_error_thinks(
          harness asked the reasoning subagent instead (its conclusion is below, and in \
          `decision`). Act on it.",
         err.tool
+    );
+
+    Some(substitute_think(out, &question, note, false))
+}
+
+/// The question the harness asks `think` on the model's behalf when
+/// [`implement_stall_thinks`] fires (unit 25 part 3): the model has been
+/// going back and forth on ONE path, alternating a refused re-read and a
+/// failed edit (`HarnessState::last_stall`, `core/src/version.rs`), for two
+/// or more consecutive stall events. `{path}` is filled from the stall's own
+/// `path`.
+pub const STALLED_PATH_QUESTION: &str = "You have been going back and forth on {path}: reading \
+     it again and editing it have both failed. Using the working set above, state the one exact \
+     edit (old text as it appears, new text) that moves the plan forward, or say which other \
+     file the change belongs in.";
+
+/// `implement`-only (unit 25 part 3): the second (and every later) stall
+/// event on the SAME path -- `HarnessState::last_stall.count >= 2`, core's
+/// own stalled-path guard (`core/src/session.rs`) having already recorded
+/// that a refused re-read and a failed edit have landed on the same path
+/// with no executed step on it in between -- substitutes a `think` call
+/// instead of letting the model keep alternating skip/error on that path.
+/// Mirrors [`implement_repeated_skip_thinks`]/[`implement_repeated_error_
+/// thinks`]'s once-per-streak shape and wiring (run right after the error
+/// trigger in `ImplementSkill::validate`), but keyed off `HarnessState::
+/// last_stall` instead of `last_skip`/`last_tool_error`.
+///
+/// Fires when all of these hold:
+/// - `cur.harness.last_stall` (`core/src/version.rs`) is `Some(stall)` with
+///   `stall.count >= 2`.
+/// - `out.action()` is STILL `Action::Tool { name, args }` for a tool in
+///   `EDIT_TOOL_NAMES`/`READ_TOOL_NAMES` (this module's own copies of
+///   `core/src/session.rs`'s `EDIT_TOOLS`/read-tool set) naming `stall.path`
+///   in `args.path` -- i.e. nothing upstream in this same `validate` call
+///   (`implement_repeated_skip_thinks`/`implement_repeated_error_thinks`,
+///   which run right before this) has ALREADY substituted this step's
+///   action for `think`. Both of those triggers can satisfy their own
+///   condition on the very same step a stall reaches `count >= 2` (a second
+///   identical-shape edit error on a path is simultaneously the SECOND
+///   stall event on that path), and having already run first in `validate`'s
+///   order, they leave `out.action()` as `Action::Tool { name: "think", .. }`
+///   -- which names neither tool set, so this check alone is enough to skip
+///   a redundant second substitution on the same step without needing to
+///   know which (if either) of the other two triggers fired.
+/// - No `think` has run since that stall event: `cur.harness.last_think_step`
+///   is `None`, or `Some(t)` with `t < stall.step` -- the same
+///   `last_think_step` rule the other two triggers use (D19: "a `think`
+///   step keeps the stall count", so this gate suppresses a SECOND
+///   substitution for the same stall event, not the streak as a whole).
+///
+/// Effect: same substitution mechanism as the other two triggers
+/// (`substitute_think`), replacing the action with `Action::Tool { name:
+/// "think", args: {"question": q} }` where `q` is [`STALLED_PATH_QUESTION`]
+/// with `{path}` filled from `stall.path`. The model's action was already a
+/// tool call, so there is no `next_skill` to strip
+/// (`strip_next_skill_if_ask_user: false`), the same as the other two
+/// triggers.
+fn implement_stall_thinks(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    const STALL_TOOLS: &[&str] = &[
+        "read_file",
+        "search",
+        "list_files",
+        "edit_file",
+        "write_file",
+        "revert_file",
+    ];
+
+    let stall = cur.harness.last_stall.as_ref()?;
+    if stall.count < 2 {
+        return None;
+    }
+    let statie_core::Action::Tool { name, args } = out.action() else {
+        return None;
+    };
+    if !STALL_TOOLS.contains(&name.as_str()) {
+        return None;
+    }
+    if args.get("path").and_then(serde_json::Value::as_str) != Some(stall.path.as_str()) {
+        return None;
+    }
+    if let Some(think_step) = cur.harness.last_think_step
+        && think_step >= stall.step
+    {
+        return None;
+    }
+
+    let path = &stall.path;
+    let question = STALLED_PATH_QUESTION.replace("{path}", path);
+    let note = format!(
+        "you have been going back and forth on {path} (a re-read refused, an edit failed, or \
+         both), so the harness asked the reasoning subagent instead (its conclusion is below, \
+         and in `decision`). Act on it."
     );
 
     Some(substitute_think(out, &question, note, false))
@@ -4331,15 +4440,25 @@ impl Skill for ImplementSkill {
         // ask_user), so ordering between them never matters in practice, but
         // this runs first to match the brief's stated order.
         let repeated_skip_think_note = implement_repeated_skip_thinks(cur, &mut out);
-        // Unit 23 part (b): the second time in a row the model repeats the
-        // SAME tool call that just failed (`HarnessState::last_tool_error`),
-        // substituted for `think` right after the repeated-skip trigger
-        // above, mirroring its wiring -- the two never target the same
-        // committed action twice (a tool call that just failed and a
-        // read-only call that was just skipped are mutually exclusive
-        // outcomes of the SAME step), so ordering between them only matters
-        // in the sense the brief states it in.
+        // Unit 23 part (b), reshaped by unit 25: the second time in a row
+        // the model repeats the SAME KIND (tool + error shape) of tool call
+        // that just failed (`HarnessState::last_tool_error`), substituted
+        // for `think` right after the repeated-skip trigger above,
+        // mirroring its wiring -- the two never target the same committed
+        // action twice (a tool call that just failed and a read-only call
+        // that was just skipped are mutually exclusive outcomes of the SAME
+        // step), so ordering between them only matters in the sense the
+        // brief states it in.
         let repeated_error_think_note = implement_repeated_error_thinks(cur, &mut out);
+        // Unit 25 part 3: a stalled path (a refused re-read and a failed
+        // edit on the SAME path, in either order, `HarnessState::
+        // last_stall`) is substituted for `think` right after the
+        // repeated-error trigger above -- run last of the three `think`
+        // substitutions since it is the broadest (it can fire on either a
+        // read-only OR an edit-tool action), and `substitute_think` is
+        // idempotent-safe to call at most once per step, matching the other
+        // two triggers here.
+        let stall_think_note = implement_stall_thinks(cur, &mut out);
         let repeat_think_note = implement_repeat_failure_thinks(cur, &mut out);
         // Only reachable when `implement_repeat_failure_thinks` did not
         // already fire: that function replaces a matching `ask_user` action
@@ -4379,6 +4498,7 @@ impl Skill for ImplementSkill {
             .chain(try_fixes_gate_note)
             .chain(repeated_skip_think_note)
             .chain(repeated_error_think_note)
+            .chain(stall_think_note)
             .chain(repeat_think_note)
             .chain(early_park_think_note)
             .chain(not_ours_note)

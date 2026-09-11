@@ -260,6 +260,30 @@ pub struct HarnessState {
     /// deserializes.
     #[serde(default)]
     pub last_tool_error: Option<RepeatedToolError>,
+    /// Unit 25 part 3: one "stalled on P" streak spanning BOTH a refused
+    /// `skipped_redundant` read of a path and a failed `tool_error` from an
+    /// edit tool (`edit_file`/`write_file`/`revert_file`) on the SAME path,
+    /// in either order -- a model that alternates re-reading a file and
+    /// failing to edit it is going back and forth on that one path, even
+    /// though neither `last_skip`'s nor `last_tool_error`'s own streak
+    /// (each keyed on an identical call/shape recurring) ever sees the same
+    /// shape twice in a row. Written by core (`Active::step`, right
+    /// alongside the `last_skip`/`last_tool_error` updates) whenever a skip
+    /// or an edit-tool error lands on a path: `Some(Stall { path, count,
+    /// step })` with `count` incremented from the previous stall when it
+    /// named the SAME path and no executed (non-error, non-skip, non-think)
+    /// step has happened since; started fresh at `count: 1` otherwise.
+    /// Cleared back to `None` by an executed step on a DIFFERENT path (or
+    /// one that names no path), but NOT by a `think` step (the same
+    /// exemption `last_skip`/`last_tool_error` get) and NOT by a skip or
+    /// edit-tool error on the SAME path (that advances the streak instead).
+    /// `#[serde(default)]` so state persisted before this field existed
+    /// still deserializes. Read by the coding skills' `implement_stall_
+    /// thinks` (`skills/src/coding/mod.rs`) to substitute a `think` call at
+    /// `count >= 2` (`STALLED_PATH_QUESTION`), and by core's own
+    /// `park_non_progress_cap` path to park at `count >= 6`.
+    #[serde(default)]
+    pub last_stall: Option<Stall>,
 }
 
 /// One skipped-redundant read, recorded on `HarnessState::last_skip`. See
@@ -279,7 +303,7 @@ pub struct SkippedRead {
     pub step: u64,
 }
 
-/// One repeated identical `tool_error`, recorded on `HarnessState::
+/// One repeated identical-SHAPE `tool_error`, recorded on `HarnessState::
 /// last_tool_error`. See that field's doc for when it is set/cleared.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RepeatedToolError {
@@ -289,14 +313,37 @@ pub struct RepeatedToolError {
     /// carried them -- compared against a later `Action::Tool { name, args
     /// }` to tell whether it is the SAME call recurring.
     pub args: serde_json::Value,
-    /// The error's reason string, as reported on the `tool_error` System
-    /// entry's own payload.
+    /// The FULL error reason string of the LATEST (most recent) error in
+    /// this streak, as reported on the `tool_error` System entry's own
+    /// payload -- unit 25: this is the exact text, not the shape, since the
+    /// substituted `think` question (`REPEATED_ERROR_QUESTION`,
+    /// `skills/src/coding/mod.rs`) quotes it verbatim.
     pub reason: String,
-    /// Consecutive count of this same identical `(tool, reason)` error,
-    /// mirroring `Session::tool_error_repeat_count` at the step that set
-    /// this value -- always `>= 1`.
+    /// Unit 25: `error_shape(reason)` -- the SHAPE the streak identity and
+    /// comparison actually key on (`core/src/session.rs`'s `error_shape`),
+    /// so two errors of the same kind but naming a different line number or
+    /// file still count as the SAME streak. Read by the coding skills'
+    /// `implement_repeated_error_thinks` (`skills/src/coding/mod.rs`) to
+    /// match on shape rather than identical args.
+    pub shape: String,
+    /// Consecutive count of this same identical-shape `(tool, shape)`
+    /// error, mirroring `Session::tool_error_repeat_count` at the step that
+    /// set this value -- always `>= 1`.
     pub count: u32,
     /// The harness step at which this error was recorded.
+    pub step: u64,
+}
+
+/// One "stalled on P" streak, recorded on `HarnessState::last_stall`. See
+/// that field's doc for when it is set/incremented/cleared.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Stall {
+    /// The path the model is going back and forth on.
+    pub path: String,
+    /// Consecutive count of skip-or-edit-error events on this path with no
+    /// executed step on it in between -- always `>= 1`.
+    pub count: u32,
+    /// The harness step at which this stall was last recorded.
     pub step: u64,
 }
 

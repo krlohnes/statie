@@ -58,6 +58,14 @@ const READ_ONLY_TOOLS: &[&str] = &[
 /// everything for a single, simple rule.
 const MUTATING_TOOLS: &[&str] = &["write_file", "edit_file", "revert_file", "shell", "test"];
 
+/// Unit 25 part 3: the edit tools whose `tool_error` counts toward the
+/// stalled-path streak (`HarnessState::last_stall`) alongside a refused
+/// re-read of the same path -- a subset of `MUTATING_TOOLS` that excludes
+/// `shell`/`test` (neither names a single `path` the way an edit call does,
+/// so an error from either can't be attributed to "the path" the way this
+/// guard needs).
+const EDIT_TOOLS: &[&str] = &["edit_file", "write_file", "revert_file"];
+
 /// From `4`, a consecutive-read note fires on every further read of that
 /// path until an edit resets it.
 const READ_GUARD_THRESHOLD: u32 = 4;
@@ -215,6 +223,188 @@ fn normalize_command(cmd: &str) -> String {
 /// tool call to match it against `HarnessState::last_skip`'s recorded key.
 pub fn read_call_key(name: &str, args: &Value) -> String {
     format!("{name} {args}")
+}
+
+/// A whitespace-delimited token's path-like-ness for [`error_shape`]: `true`
+/// when it contains `/` or ends in one of a fixed set of source/doc
+/// extensions (`.rs`, `.py`, `.toml`, `.txt`, `.md`). A trailing punctuation
+/// character right after the extension (`.`, `,`, `;`, `:`, `)`, `"`, `'`)
+/// is allowed and kept outside the replacement, so `"src/lib.rs."` and
+/// `"src/lib.rs,"` still normalize their path portion and keep the
+/// punctuation, matching how such tokens actually appear in a sentence.
+fn path_like_token(token: &str) -> Option<usize> {
+    const PATH_EXTENSIONS: &[&str] = &[".rs", ".py", ".toml", ".txt", ".md"];
+    let trimmed_end = token.trim_end_matches(['.', ',', ';', ':', ')', '"', '\'']);
+    if trimmed_end.is_empty() {
+        return None;
+    }
+    let is_path =
+        trimmed_end.contains('/') || PATH_EXTENSIONS.iter().any(|ext| trimmed_end.ends_with(ext));
+    if is_path {
+        Some(trimmed_end.len())
+    } else {
+        None
+    }
+}
+
+/// Unit 25: the reason string's SHAPE, ignoring the specific numbers and
+/// paths it names, so two errors of the same kind (e.g. "old text not found
+/// in <path>") key together regardless of which line number or which file
+/// they happened to name. Used by the identical-tool-error streak
+/// (`Session::last_tool_error_key`/`tool_error_repeat_count`,
+/// `HarnessState::last_tool_error`) and the stalled-path streak
+/// (`HarnessState::last_stall`) so a model that re-issues the same KIND of
+/// failing edit with a different line number is still recognized as
+/// repeating itself, instead of looking like a fresh error every time.
+///
+/// Transform, in order:
+/// 1. Every whitespace-delimited token that is path-like (contains `/`, or
+///    ends in `.rs`/`.py`/`.toml`/`.txt`/`.md`, ignoring a trailing
+///    punctuation character) is replaced by `<path>` (punctuation kept).
+/// 2. Every run of ASCII digits remaining is replaced by a single `#`.
+/// 3. Every backtick-quoted span (from one `` ` `` to the next) is replaced
+///    by `` `…` `` -- this runs last so a path or number quoted inside
+///    backticks (e.g. `` `pub fn new(...)` ``) never leaks digits or path
+///    text into the shape, since the whole span collapses regardless of
+///    what it contains.
+/// 4. Whitespace is collapsed (runs of whitespace become one space, and the
+///    result is trimmed).
+/// 5. The result is cut to 120 characters.
+pub fn error_shape(reason: &str) -> String {
+    // Step 1: path-like tokens -> `<path>`, token by token, preserving
+    // everything else (including inter-token whitespace) unchanged so step
+    // 4's whitespace collapse still sees the original spacing.
+    let mut after_paths = String::with_capacity(reason.len());
+    for token in split_keep_whitespace(reason) {
+        if token.chars().next().is_some_and(char::is_whitespace) {
+            after_paths.push_str(token);
+            continue;
+        }
+        if let Some(end) = path_like_token(token) {
+            after_paths.push_str("<path>");
+            after_paths.push_str(&token[end..]);
+        } else {
+            after_paths.push_str(token);
+        }
+    }
+
+    // Step 2: runs of ASCII digits -> `#`.
+    let mut after_digits = String::with_capacity(after_paths.len());
+    let mut chars = after_paths.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                chars.next();
+            }
+            after_digits.push('#');
+        } else {
+            after_digits.push(c);
+        }
+    }
+
+    // Step 3: backtick-quoted spans -> `` `…` ``.
+    let mut after_backticks = String::with_capacity(after_digits.len());
+    let mut in_span = false;
+    for c in after_digits.chars() {
+        if c == '`' {
+            if in_span {
+                after_backticks.push('…');
+                after_backticks.push('`');
+                in_span = false;
+            } else {
+                after_backticks.push('`');
+                in_span = true;
+            }
+        } else if !in_span {
+            after_backticks.push(c);
+        }
+        // Characters inside a span are dropped -- the `…` placeholder
+        // already pushed when the span opened stands in for all of them.
+    }
+
+    // Step 4: collapse whitespace.
+    let collapsed = after_backticks
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Step 5: cut to 120 characters.
+    if collapsed.chars().count() <= 120 {
+        collapsed
+    } else {
+        collapsed.chars().take(120).collect()
+    }
+}
+
+/// Splits `s` into alternating non-whitespace/whitespace runs, in order,
+/// covering the whole string -- used by [`error_shape`] to walk tokens while
+/// keeping the original whitespace between them intact for step 4's later
+/// collapse.
+fn split_keep_whitespace(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    if s.is_empty() {
+        return parts;
+    }
+    let mut start = 0;
+    let mut cur_is_ws = s.chars().next().is_some_and(char::is_whitespace);
+    for (idx, c) in s.char_indices() {
+        let is_ws = c.is_whitespace();
+        if is_ws != cur_is_ws && idx != start {
+            parts.push(&s[start..idx]);
+            start = idx;
+            cur_is_ws = is_ws;
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+#[cfg(test)]
+mod error_shape_tests {
+    use super::error_shape;
+
+    #[test]
+    fn line_numbers_and_paths_collapse_to_the_same_shape() {
+        let a = "line 42 of src/lib.rs already has `pub fn new(...)`";
+        let b = "line 53 of src/lib.rs already has `pub fn count(...)`";
+        assert_eq!(
+            error_shape(a),
+            error_shape(b),
+            "different line numbers and different backtick-quoted spans must still be the SAME \
+             shape: {:?} vs {:?}",
+            error_shape(a),
+            error_shape(b)
+        );
+        assert_eq!(error_shape(a), "line # of <path> already has `…`");
+    }
+
+    #[test]
+    fn different_kinds_of_error_are_different_shapes() {
+        let a = "old text not found in src/config.rs";
+        let b = "anchor line occurs 2 times in src/main_logic.rs";
+        assert_ne!(
+            error_shape(a),
+            error_shape(b),
+            "a missing-old-text error and an ambiguous-anchor error must be DIFFERENT shapes: \
+             {:?} vs {:?}",
+            error_shape(a),
+            error_shape(b)
+        );
+        assert_eq!(error_shape(a), "old text not found in <path>");
+        assert_eq!(error_shape(b), "anchor line occurs # times in <path>");
+    }
+
+    #[test]
+    fn whitespace_is_collapsed() {
+        assert_eq!(error_shape("a   b\t\tc\n\nd"), "a b c d");
+    }
+
+    #[test]
+    fn long_reason_is_cut_to_120_characters() {
+        let long = "x".repeat(500);
+        let shape = error_shape(&long);
+        assert_eq!(shape.chars().count(), 120);
+    }
 }
 
 /// True when `action` is a `think` call (`Action::Tool { name: "think", .. }`)
@@ -751,21 +941,21 @@ pub struct Session<W> {
     /// continuing (`Active::execute`'s skip handling), the same as
     /// `continue_repeat_count` does for `Continue`.
     skip_repeat_count: u32,
-    /// Repeated-tool-error guard: the `(tool name, reason string)` (the
-    /// same pair a `tool_error` System entry's payload carries, see the
-    /// generic tool-execution error path in `execute`) of the most recent
-    /// `tool_error` step, kept so the next tool error can tell whether it
-    /// is the SAME error recurring. `None` initially, on activation, and
-    /// after any step that is not itself an identical tool error AND is not
-    /// a `think` step (`is_think_action`, unit 23's correction) -- i.e. a
-    /// successful non-`think` tool call, a different tool error, a
-    /// rejection, or any other outcome breaks the streak, the same as
-    /// `last_skip_key` does for a skip, but a `think` step (model-chosen or
-    /// substituted by `implement_repeated_error_thinks`) leaves the streak
-    /// exactly as it was: without this exemption the model could alternate
+    /// Repeated-tool-error guard: the `(tool name, error_shape(reason))`
+    /// (unit 25: the SHAPE of the reason, not its exact text -- see
+    /// `error_shape`) of the most recent `tool_error` step, kept so the
+    /// next tool error can tell whether it is the SAME KIND of error
+    /// recurring. `None` initially, on activation, and after any step that
+    /// is not itself an identical-shape tool error AND is not a `think`
+    /// step (`is_think_action`, unit 23's correction) -- i.e. a successful
+    /// non-`think` tool call, a different-shape tool error, a rejection, or
+    /// any other outcome breaks the streak, the same as `last_skip_key`
+    /// does for a skip, but a `think` step (model-chosen or substituted by
+    /// `implement_repeated_error_thinks`) leaves the streak exactly as it
+    /// was: without this exemption the model could alternate
     /// error/think/error/think forever (the substituted think would itself
     /// clear the streak, making every repeat look like a fresh occurrence)
-    /// and never reach `CONTINUE_REPEAT_CAP`. A repeated identical tool
+    /// and never reach `CONTINUE_REPEAT_CAP`. A repeated identical-SHAPE tool
     /// error is the same kind of non-progress as a repeated skip or
     /// `Continue` note: the model keeps retrying a call whose result cannot
     /// change without a different action.
@@ -796,6 +986,21 @@ pub struct Session<W> {
     /// and the `non_progress_cap` log entry when the cap fires. Cleared
     /// alongside `non_progress_count`.
     non_progress_shapes: Vec<String>,
+    /// Unit 25 part 3: the path of the current "stalled on P" streak (see
+    /// `HarnessState::last_stall`), mirrored in-memory the same way
+    /// `last_skip_key`/`last_tool_error_key` mirror their own harness
+    /// fields. `None` initially, on activation, and after any executed
+    /// (non-error, non-skip, non-think) step -- i.e. a successful tool call
+    /// on ANY path breaks the streak, not just one on a different path: the
+    /// spec's "no executed ... step has happened since" is unconditional,
+    /// not scoped to the stalled path itself.
+    last_stall_path: Option<String>,
+    /// Consecutive count of skip-or-edit-error events on `last_stall_path`
+    /// with no executed step since (including the one that set it, so this
+    /// is always >= 1 whenever `last_stall_path` is `Some`). Reset to 0
+    /// alongside `last_stall_path`. At `count >= 6`, `Active::step` parks
+    /// through `park_non_progress_cap` with shape "stalled on {path}".
+    stall_count: u32,
 }
 
 impl<W> Session<W> {
@@ -856,6 +1061,8 @@ impl<W> Session<W> {
             tool_error_repeat_count: 0,
             non_progress_count: 0,
             non_progress_shapes: Vec::new(),
+            last_stall_path: None,
+            stall_count: 0,
         }
     }
 
@@ -1016,6 +1223,7 @@ impl<W> Session<W> {
                         last_failure_summary: None,
                         last_skip: None,
                         last_tool_error: None,
+                        last_stall: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -1048,6 +1256,10 @@ impl<W> Session<W> {
                 // starts the repeated-tool-error guard fresh, the same
                 // treatment `last_skip` gets just above.
                 harness.last_tool_error = None;
+                // Mirrors `last_stall_path`/`stall_count`'s own reset just
+                // below (unit 25 part 3): a new activation starts the
+                // stalled-path guard fresh too.
+                harness.last_stall = None;
                 // Deliberately NOT reset here: `last_failure_summary` is a
                 // fact about the sandbox (the most recent `test` call's
                 // result), not about this activation, so it survives
@@ -1080,6 +1292,8 @@ impl<W> Session<W> {
         self.tool_error_repeat_count = 0;
         self.non_progress_count = 0;
         self.non_progress_shapes.clear();
+        self.last_stall_path = None;
+        self.stall_count = 0;
 
         let entry = LogEntry {
             step: self.log.last_step(),
@@ -2459,19 +2673,29 @@ where
         // failing-test tool errors -- any `tool_error` System entry this
         // step produced) is the same kind of non-progress as a repeated skip
         // or `Continue` note: the model keeps retrying a call whose result
-        // cannot change without a different action. Identity is `(tool
-        // name, reason string)`, read back from the `tool_error` entry's own
-        // payload (not from `action_for_maintainer`'s args, which for a
-        // rejected-arguments error may differ call to call while the error
-        // itself repeats, e.g. `think` with a slightly different empty
-        // question each time still reports the same reason). Any other
-        // committed step (a successful tool call, a DIFFERENT tool error, a
-        // skip, or a `Continue` conversion) resets the streak, the same as
-        // a different skip would for `last_skip_key`.
+        // cannot change without a different action. Unit 25: identity is
+        // `(tool name, error_shape(reason))` -- the SHAPE of the reason, not
+        // its exact text (`error_shape`, this module) -- read back from the
+        // `tool_error` entry's own payload (not from `action_for_maintainer`'s
+        // args, which for a rejected-arguments error may differ call to call
+        // while the error itself repeats, e.g. `think` with a slightly
+        // different empty question each time still reports the same
+        // reason). Keying on shape rather than the exact reason means a
+        // model that re-issues the same KIND of failing edit with a
+        // different line number (or a different quoted snippet) is still
+        // recognized as repeating itself. Any other committed step (a
+        // successful tool call, a DIFFERENT-shape tool error, a skip, or a
+        // `Continue` conversion) resets the streak, the same as a different
+        // skip would for `last_skip_key`.
         let tool_error_entry = entries.iter().find(|e| {
             e.kind == LogKind::System
                 && e.payload.get("event").and_then(Value::as_str) == Some("tool_error")
         });
+        // Captured as a plain `bool` (rather than reusing `tool_error_entry`
+        // itself) for the stalled-path guard below, since that guard's own
+        // `park_non_progress_cap` call needs `&mut entries` and
+        // `tool_error_entry` borrows `entries` immutably for its lifetime.
+        let had_tool_error = tool_error_entry.is_some();
         if let Some(e) = tool_error_entry {
             let tool = e
                 .payload
@@ -2485,7 +2709,8 @@ where
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let key = (tool.clone(), reason);
+            let shape = error_shape(&reason);
+            let key = (tool.clone(), shape.clone());
             if self.session.last_tool_error_key.as_ref() == Some(&key) {
                 self.session.tool_error_repeat_count += 1;
             } else {
@@ -2495,18 +2720,21 @@ where
 
             // `HarnessState::last_tool_error`: harness-owned mirror of the
             // `last_tool_error_key`/`tool_error_repeat_count` pair just
-            // updated above (unit 23 part (b)), committed via `set_harness`
-            // the same out-of-band way `HarnessState::last_skip` is just
-            // above, so a skill's `validate` can see it
-            // (`implement_repeated_error_thinks`, `skills/src/coding/
-            // mod.rs`). `args` comes from `action_for_maintainer`, not the
-            // `tool_error` entry's own payload (which carries only `name`/
-            // `reason`) -- every `tool_error` entry is pushed from within a
-            // tool-call dispatch path, so `action_for_maintainer` is always
-            // `Action::Tool { name, args }` whenever `tool_error_entry` is
-            // `Some` here. Recorded at this step's count BEFORE the
-            // cap-park reset below (if any), exactly mirroring `last_skip`'s
-            // own timing.
+            // updated above (unit 23 part (b), reshaped by unit 25),
+            // committed via `set_harness` the same out-of-band way
+            // `HarnessState::last_skip` is just above, so a skill's
+            // `validate` can see it (`implement_repeated_error_thinks`,
+            // `skills/src/coding/mod.rs`). `args` comes from
+            // `action_for_maintainer`, not the `tool_error` entry's own
+            // payload (which carries only `name`/`reason`) -- every
+            // `tool_error` entry is pushed from within a tool-call dispatch
+            // path, so `action_for_maintainer` is always `Action::Tool {
+            // name, args }` whenever `tool_error_entry` is `Some` here.
+            // `reason` keeps the FULL text of THIS (the latest) error --
+            // the `think` question quotes it verbatim -- while `shape` is
+            // what the identity/streak comparison above actually uses.
+            // Recorded at this step's count BEFORE the cap-park reset below
+            // (if any), exactly mirroring `last_skip`'s own timing.
             let error_args = match &action_for_maintainer {
                 Action::Tool { args, .. } => args.clone(),
                 _ => Value::Null,
@@ -2516,7 +2744,8 @@ where
             harness_for_error.last_tool_error = Some(crate::version::RepeatedToolError {
                 tool: tool.clone(),
                 args: error_args,
-                reason: key.1.clone(),
+                reason,
+                shape,
                 count: self.session.tool_error_repeat_count,
                 step: next_harness.step,
             });
@@ -2588,6 +2817,105 @@ where
                 let mut harness_for_error = cur_for_error.harness;
                 harness_for_error.last_tool_error = None;
                 self.session.store.set_harness(harness_for_error).await?;
+            }
+        }
+
+        // Stalled-path guard (unit 25 part 3, `HarnessState::last_stall`):
+        // one streak spanning BOTH a refused re-read of a path (the
+        // repeated-skip guard just above, `tool_skipped`) and a failed edit
+        // on the SAME path (this step's own `tool_error_entry`, restricted
+        // to `EDIT_TOOLS`), in either order -- a model that alternates
+        // re-reading a file and failing to edit it is going back and forth
+        // on that one path even though neither guard above ever sees the
+        // SAME shape twice running (a skip then an edit error are different
+        // shapes to each of those guards). This step is a "stall event on
+        // path P" when either: `tool_skipped` is true and the skipped call
+        // named `path`, or `tool_error_entry` is `Some` for a tool in
+        // `EDIT_TOOLS` whose args name `path`. Any OTHER committed step --
+        // including a skip/error with no `path` argument at all -- is
+        // "executed" for this guard's purposes UNLESS it is a `think` step
+        // (`is_think_action`, D19: "a `think` step keeps the stall count"),
+        // which leaves the streak exactly as it was, mirroring the
+        // `last_skip`/`last_tool_error` think exemption.
+        let stall_path = if tool_skipped
+            && let Action::Tool { name, args } = &action_for_maintainer
+            && READ_ONLY_TOOLS.contains(&name.as_str())
+        {
+            args.get("path").and_then(Value::as_str).map(str::to_string)
+        } else {
+            None
+        }
+        .or_else(|| {
+            if !had_tool_error {
+                return None;
+            }
+            match &action_for_maintainer {
+                Action::Tool { name, args } if EDIT_TOOLS.contains(&name.as_str()) => {
+                    args.get("path").and_then(Value::as_str).map(str::to_string)
+                }
+                _ => None,
+            }
+        });
+
+        if let Some(path) = stall_path {
+            let same_path_no_break = self.session.last_stall_path.as_deref() == Some(path.as_str());
+            if same_path_no_break {
+                self.session.stall_count += 1;
+            } else {
+                self.session.last_stall_path = Some(path.clone());
+                self.session.stall_count = 1;
+            }
+
+            let (cur_for_stall, _version) = self.session.state().await?;
+            let mut harness_for_stall = cur_for_stall.harness;
+            harness_for_stall.last_stall = Some(crate::version::Stall {
+                path: path.clone(),
+                count: self.session.stall_count,
+                step: next_harness.step,
+            });
+            self.session.store.set_harness(harness_for_stall).await?;
+
+            // From the second stall event on (`count >= 2`), the guard is
+            // live -- but the actual `think` substitution happens in
+            // `implement`'s `validate` (`implement_stall_thinks`,
+            // `skills/src/coding/mod.rs`), reading `HarnessState::
+            // last_stall` back the same way `implement_repeated_skip_
+            // thinks`/`implement_repeated_error_thinks` read their own
+            // harness-owned fields; core itself does not substitute
+            // anything here, only records the streak and parks at the cap.
+            if self.session.stall_count >= NON_PROGRESS_CAP {
+                // Reset so a resumed session starts this streak fresh,
+                // mirroring the repeated-skip/repeated-tool-error guards'
+                // own cap resets.
+                self.session.last_stall_path = None;
+                self.session.stall_count = 0;
+
+                if !matches!(outcome, Outcome::Parked(_)) {
+                    self.session
+                        .non_progress_shapes
+                        .push(format!("stalled on {path}"));
+                    outcome = self.park_non_progress_cap(
+                        next_harness.step,
+                        &mut entries,
+                        NON_PROGRESS_CAP,
+                    );
+                }
+            }
+        } else if !is_think_action(&action_for_maintainer) {
+            self.session.last_stall_path = None;
+            self.session.stall_count = 0;
+
+            // `HarnessState::last_stall`: cleared the same step
+            // `last_stall_path` is, mirroring `last_skip`/`last_tool_error`'s
+            // own clearing above -- any committed step that is not itself a
+            // stall event breaks the streak, EXCEPT a `think` step
+            // (`is_think_action`, D19). Only touches the store when there is
+            // something to clear.
+            let (cur_for_stall, _version) = self.session.state().await?;
+            if cur_for_stall.harness.last_stall.is_some() {
+                let mut harness_for_stall = cur_for_stall.harness;
+                harness_for_stall.last_stall = None;
+                self.session.store.set_harness(harness_for_stall).await?;
             }
         }
 
@@ -4265,6 +4593,12 @@ where
         // `execute`.
         self.session.last_tool_error_key = None;
         self.session.tool_error_repeat_count = 0;
+
+        // Same reset for the stalled-path guard (see `last_stall_path`): a
+        // rejection is not a skip or an edit error landing on a path
+        // either, and never reaches that handling in `execute`/`step`.
+        self.session.last_stall_path = None;
+        self.session.stall_count = 0;
 
         // Same reset for the mixed-shape non-progress guard
         // (`NON_PROGRESS_CAP`): a rejected step never committed, so it is

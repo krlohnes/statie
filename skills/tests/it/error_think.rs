@@ -663,3 +663,215 @@ async fn error_think_error_think_error_parks_at_the_cap_with_exactly_two_thinks(
     assert_eq!(thinker.calls()[0].question, expected_question(err1_reason));
     assert_eq!(thinker.calls()[1].question, expected_question(err3_reason));
 }
+
+/// Fifth test (review correction): after ONE `edit_file` error, a CORRECTED
+/// `edit_file` call -- same tool, DIFFERENT args (a different old/new text,
+/// targeting the SAME path) -- must be left alone to RUN, not substituted
+/// for `think`. `err.args != args` and `err.count` is only 1 (the shape has
+/// not yet repeated), so `implement_repeated_error_thinks`'s corrected rule
+/// leaves it alone: the harness's own error message told the model to
+/// re-read and fix the call, so the fixed retry must actually execute. The
+/// corrected call here still fails (a second, DIFFERENT old-text-not-found
+/// error), proving the commit is a real `tool_error` for THIS step, not a
+/// think and not a silent no-op.
+#[tokio::test]
+async fn a_corrected_call_after_one_error_runs_instead_of_thinking() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("a.txt"),
+        "line one\nline two\nline three\n",
+    )
+    .unwrap();
+
+    let turns = vec![
+        // Step 1: `edit_file` with old text not present -- tool_error,
+        // last_tool_error becomes Some(count 1).
+        edit_turn("a.txt", "line not present", "replacement"),
+        // Step 2: a DIFFERENT edit_file call (different old/new text) --
+        // this is the "corrected retry" the harness's error message asked
+        // for. err.count is only 1, so the corrected-rule leaves it alone:
+        // it must run as an ordinary tool call, not be substituted for
+        // think. It also fails (still bad old text), so this commits as a
+        // fresh tool_error, not a silent pass-through.
+        edit_turn("a.txt", "also not present", "something else"),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let thinker = Arc::new(statie_core::MockThinker::new(vec![Ok(
+        ThinkOutput::answer(THINKER_ANSWER),
+    )]));
+    let (mut session, log) =
+        make_file_tools_session(Arc::clone(&model), config(&root), Arc::clone(&thinker) as _);
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    // Step 1: the failing edit.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    log.append_record(rec1).unwrap();
+    let (state1, _v) = active.session().state().await.unwrap();
+    let err1 = state1
+        .harness
+        .last_tool_error
+        .clone()
+        .expect("step 1 must set last_tool_error");
+    assert_eq!(err1.count, 1);
+
+    // Step 2: the CORRECTED call (different args) -- must run, not think.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome2 = log.append_record(rec2).unwrap();
+    assert!(matches!(outcome2, Outcome::Continue), "got {outcome2:?}");
+    assert!(!any_rejected(&log));
+
+    let (name2, args2) = last_action(&log);
+    assert_eq!(
+        name2, "edit_file",
+        "a corrected edit_file call (different args, error shape has only failed once) must run \
+         as an ordinary tool call, not be substituted for think"
+    );
+    assert_eq!(
+        args2,
+        json!({"path": "a.txt", "old": "also not present", "new": "something else"}),
+        "the corrected call's own different args must be the ones that actually ran"
+    );
+    assert!(
+        any_event(&log, "tool_error"),
+        "the corrected call also fails (still bad old text), so step 2 must report its own \
+         tool_error, proving this actually ran rather than being silently skipped"
+    );
+
+    let (state2, _v) = active.session().state().await.unwrap();
+    let err2 = state2
+        .harness
+        .last_tool_error
+        .clone()
+        .expect("step 2's fresh error must set last_tool_error");
+    assert_eq!(
+        err2.args, args2,
+        "the recorded error must be the corrected call's own args, not the original"
+    );
+
+    assert_eq!(
+        thinker.calls().len(),
+        0,
+        "the mock thinker must never have been called: the corrected call was left alone to run"
+    );
+}
+
+/// Sixth test (review correction, the repeated-shape case): after TWO
+/// `edit_file` errors of the SAME shape (differing only in the line number
+/// quoted in each `old` text), a THIRD `edit_file` call with yet another
+/// different old/new text must be substituted for `think` with
+/// `REPEATED_ERROR_QUESTION` -- `err.count` is 2 by the time the third call
+/// is evaluated, satisfying the `err.count >= 2` half of the rule even
+/// though this third call's own args never equal `err.args` (the model has
+/// now shown, across two attempts, that it is not correcting the underlying
+/// problem, even though each attempt used different arguments).
+#[tokio::test]
+async fn two_same_shape_errors_then_a_third_different_call_substitutes_think() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("a.txt"),
+        "line one\nline two\nline three\nline four\n",
+    )
+    .unwrap();
+
+    let turns = vec![
+        // Step 1: old text not present -- tool_error, last_tool_error
+        // Some(count 1).
+        edit_turn("a.txt", "line 1 missing", "replacement one"),
+        // Step 2: a DIFFERENT edit_file call, SAME error shape (old text not
+        // found in a.txt), different line number quoted -- err.count is
+        // only 1 going into this step, so the corrected-rule leaves it
+        // alone to run; it fails the same way, advancing the SAME
+        // error-shape streak to count 2.
+        edit_turn("a.txt", "line 2 missing", "replacement two"),
+        // Step 3: yet another different edit_file call -- err.count is now
+        // 2 (from step 2's error), so the count>=2 half of the rule fires
+        // even though this call's args differ from err.args: substituted
+        // for think.
+        edit_turn("a.txt", "line 3 missing", "replacement three"),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let thinker = Arc::new(statie_core::MockThinker::new(vec![Ok(
+        ThinkOutput::answer(THINKER_ANSWER),
+    )]));
+    let (mut session, log) =
+        make_file_tools_session(Arc::clone(&model), config(&root), Arc::clone(&thinker) as _);
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    // Step 1: first error, count 1.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    log.append_record(rec1).unwrap();
+    let (state1, _v) = active.session().state().await.unwrap();
+    let err1 = state1
+        .harness
+        .last_tool_error
+        .clone()
+        .expect("step 1 must set last_tool_error");
+    assert_eq!(err1.count, 1);
+
+    // Step 2: a different call, same error shape -- left alone to run
+    // (count was only 1), fails the same way, advances the SAME streak to
+    // count 2.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome2 = log.append_record(rec2).unwrap();
+    assert!(matches!(outcome2, Outcome::Continue), "got {outcome2:?}");
+    let (name2, args2) = last_action(&log);
+    assert_eq!(
+        name2, "edit_file",
+        "step 2 (different args, error shape has failed only once so far) must run, not think"
+    );
+    let (state2, _v) = active.session().state().await.unwrap();
+    let err2 = state2
+        .harness
+        .last_tool_error
+        .clone()
+        .expect("step 2 must set last_tool_error");
+    assert_eq!(
+        err2.count, 2,
+        "step 2's error must advance the SAME error-shape streak to count 2"
+    );
+    assert_eq!(
+        err2.shape, err1.shape,
+        "steps 1 and 2 differ only in the line number quoted in their old text, so they must \
+         share the same error shape"
+    );
+    assert_eq!(
+        err2.args, args2,
+        "the recorded error must be step 2's own (different) args"
+    );
+
+    // Step 3: yet another different call -- err.count is now 2, so this
+    // must be substituted for think even though its args differ from
+    // err2.args.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(
+        matches!(outcome3, Outcome::Continue),
+        "must not park: got {outcome3:?}"
+    );
+    assert!(!any_rejected(&log));
+
+    let (name3, args3) = last_action(&log);
+    assert_eq!(
+        name3, "think",
+        "step 3 (a third, differently-worded edit_file call, after the SAME error shape has \
+         already repeated once) must be substituted for think"
+    );
+    // The substitution caps the reason to 300 characters
+    // (`cap_reason_to_300_chars`, `skills/src/coding/mod.rs`); this file's
+    // four-line "closest match" window pushes the raw reason past that, so
+    // mirror the same cap here rather than asserting on the uncapped text.
+    let capped_reason: String = err2.reason.chars().take(300).collect();
+    let expected = expected_question(&capped_reason);
+    assert_eq!(args3, json!({"question": expected}));
+
+    assert_eq!(
+        thinker.calls().len(),
+        1,
+        "the mock thinker must have been called exactly once, for step 3's substitution"
+    );
+    assert_eq!(thinker.calls()[0].question, expected);
+}

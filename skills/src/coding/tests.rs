@@ -40,6 +40,7 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             last_failure_summary: None,
             last_skip: None,
             last_tool_error: None,
+            last_stall: None,
         },
         agent,
     }

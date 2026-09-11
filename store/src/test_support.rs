@@ -89,6 +89,7 @@ pub fn harness(step: u64) -> HarnessState {
         last_failure_summary: None,
         last_skip: None,
         last_tool_error: None,
+        last_stall: None,
     }
 }
 

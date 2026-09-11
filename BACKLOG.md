@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 27. A run without a green test in N test runs stops
-- **Status.** Built (Milestone 34); in the fifteenth gate. Measured next by `refactor_b10` on the three hard tasks against `refactor_b8`. Evidence across 79 landed runs (builds 10 and 11): the most failing `test` runs before the first pass was 13 (one `multi_file_feature` seed), the 90th percentile 6, the median 2. The five `refactor_signature` misses ran 29, 24, 22, 14, and 11 failing tests.
+- **Status.** Committed (4307eb8; Milestone 34). Measured next by `refactor_b10` on the three hard tasks against `refactor_b8`. Evidence across 79 landed runs (builds 10 and 11): the most failing `test` runs before the first pass was 13 (one `multi_file_feature` seed), the 90th percentile 6, the median 2. The five `refactor_signature` misses ran 29, 24, 22, 14, and 11 failing tests.
 - **What.** The harness counts failing `test` runs since the last pass in
   this activation (`HarnessState.fails_since_green`). At 12, `implement`
   substitutes `think` with a question that says how many tests have

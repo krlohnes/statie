@@ -248,7 +248,7 @@ moves the metric it was built for. Ordered within each tier.
   current arm before and after; count of `reread_evicted` events per run.
 
 ### 20. `try_fixes` is offered only when there is a failure to fix
-- **Status.** Built (Milestone 28); in the seventh gate. Found in the `arm_harness_max` battery: 176 of its 195 tool errors were `try_fixes` called with no failing test ("no failing test to fix; run test first"), 113 of them in `design_fork` and 68 in `trap_interest`, the model repeating the call after each error.
+- **Status.** Committed (69a93a8; Milestone 28); measured by `arm_harness_max_b5`. Found in the `arm_harness_max` battery: 176 of its 195 tool errors were `try_fixes` called with no failing test ("no failing test to fix; run test first"), 113 of them in `design_fork` and 68 in `trap_interest`, the model repeating the call after each error.
 - **What.** `implement` lists `try_fixes` only when the workspace's
   `tests` record shows a failure (`pass == false`) and a fixer is
   configured. A `try_fixes` call that arrives with no failing test is not
@@ -263,7 +263,7 @@ moves the metric it was built for. Ordered within each tier.
   before and after; `design_fork` and `trap_interest` landing.
 
 ### 21. A second refused re-read becomes a `think`
-- **Status.** Built (Milestone 29); in the eighth gate with item 20. Found in `arm_current_b4`: `refactor_signature` 0/2, both seeds parked by the repeated-skip cap after three refused `read_file src/config.rs` calls whose window was still rendered.
+- **Status.** Committed (69a93a8; Milestone 29); measured by the sweep batteries on `refactor_signature`. Found in `arm_current_b4`: `refactor_signature` 0/2, both seeds parked by the repeated-skip cap after three refused `read_file src/config.rs` calls whose window was still rendered.
 - **What.** The harness records consecutive identical `skipped_redundant`
   steps in `HarnessState` (count and call key). When `implement` sees a
   read-only call whose key was skipped on the previous step, it

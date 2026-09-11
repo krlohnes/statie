@@ -1512,6 +1512,23 @@ either a default or a config knob:
   guard gives a `think` there (item 21), the error guard only a prefix
   line (backlog item 23).
 
+- **Fixer arm on build 11 (item 23 in): 23 of 26.** The best battery so
+  far. `try_fixes` errors went 145, 9, 0 across builds 10 to 11; the
+  identical-error cap parked two runs instead of eight because the
+  second strike is now a `think`; `multi_file_feature` landed on both
+  seeds for the first time. The misses are `refactor_signature` (both
+  seeds, still) and one `trap_rounding` seed.
+
+  The eight original short tasks, build by build, so the regression
+  noticed on build 10 stays visible:
+
+  | build | eight short tasks | note |
+  |---|---|---|
+  | 8 | 16/16 | chunked thinker, second batch |
+  | 10, current arm | 13/16 | new guards turning loops into parks |
+  | 10, fixer arm with cap | 12/16 | cap parked at the third strike |
+  | 11, fixer arm | 15/16 | second strike is a `think` (items 21, 23) |
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

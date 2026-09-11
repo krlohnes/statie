@@ -372,3 +372,28 @@ holds the resulting design; this file holds why.
   minutes for 103 binaries against about three hours before: 23
   binaries in the first 43 minutes, then 24 in the next ten. The
   per-binary wait is smaller, not gone. D18 attacks the count.
+
+## D19. A guard's second strike is a question, its third is a park
+- **Decision.** Every repeat guard (identical skipped read, identical
+  tool error, and any added later) answers the second identical repeat
+  with a `think` that quotes what happened and asks for a different
+  exact action, and parks only on the third. A guard that parks on the
+  second strike is a defect against this rule.
+- **Why.** Build 10's identical-error cap parked at the third strike
+  with only a prefix line at the second: eight parks, landing down from
+  20 to 17 of 26 and the short tasks from 16 of 16 (build 8) to 12 of
+  16. Build 11 puts a `think` at the second strike for both guards: 23
+  of 26, two parks, short tasks 15 of 16, `multi_file_feature` landed
+  on both seeds for the first time. Same tasks, same seeds count, same
+  model; the difference is what the harness says on the second repeat.
+  This is D9 (the question must fit the failure) applied to the guards
+  themselves, and it recovers the regression I had let hide inside the
+  full-battery totals.
+- **Check.** The eight-short-task row in the README stays at 15 or 16
+  of 16 on every later build; a build that drops below that gets the
+  paired audit before anything else lands.
+- **Result (gate 12).** 16 binaries, 12 minutes end to end, all green,
+  against 103 binaries and 93 minutes for gate 11 on the same machine
+  state (about three hours before the Developer Tools permission). The
+  test-fixture git helpers also stop inheriting the developer's signing
+  config, which had failed a test once under load.

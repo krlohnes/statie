@@ -1633,7 +1633,11 @@ errors (or skips) before the core cap parks the run;
 
 ## Testing conventions
 
-- Unit tests live beside code (`#[cfg(test)]`). Integration tests in `<crate>/tests/`.
+- Unit tests live beside code (`#[cfg(test)]`). Integration tests in
+  `<crate>/tests/it/<module>.rs`, one binary per crate declared by
+  `tests/it/main.rs` (D18); a new test file is a new `mod` line there,
+  never a new file directly under `tests/`. Run one with
+  `cargo test -p <crate> --test it <module>::`.
 - Compile-time invariants get `compile_fail` doctests in `core/src/lib.rs`
   (A1 Reasoning not Promptable; A2 store commit rejects RawPatch; A3
   ValidatedPatch not Clone; A9 tool APIs reject `Path`).

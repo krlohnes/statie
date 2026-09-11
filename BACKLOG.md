@@ -299,7 +299,7 @@ moves the metric it was built for. Ordered within each tier.
   tool-error streak across the battery.
 
 ### 23. The detected test command is recorded; a repeated failing call becomes a `think`
-- **Status.** Built (Milestone 31); in the eleventh gate. First cut let a `think` step reset the streak, so error, think, error, think could cycle; corrected so a think keeps the count and the cap bounds it. Found in `arm_harness_max_b6`: three runs refused `try_fixes` after `test {}` because the auto-detected command was never recorded; five runs parked at the third identical `edit_file` error.
+- **Status.** Committed (9ba0690; Milestone 31). Measured (`arm_harness_max_b7`): 23/26 landed against 17/26, `try_fixes` errors 0, cap parks 2 against 8, short tasks 15/16. First cut let a `think` step reset the streak, so error, think, error, think could cycle; corrected so a think keeps the count and the cap bounds it. Found in `arm_harness_max_b6`: three runs refused `try_fixes` after `test {}` because the auto-detected command was never recorded; five runs parked at the third identical `edit_file` error.
 - **What.** (a) When `test` runs with no `cmd`, the harness records the
   command the tool detected (the tool prints it as its first line) in
   `HarnessState.last_test_cmd` and in the `tests` record, so a failure
@@ -317,13 +317,30 @@ moves the metric it was built for. Ordered within each tier.
   the identical-error cap; landing.
 
 ### 24. One integration test binary per crate
-- **Status.** In progress (D18): skills first, then core, tools, cli, models, augment, tui.
+- **Status.** Done (D18): all seven crates, 16 binaries, gate 12 green in 12 minutes against 93.
 - **What.** `tests/it/main.rs` per crate declaring the former files as
   modules; the same tests, one binary. Targeted runs become
   `cargo test -p <crate> --test it <module>::`.
 - **Why.** The gate launched about 103 binaries for five minutes of
   test CPU; the per-binary link and Gatekeeper wait were the whole cost.
 - **Measure.** Gate wall clock and `Running` lines before and after.
+
+### 25. Repeat guards key on the shape of an error, not its text
+- **Status.** Found in `arm_harness_max_b7`: `refactor_signature` ran 116 and 153 steps before the mixed-shape cap parked it.
+- **What.** The identical-error streak keys on (tool, reason text), so
+  nine `edit_file` failures in a row with different line numbers in the
+  reason count as nine different errors, and a run that alternates a
+  refused read with a failed edit breaks both streaks every step. Key
+  the error streak on (tool, reason with digits and paths stripped),
+  and count a refused read followed by a failed edit on the same path
+  as one streak, so the second-strike `think` and the third-strike park
+  arrive at three, not at a hundred.
+- **Why.** `refactor_signature` is the one task no build has landed;
+  the model cannot do the refactor, and the harness's job is then to
+  stop spending steps on it. Seed 1 alternated skip, error, skip, error
+  for forty steps; seed 2 issued nine consecutive failing edits.
+- **Measure.** Steps to park on `refactor_signature`; no change on the
+  landing rows.
 
 ## P2: worth doing, weaker or narrower evidence
 

@@ -38,8 +38,8 @@ Nothing. No cargo, bench, or agent process is running.
 
 ## Open threads
 - Push is yours; nothing has been pushed this session.
-- `refactor_signature` is a capability miss for a 26B model in a 4k
-  working set; the harness now names it (`no green in 16 test runs`)
+- `refactor_signature` is a capability miss for a 26B model with a four-window,
+  6k-token working set in a 16k context; the harness now names it (`no green in 16 test runs`)
   instead of timing out on it.
 - 8b (budget lines in the harness view) is the one deferred item with a
   spec; it needs a hypothesis about what the model would do with the

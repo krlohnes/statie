@@ -441,8 +441,9 @@ holds the resulting design; this file holds why.
   1500 s timeout. On this task a failing test cycle costs about 80 s,
   so sixteen of them is most of the budget. The run's problem is not
   that it goes on too long; it is that a 26B model cannot hold a
-  six-file signature change in a 4k working set, and each edit fixes
-  one compile error by creating another. Lowering the cap to save time
+  six-file signature change in a working set of four windows and 6k
+  tokens (the prompt peaks near 12k of a 16k context), and each edit
+  fixes one compile error by creating another. Lowering the cap to save time
   would cut into landed runs (`multi_file_feature` needed 13 failing
   tests once).
 - **Ruled out.** A lower park threshold; a per-task budget; retrying

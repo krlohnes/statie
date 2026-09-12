@@ -1,56 +1,48 @@
-# Status, 2026-09-11 morning
+# Status, 2026-09-12 morning
 
 ## Where the code is
-Fifteen commits on `main` since the last push point (`58dff8f`), all
-unpushed. The latest: `b42f23a` (one integration test binary per crate,
-D18: gate from 103 binaries and about three hours to 16 binaries and 12 to
-19 minutes), `9ba0690` (item 23), `3024891` (item 25). The tree is clean.
+25 commits on `main` since the last push point (`58dff8f`), all
+unpushed. The latest code commits: `896fb14` (item 26, situational
+rules behind `guards.situational_rules`) and `4307eb8` (item 27, the
+no-green cap). The tree is clean; no worktrees or agent branches remain.
+The gate is 16 test binaries in 12 to 19 minutes (D18).
 
-## Backlog: every item is now committed, measured, or parked with a reason
-- P0: long tasks (1) built and calibrated; arms (2) measured on build 9;
-  worktree (3) and `try_fixes` (4) built.
-- P1: `tests` record (5), chunked `think` (6), `probe` (7), early-park think
-  (8), `write_file` after read (15), shell reads (16), `edit_file` checks (17),
-  failure-shaped question (18): all committed.
-- P2: audit (13), grounded review (12), `think` listing (14), options mode
-  (11): committed and measured. Sweep (10): measured. Context blocks (9):
-  parked on the arm evidence. Budget lines (8b): still deferred.
-- Found while measuring, all fixed and committed: evicted re-reads refused
-  (19), `try_fixes` offered without a failure (20), refused re-read parks
-  (21), `try_fixes` reading a stale session field and uncapped identical
-  errors (22), detected command not recorded and error cap without a think
-  (23), one test binary per crate (24), error streaks keyed on shape and a
-  stalled-path streak (25).
+## Backlog: through
+Every item is committed and measured, or parked with a written reason.
+- P0 and P1: all committed (items 1 to 8, 15 to 18).
+- P2: audit (13), grounded review (12), `think` listing (14), options
+  mode (11), maintainer sweep (10), situational rules (26): committed and
+  measured. Context blocks (9): parked on the arm evidence (D15). Budget
+  lines (8b): deferred.
+- Found while measuring, all fixed, committed, measured: 19 to 25, 27.
 
-## What the measurements say (README "field notes", DECISIONS D12 to D17)
-- Arms: model-owned and current both landed 16 of 24; current took 13 median
-  steps against 20 and a third of the wall clock. Harness-owned state stays.
-- Every miss shared by the arms was a harness defect, not a state-ownership
-  effect: the guards claimed the model could see things it could not (D14).
-- Current arm after item 19: python long task back to 2 of 2, 18 of 26 overall.
-- Fixer arm: 15/23 on build 9, 20/26 on build 10 (best so far), 17/26 on
-  build 10 with the error cap (the cap parked 8 runs at the third strike; item
-  23 puts a `think` at the second). Build 11 runs next.
-- `think` listing: no landing effect, small prompt cost; unlisted by default.
-- Grounded review: nothing to act on, the review sends back almost nothing.
-- Maintainer budget 200/400/800/off: within one run; off costs a third more
-  steps. Stays at 400.
-
-## Latest numbers (README "field notes", DECISIONS D12 to D19)
-- Fixer arm, build 11: 23 of 26, the best battery; `try_fixes` errors 0;
-  `multi_file_feature` landed on both seeds for the first time.
-- Eight original short tasks: build 8 16/16, build 10 13/16 (the regression
-  the caps caused), build 11 15/16 on both the fixer and the current arm.
-- Still missing on every build: `refactor_signature` (0 of 2). Item 25
-  shortens how long a run spends on it.
+## What the last three builds said (README field notes, D20, D21)
+- Build 13, same binary, same seeds: situational rules off 22 of 26 in 72
+  minutes; on 22 of 26 in 92 minutes, no prompt saving at the peak. The
+  switch stays off (D20). The paper's localisation gain does not carry to
+  a model whose misses are stalls.
+- Build 14, the no-green cap on the three hard tasks: both
+  `refactor_signature` seeds parked at exactly the sixteenth failing test
+  after four questions, at 1265 s and 1387 s of 1500 s. Correct, and a
+  small saving: a failing test cycle costs 80 s on that task. Kept; no
+  more batteries aimed at that task alone (D21).
+- `multi_file_feature` is 4 of 6 across the last three batteries of the
+  same code; `trap_rounding` 3 of 6 then 2 of 2. Both are variance at
+  two seeds, not a trend.
+- Best full battery remains build 11's fixer arm at 23 of 26; builds 13
+  and 14 carry the same code plus two switched-off or never-firing
+  additions, and landed 22 of 26.
 
 ## Running now
-- `refactor_b8`: refactor_signature, trap_rounding, multi_file_feature on the
-  item 25 binary, to measure steps-to-park.
+Nothing. No cargo, bench, or agent process is running.
 
-## Open threads after that
+## Open threads
 - Push is yours; nothing has been pushed this session.
-- `refactor_signature` is a capability miss; the harness's remaining job is
-  to stop spending steps on it, which item 25 measures.
-- Nine crates for 44k lines is more than the project needs; three would do.
-  Not worth the churn now that the gate is minutes.
+- `refactor_signature` is a capability miss for a 26B model in a 4k
+  working set; the harness now names it (`no green in 16 test runs`)
+  instead of timing out on it.
+- 8b (budget lines in the harness view) is the one deferred item with a
+  spec; it needs a hypothesis about what the model would do with the
+  number before it earns a battery.
+- Nine crates for 44k lines is more than the project needs; three would
+  do. Not worth the churn now that the gate is minutes.

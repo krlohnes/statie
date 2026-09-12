@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 27. A run without a green test in N test runs stops
-- **Status.** Committed (4307eb8; Milestone 34). Measured next by `refactor_b10` on the three hard tasks against `refactor_b8`. Evidence across 79 landed runs (builds 10 and 11): the most failing `test` runs before the first pass was 13 (one `multi_file_feature` seed), the 90th percentile 6, the median 2. The five `refactor_signature` misses ran 29, 24, 22, 14, and 11 failing tests.
+- **Status.** Committed (4307eb8; Milestone 34). Measured (`refactor_b10`): both `refactor_signature` seeds parked at exactly the sixteenth failing test after four questions each, at 1265 s and 1387 s against a 1500 s timeout. The cap names the shape and saves a tenth of the budget; it does not land the task. `trap_rounding` 2 of 2, `multi_file_feature` 0 of 2 with the cap never firing (7 and 11 failing tests; 4 of 6 across the last three batteries). Kept (D21). Evidence across 79 landed runs (builds 10 and 11): the most failing `test` runs before the first pass was 13 (one `multi_file_feature` seed), the 90th percentile 6, the median 2. The five `refactor_signature` misses ran 29, 24, 22, 14, and 11 failing tests.
 - **What.** The harness counts failing `test` runs since the last pass in
   this activation (`HarnessState.fails_since_green`). At 12, `implement`
   substitutes `think` with a question that says how many tests have

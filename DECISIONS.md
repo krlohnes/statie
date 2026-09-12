@@ -429,3 +429,26 @@ holds the resulting design; this file holds why.
 - **Check.** If a later build's prompt peak becomes rules-dominated
   (rules above a third of the peak), rerun this comparison.
 
+## D21. The no-green cap stays; `refactor_signature` stops being the target
+
+- **Decision.** Item 27 stays at think 12, park 16. No battery is
+  spent on `refactor_signature` alone again; it stays in the full
+  battery as the task this model does not land.
+- **Evidence (build 14).** The cap did what it says: both seeds parked
+  at exactly the sixteenth failing test, after the four questions the
+  threshold implies, and no landed run in the record would have hit
+  it. What it did not do is save much: 1265 s and 1387 s against the
+  1500 s timeout. On this task a failing test cycle costs about 80 s,
+  so sixteen of them is most of the budget. The run's problem is not
+  that it goes on too long; it is that a 26B model cannot hold a
+  six-file signature change in a 4k working set, and each edit fixes
+  one compile error by creating another. Lowering the cap to save time
+  would cut into landed runs (`multi_file_feature` needed 13 failing
+  tests once).
+- **Ruled out.** A lower park threshold; a per-task budget; retrying
+  the task with a bigger working set (D3 fixed the window on purpose).
+- **Check.** The cap's shape string, `no green in 16 test runs`,
+  appears in a park only on runs that would otherwise have timed out.
+  A landed-task regression that carries that shape reopens the
+  threshold.
+

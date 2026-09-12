@@ -1546,6 +1546,15 @@ either a default or a config knob:
   Same misses by shape. The rules block was never the peak; the
   working set is. The switch stays off.
 
+  Item 27 (build 14, no-green cap, D21): `refactor_signature` parked
+  at the sixteenth failing test on both seeds, after four harness
+  questions each, at 1265 s and 1387 s of a 1500 s budget. Each
+  failing test on that task costs about 80 s (a full compile of a
+  six-file crate plus a model turn at 11k prompt tokens), so a cap set
+  above every landed run fires late. `trap_rounding` 2 of 2;
+  `multi_file_feature` 0 of 2 with the cap never reached, 4 of 6 on
+  the last three batteries of the same code.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

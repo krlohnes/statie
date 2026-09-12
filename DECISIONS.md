@@ -401,3 +401,31 @@ holds the resulting design; this file holds why.
   group; anything launched from the same shell call shares that group.
   A battery runner launched alongside a gate died with it. Batteries
   and gates are launched from separate shell calls.
+
+## D20. Situational rules stay off
+
+- **Decision.** `guards.situational_rules` stays `false`. The static
+  procedure graph and the `## Now` section stay in the tree behind the
+  switch (Milestone 33); the whole rules block remains the default.
+- **Evidence (build 13, same binary, same seeds).** Fixer arm with the
+  switch off: 22 of 26, median 14.5 steps, mean peak prompt 7290
+  tokens, 72 minutes. Switch on: 22 of 26, median 17.5 steps, mean peak
+  prompt 7343 tokens, 92 minutes. The two arms differ on two runs in
+  opposite directions (`design_fork` seed 2 landed only with the switch
+  on, `trap_rounding` seed 2 only with it off), and every miss is a
+  known stall shape (a `done` with an open step, a skip-and-continue
+  mix, the `refactor_signature` no-green loop). The section saves
+  about 130 prompt tokens a step at step 3 (the unit test) and nothing
+  at the peak, because the peak is the working set, not the rules.
+- **Why the paper's result does not carry.** Procedural Graphs' gain
+  came from a learned graph, a guidance model reading a three-step
+  trajectory window, and frontier solvers. The cheap adoption keeps
+  only the localisation. On a 26B model whose misses are stalls rather
+  than wrong rule choices, localising the rules changes which rules
+  are shown and not whether the model follows them. The rules block
+  was never the context cost that mattered here; the working set is.
+- **Ruled out.** Enabling the switch by default; a learned or
+  model-edited graph (D9: no second call per step on a 4090).
+- **Check.** If a later build's prompt peak becomes rules-dominated
+  (rules above a third of the peak), rerun this comparison.
+

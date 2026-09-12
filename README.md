@@ -1540,6 +1540,12 @@ either a default or a config knob:
   the first pass was 13; the refactor misses ran 29, 24, and 22
   (backlog item 27).
 
+  Item 26 (build 13, situational rules, D20): switch off 22 of 26 in
+  72 minutes at a median of 14.5 steps; switch on 22 of 26 in 92
+  minutes at 17.5 steps, mean peak prompt 7290 against 7343 tokens.
+  Same misses by shape. The rules block was never the peak; the
+  working set is. The switch stays off.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

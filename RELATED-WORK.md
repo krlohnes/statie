@@ -258,6 +258,13 @@ neighbourhood (after a failing `test`, only the failure rules; after an
 edit, "run `test` next" and the edit pitfalls) is the same localisation
 without the extra call (BACKLOG.md item 26).
 
+Measured (build 13, D20): the static neighbourhood landed the same 22
+of 26 as the whole block on the same binary, took three more median
+steps, and saved nothing at the prompt peak, which is the working set
+and not the rules. The localisation half of the paper does not carry
+to a harness whose misses are stalls rather than rule confusion; the
+switch stays off.
+
 ### Compaction and context rot
 
 - **Anthropic, "Effective context engineering for AI agents", 2025.**

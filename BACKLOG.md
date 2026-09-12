@@ -426,7 +426,7 @@ moves the metric it was built for. Ordered within each tier.
   models; full injection hurt. Our rules block is a full injection.
 - **Measure.** Mean and peak prompt tokens, landing on the full battery,
   the eight-short-task row.
-- **Status.** Committed (896fb14; Milestone 33). Measured by `situational_b9` against `arm_harness_max_b9` on the same binary.
+- **Status.** Committed (896fb14; Milestone 33). Measured (`situational_b9` against `arm_harness_max_b9`, same binary): 22 of 26 both ways, three more median steps and no prompt saving at the peak with the switch on. Stays off (D20).
 - **Depends on.** Nothing; P2 because the evidence is from other models.
 
 ## Not doing

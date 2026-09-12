@@ -297,8 +297,9 @@ holds the resulting design; this file holds why.
 
 ## D16. `think` stays listed only because the plan skill's options mode needs it
 - **Decision.** `thinker.listed` keeps its default of true. The
-  measurement (backlog item 14) found no landing effect either way and a
-  small cost to listing: about 400 prompt tokens at peak and a few more
+  measurement (backlog item 14) could not separate the two on landing
+  (13 of 16 listed, 12 of 16 unlisted: one run apart at two seeds a
+  task, which is noise) and found a small cost to listing: about 400 prompt tokens at peak and a few more
   tool errors on sixteen runs. Every useful `think` so far has been a
   harness substitution. Listing survives because `think {mode:
   "options"}` (item 11) is a model-initiated call at plan time; if the
@@ -407,6 +408,8 @@ holds the resulting design; this file holds why.
 - **Decision.** `guards.situational_rules` stays `false`. The static
   procedure graph and the `## Now` section stay in the tree behind the
   switch (Milestone 33); the whole rules block remains the default.
+  This is "no gain seen at two seeds, so keep the cheaper setting"
+  (D22), not a finding that the section hurts.
 - **Evidence (build 13, same binary, same seeds).** Fixer arm with the
   switch off: 22 of 26, median 14.5 steps, mean peak prompt 7290
   tokens, 72 minutes. Switch on: 22 of 26, median 17.5 steps, mean peak
@@ -452,4 +455,36 @@ holds the resulting design; this file holds why.
   appears in a park only on runs that would otherwise have timed out.
   A landed-task regression that carries that shape reopens the
   threshold.
+
+## D22. Two-seed comparisons pick defaults; they do not establish effects
+
+- **Decision.** A paired battery at two seeds a task (16 short-task
+  runs or 26 full-battery runs an arm) decides which setting is the
+  default when the two arms are within a couple of runs of each other:
+  the cheaper one wins. It does not establish that a feature helps or
+  hurts, and the record must not say it does. Claims of an effect need
+  a difference larger than the run-to-run swing, which on this battery
+  is at least three runs at two seeds, or a battery of six seeds a task
+  (about 50 runs an arm, two hours on the 4090) for a gap of one or
+  two runs.
+- **Why.** The user asked whether 13 of 16 against 12 of 16 (D16) was
+  conclusive. It is not, and neither are 21 against 18 of 26 (grounded
+  review), 6, 5, 5, and 4 of 10 (D17), or 22 against 22 (D20). Each of
+  those decisions actually rested on something else: a feature the
+  model never invoked, a guard that never had anything to act on, the
+  step count with the maintainer off, no prompt saving at the peak.
+  The landing numbers were reported alongside as if they carried the
+  decision, and they did not. The same tasks swing between 0 and 2 of
+  2 on identical code (`multi_file_feature` across builds 12 to 14), so
+  a one-run gap is inside the noise by construction.
+- **What still holds.** Harness-owned against model-owned state (D15)
+  rests on 13 against 20 median steps and a third of the wall clock
+  across 24 runs an arm, not on the equal landing count. The
+  second-strike question (D19) rests on a four-run swing on the short
+  tasks (12 to 15 of 16) and a six-run swing on the full battery (17 to
+  23 of 26), both larger than the noise seen anywhere else.
+- **Check.** Any decision in this file that cites a landing gap of two
+  runs or fewer as its evidence gets re-read against this entry; the
+  README field notes say "not distinguishable at two seeds" for those
+  comparisons.
 

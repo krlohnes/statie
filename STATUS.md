@@ -16,7 +16,10 @@ Every item is committed and measured, or parked with a written reason.
   lines (8b): deferred.
 - Found while measuring, all fixed, committed, measured: 19 to 25, 27.
 
-## What the last three builds said (README field notes, D20, D21)
+## What the last three builds said (README field notes, D20 to D22)
+Every paired comparison this session ran at two seeds a task. That
+picks the cheaper default when the arms are close; it does not show an
+effect (D22). Read the landing gaps below with that in mind.
 - Build 13, same binary, same seeds: situational rules off 22 of 26 in 72
   minutes; on 22 of 26 in 92 minutes, no prompt saving at the peak. The
   switch stays off (D20). The paper's localisation gain does not carry to

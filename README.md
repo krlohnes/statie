@@ -1464,7 +1464,8 @@ either a default or a config knob:
   and is refused three times (backlog item 21).
 
   Listing `think` (backlog item 14, `thinker.listed`): on the eight
-  short tasks, listed landed 13 of 16 and unlisted 12 of 16; unlisted
+  short tasks, listed landed 13 of 16 and unlisted 12 of 16, which is
+  not distinguishable at two seeds (D22); unlisted
   had no rejections against two, ten tool errors against nineteen, and
   a mean peak prompt 400 tokens lower. Every `think` in the unlisted
   battery was a harness substitution. The model has still never called
@@ -1472,8 +1473,9 @@ either a default or a config knob:
 
   Grounded review findings (backlog item 12): switch off landed 21 of
   26 against 18 of 26 with it on, but across all 52 runs the review
-  sent work back twice and no finding was dropped, so the gap is noise
-  and the guard has had nothing to act on. The review approves what it
+  sent work back twice and no finding was dropped, so the gap is not
+  distinguishable from noise at two seeds (D22) and the guard has had
+  nothing to act on. The review approves what it
   is shown; the send-back is not where this battery loses runs.
 
   The fixer arm re-run with items 19 to 21 in (`arm_harness_max_b5`)
@@ -1543,8 +1545,9 @@ either a default or a config knob:
   Item 26 (build 13, situational rules, D20): switch off 22 of 26 in
   72 minutes at a median of 14.5 steps; switch on 22 of 26 in 92
   minutes at 17.5 steps, mean peak prompt 7290 against 7343 tokens.
-  Same misses by shape. The rules block was never the peak; the
-  working set is. The switch stays off.
+  Same misses by shape, and not distinguishable at two seeds (D22).
+  The rules block was never the peak; the working set is. The switch
+  stays off because it is the cheaper setting, not because it lost.
 
   Item 27 (build 14, no-green cap, D21): `refactor_signature` parked
   at the sixteenth failing test on both seeds, after four harness

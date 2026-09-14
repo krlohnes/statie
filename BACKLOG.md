@@ -343,8 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 29. A rejected tool call names the skill that has the tool, and repeats count
-- **Status.** Proposed on the Qwen smoke runs (build 15); sized by the
-  json-format short battery.
+- **Status.** Committed (Milestone 36). Measured next by `qwen_json_short_b16` and `short_fixer_b16`. Sized by the json-format short battery (build 15): three of five misses are the permission question after a rejected `edit_file` in `plan`; one is a 140-step timeout with the file path in the tool `name` field sixty times.
 - **Evidence.** qwen3-coder under `format: schema`: one run called a tool
   named `plan` from the router 142 times to the step cap; no guard
   counts a rejected call. Under `format: json`: two of six runs reached

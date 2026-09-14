@@ -1738,3 +1738,36 @@ Tests: `core/tests/it/prompt.rs` (a tool-and-done schema renders no
 from the router is rejected with the exact note, not parked; the flag
 is false only for the router).
 
+## Milestone 36: a rejected tool call says where the tool is (BACKLOG.md item 29)
+
+`Skill::skill_with_tool(tool)` is a default trait method returning the
+allowed transition whose tool list has the named tool. The coding
+skills share `coding_skill_with_tool`, which maps the implement-only
+tools (`edit_file`, `write_file`, `revert_file`, `test`, `try_fixes`,
+`shell`, `probe`) to `implement`, gated on the caller's
+`allowed_transitions()`.
+
+The inactive-tool rejection in `Active::execute` now has three exact
+texts: the tool is elsewhere (names the skill and quotes the hand-off
+shape), the name is empty (put the name in `name`, the arguments in
+`args`), or nothing has it (and if the name looks like a path, it
+belongs in `args`). The `tool_rejected` log entry carries
+`skill_with_tool`.
+
+A rejected call also joins the identical-tool-error streak
+(`last_tool_error`, Milestone 30 and 32) through a second entry search
+kept separate from the stalled-path guard's, so a rejected `edit_file`
+in `plan` is a repeat, not an edit failure on a path. The second strike
+is the `think` in `implement`; the third is the park with the existing
+"repeated tool error" shape, which is the whole effect in `plan` and
+`router`, where no `think` runs.
+
+Why: Qwen's misses under `format: json` were a rejected `edit_file` in
+`plan` followed by a question asking permission to hand off, and one
+run with the file path in the tool name sixty times to the timeout.
+Both are questions the harness can answer (D14).
+
+Tests: `core/tests/it/tool_rejected.rs` (the three texts, the third
+strike, an interleaved different call), `skills/tests/it/rejected_handoff.rs`
+(`plan` rejecting `edit_file` names `implement` with the exact shape).
+

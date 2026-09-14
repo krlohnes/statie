@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 30. A question asked after the plan is written is the hand-off
-- **Status.** Committed (Milestone 37). Measured next by `qwen_json_short_b17`. Evidence: seven Qwen runs across the json
+- **Status.** Committed (Milestone 37). Measured (`qwen_json_short_b17`): 11 of 16; the trigger never fired because no run asked in `plan`; the plan-phase rejections handed off on the item 29 note instead. Kept on the seven-run evidence; it costs nothing when it does not fire. Evidence: seven Qwen runs across the json
   smoke and builds 15 and 16, every one an `ask_user` in `plan` with a
   four- to six-step plan already written, asking whether it may hand
   off to `implement` (item 29's note names `implement` and quotes the

@@ -1583,6 +1583,17 @@ either a default or a config knob:
   build 12: an empty-name tool call at step 5 of nearly every run,
   rejected, never repeated.
 
+  Build 17 (item 30 in), Qwen json: 11 of 16, mean 78 s a run. Item 30
+  never fired: no run asked in `plan` this time; the four runs whose
+  `edit_file` was rejected in `plan` read the item 29 note and handed
+  off. Three of the five misses are `edit_file` argument shape: Qwen
+  sends `content` (a whole file) or `new` with no `old`/`after`/`before`
+  anchor, gets "exactly one of `old`, `after`, `before` must be set",
+  and loops to the stalled-path park. One run put a `question` in the
+  arguments of a tool with no name three times and parked at the third
+  strike. The model wants to write whole files or address lines; the
+  tool asks it to copy lines (backlog item 31).
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

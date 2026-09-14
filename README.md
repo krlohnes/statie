@@ -1594,6 +1594,15 @@ either a default or a config knob:
   strike. The model wants to write whole files or address lines; the
   tool asks it to copy lines (backlog item 31).
 
+  Build 18 (item 31 in), Qwen json: 13 of 16, the best Qwen battery,
+  and inside D22's noise against 11 and 12. The model never sent a
+  `lines` edit; the new argument note fired three times and the runs
+  went on to anchor edits. The three misses: an anchor copied with the
+  wrong whitespace three times to the park, a `plan` drift into
+  repeated `list_files`, and, for the second battery running, a
+  `think` sent with an empty tool name and the question in `args`,
+  three times to the park (backlog item 32).
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

@@ -342,6 +342,26 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 32. A tool call with no name is named by its arguments; an anchor miss names `lines`
+- **Status.** Building. Evidence: two Qwen batteries running (builds 17
+  and 18) parked `trap_rounding` the same way: a tool call with an
+  empty `name` and a `question` in `args`, three times to the third
+  strike. The model meant `think`. And the build 18 anchor-miss park:
+  three tries at copying a multi-line anchor with the wrong whitespace,
+  never trying `lines`, because the error text tells it to copy again.
+- **What.** (a) In the coding skills' `validate`, a `tool` action with
+  an empty name whose `args` match exactly one tool's distinctive keys
+  is renamed: `question` alone is `think`; `path` with `content` is
+  `write_file`; `path` with `new` and one of `old`/`after`/`before`/
+  `lines` is `edit_file`; `pattern` is `search`. Anything else stays
+  empty and gets the item 29 note. A note records the inference. (b)
+  The anchor-not-found error ends with: "or address the range with
+  `lines: \"START-END\"` from the read window instead of copying it."
+- **Why.** The harness can read the arguments; the model wrote them.
+  Failing a step the harness could complete is the shape D14 names.
+- **Measure.** No empty-name park on the Qwen short battery; the
+  first `lines` edit in a live run.
+
 ### 31. Line-addressed edits, and an edit that is a whole file is routed to `write_file`
 - **Status.** Committed (Milestone 38). Measured next by `qwen_json_short_b18` and `short_fixer_b18`. Evidence (build 17, Qwen json): three of five
   misses are `edit_file` argument shape. The model sends `content`

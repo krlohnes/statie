@@ -1855,3 +1855,16 @@ Tests: `skills/src/coding/tests.rs` (every arm of the inference and the
 inference note and the item 29 note), `tools/tests/it/edit_file.rs`
 (the exact anchor-miss text with and without the closest-line hint).
 
+## Milestone 40: the knob sweep runner (BACKLOG.md item 33)
+
+`bench/run_sweep.sh <label> <base_config> --set a.b=v1,v2 [...]` derives
+one config per combination under `bench-runs/<label>/configs/`, refuses
+a combination whose working-set budget exceeds the prompt budget or
+whose prompt budget exceeds the model window, and runs the rest one
+after another. `bench/sweep_summary.py <label>` tabulates landed,
+median steps, mean peak prompt, and mean seconds per combination. The
+runner knows nothing about models: the model, and a recommended
+setting for it, is a config file, which is the split agreed with the
+user for every per-model knob. The maintainer sweep of item 10 is now
+one invocation of this runner.
+

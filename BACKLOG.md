@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 33. A knob sweep runner: the model is a config field, the knobs are the experiment
-- **Status.** Building. Agreed with the user: no per-model defaults in
+- **Status.** Committed (Milestone 40). First sweep running: `qwen_sweep_16k` and `qwen_sweep_24k` (see Measure; the window pairs `num_ctx` with `budget.total`, so it is two base configs rather than a third knob). Agreed with the user: no per-model defaults in
   code; a recommendation is a config file; the sweep varies the knobs
   on whatever base config it is given.
 - **What.** `bench/run_sweep.sh <label> <base_config> --set a.b=v1,v2
@@ -360,8 +360,9 @@ moves the metric it was built for. Ordered within each tier.
   landing is the next question, and it must be asked per model without
   the runner knowing what a model is.
 - **Measure.** The first sweep: Qwen json, `working_set.max_windows`
-  4 and 8, `budget.working_set` 6000 and 9000, `model.num_ctx` 16384
-  and 24576, on the eight short tasks.
+  4 and 8, `budget.working_set` 6000 and 9000, on two base configs,
+  16384/14000 and 24576/22000 (`num_ctx`/`budget.total`), eight short
+  tasks, two seeds: eight batteries.
 
 ### 32. A tool call with no name is named by its arguments; an anchor miss names `lines`
 - **Status.** Committed (Milestone 39). Measured (`qwen_json_short_b19`): 13 of 16; the inference never fired (the nameless calls had no arguments, or a bare `path`); Qwen's first six `lines` edits arrived on this build. Kept: it costs nothing and the two-battery shape it was built for did not recur. Evidence: two Qwen batteries running (builds 17

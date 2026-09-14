@@ -18,6 +18,7 @@ mod repeated_failure;
 mod restrict_action_types;
 mod think;
 mod think_modes;
+mod tool_rejected;
 mod try_fixes;
 mod try_fixes_source;
 mod user_patch;

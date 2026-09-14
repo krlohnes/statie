@@ -276,6 +276,43 @@ fn common_is_terminal(ws: &CodingWorkspace) -> bool {
     ws.done
 }
 
+/// Item 29: which coding skill has `tool` in its own `tools()`, for
+/// `Skill::skill_with_tool`'s shared mapping across `RouterSkill`,
+/// `PlanSkill`, `ImplementSkill`, and `ReviewSkill`. Checked in order --
+/// `implement` first, since every tool it alone has (`edit_file`,
+/// `write_file`, `revert_file`, `test`, `try_fixes`, `shell`, `probe`) is
+/// the common case a rejected call in `plan`/`router`/`review` needs
+/// pointed at -- then `review`, for any tool only `review` has (today,
+/// none: every tool `review` carries is also in `plan`'s list, so this arm
+/// never actually matches, but it stays as the general rule rather than a
+/// hardcoded `implement`-or-nothing check). `None` for a name no skill has,
+/// including the empty string (a rejected call with no `name` at all is
+/// never "the tool that skill has", it's a missing name -- see
+/// `core/src/session.rs`'s empty-name observation text, which is handled
+/// as its own case rather than routed through this function).
+pub fn coding_skill_with_tool(tool: &str) -> Option<&'static str> {
+    if tool.is_empty() {
+        return None;
+    }
+    const IMPLEMENT_ONLY: &[&str] = &[
+        "edit_file",
+        "write_file",
+        "revert_file",
+        "test",
+        "try_fixes",
+        "shell",
+        "probe",
+    ];
+    if IMPLEMENT_ONLY.contains(&tool) {
+        return Some("implement");
+    }
+    const REVIEW_ONLY: &[&str] = &[];
+    if REVIEW_ONLY.contains(&tool) {
+        return Some("review");
+    }
+    None
+}
+
 /// `on_activate` shared by every coding skill (`Skill::on_activate`,
 /// `core/src/skill.rs`): a handoff is requested by setting `next_skill`
 /// (paired with action `done`); the session consumes it by activating the
@@ -3828,6 +3865,14 @@ impl Skill for RouterSkill {
         ]
     }
 
+    fn skill_with_tool(&self, tool: &str) -> Option<String> {
+        let s = coding_skill_with_tool(tool)?;
+        self.allowed_transitions()
+            .iter()
+            .any(|t| t == s)
+            .then(|| s.to_string())
+    }
+
     /// `router` can never finish the task on its own, the same as `plan`
     /// (see `PlanSkill::is_terminal`'s doc) -- only `review`'s approval
     /// does that. Unconditionally `false`: router only ever hands off via
@@ -4048,6 +4093,14 @@ impl Skill for PlanSkill {
 
     fn allowed_transitions(&self) -> Vec<String> {
         vec!["implement".to_string(), "router".to_string()]
+    }
+
+    fn skill_with_tool(&self, tool: &str) -> Option<String> {
+        let s = coding_skill_with_tool(tool)?;
+        self.allowed_transitions()
+            .iter()
+            .any(|t| t == s)
+            .then(|| s.to_string())
     }
 
     /// `plan` can never finish the task on its own -- only `review`'s
@@ -4447,6 +4500,14 @@ impl Skill for ImplementSkill {
             "plan".to_string(),
             "router".to_string(),
         ]
+    }
+
+    fn skill_with_tool(&self, tool: &str) -> Option<String> {
+        let s = coding_skill_with_tool(tool)?;
+        self.allowed_transitions()
+            .iter()
+            .any(|t| t == s)
+            .then(|| s.to_string())
     }
 
     /// Only `review`'s approval (empty `findings`) finishes the task
@@ -4851,6 +4912,14 @@ impl Skill for ReviewSkill {
 
     fn allowed_transitions(&self) -> Vec<String> {
         vec!["implement".to_string(), "router".to_string()]
+    }
+
+    fn skill_with_tool(&self, tool: &str) -> Option<String> {
+        let s = coding_skill_with_tool(tool)?;
+        self.allowed_transitions()
+            .iter()
+            .any(|t| t == s)
+            .then(|| s.to_string())
     }
 
     fn is_terminal(&self, s: &Self::Workspace) -> bool {

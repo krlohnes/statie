@@ -17,6 +17,7 @@ mod plan_done;
 mod plan_options;
 mod premature_done;
 mod recovery;
+mod rejected_handoff;
 mod review_blind;
 mod review_looks;
 mod review_sendback;

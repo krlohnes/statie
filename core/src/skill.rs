@@ -796,6 +796,17 @@ pub trait Skill: Send + Sync + 'static {
         true
     }
 
+    /// If a rejected `tool` call names a tool this skill doesn't have but
+    /// some skill this one may hand off to (`allowed_transitions()`) does,
+    /// the name of that skill -- so the rejection can tell the model where
+    /// to go instead of just what it can't do here (item 29). Default
+    /// `None`: skills that don't know of such a mapping (or whose
+    /// `allowed_transitions()` doesn't include the skill that has it) leave
+    /// this unimplemented.
+    fn skill_with_tool(&self, _tool: &str) -> Option<String> {
+        None
+    }
+
     /// Absorbs a subagent's finished `Report` into this skill's workspace.
     /// Called by the harness after a `delegate` action completes, never by
     /// the model. Default rejects: only skills that declare

@@ -2732,6 +2732,25 @@ where
         // `park_non_progress_cap` call needs `&mut entries` and
         // `tool_error_entry` borrows `entries` immutably for its lifetime.
         let had_tool_error = tool_error_entry.is_some();
+        // Item 29: a rejected inactive-tool call (`tool_rejected` System
+        // entry) joins this SAME streak, the same way a `tool_error` step
+        // does -- deliberately a SEPARATE search from `tool_error_entry`
+        // above (not a broadened predicate on it), since `tool_error_entry`
+        // also feeds the stalled-path guard below (`had_tool_error`,
+        // restricted to `EDIT_TOOLS`): a rejected `edit_file` call in a
+        // skill that doesn't have it (`plan`, this unit's own worked
+        // example) must not also count as an edit failure ON A PATH for
+        // that unrelated guard. `tool_error_entry` takes priority when
+        // somehow both are present this step (never happens in practice --
+        // a rejected call returns before dispatch, so the same step cannot
+        // also produce a real `tool_error` -- but `or_else` keeps the
+        // ordering explicit rather than assumed).
+        let tool_error_entry = tool_error_entry.or_else(|| {
+            entries.iter().find(|e| {
+                e.kind == LogKind::System
+                    && e.payload.get("event").and_then(Value::as_str) == Some("tool_rejected")
+            })
+        });
         if let Some(e) = tool_error_entry {
             let tool = e
                 .payload
@@ -3123,17 +3142,47 @@ where
                 // regardless, never reaching the real tool registry.
                 let active = self.skill.tools();
                 if name != "think" && !active.iter().any(|a| a == &name) {
+                    // Item 29: the rejection names the skill that actually
+                    // has this tool, when one of the skills this skill may
+                    // hand off to (`allowed_transitions()`) does
+                    // (`Skill::skill_with_tool`) -- so the model is told
+                    // where to go, not just what it can't do here. An empty
+                    // `name` is its own case (the model sent no tool name
+                    // at all, so there is no tool to point anywhere for);
+                    // otherwise, an unknown name with no skill that has it
+                    // falls back to the plain "not available" text.
+                    let skill_with_tool = self.skill.skill_with_tool(&name);
+                    let reason = if let Some(s) = &skill_with_tool {
+                        format!(
+                            "tool `{name}` is not available in skill `{}`; `{s}` has it. \
+                             Finish this skill's job, then hand off: {{\"patch\": \
+                             {{\"next_skill\": \"{s}\"}}, \"action\": {{\"type\": \"done\", \
+                             \"name\": \"\", \"args\": {{}}}}, \"ack_inbox\": []}}",
+                            self.skill.name()
+                        )
+                    } else if name.is_empty() {
+                        format!(
+                            "action.name is empty: put the tool's name in `name` and its \
+                             arguments in `args`; available tools: {active:?}"
+                        )
+                    } else {
+                        format!(
+                            "tool `{name}` is not available in skill `{}`; available tools: \
+                             {active:?}. There is no tool by that name; if `{name}` is a path, \
+                             it belongs in `args`.",
+                            self.skill.name()
+                        )
+                    };
                     entries.push(system_entry(
                         step,
                         "tool_rejected",
-                        serde_json::json!({"name": name, "reason": "not active"}),
+                        serde_json::json!({
+                            "name": name,
+                            "reason": reason,
+                            "skill_with_tool": skill_with_tool,
+                        }),
                     ));
-                    self.session.pending_observation = Some(Observation::rejection(&format!(
-                        "tool `{name}` is not available in skill `{}`; available tools: {:?}. \
-                         If the job needs it, hand off to a skill that has it.",
-                        self.skill.name(),
-                        active
-                    )));
+                    self.session.pending_observation = Some(Observation::user_message(&reason));
                     return Ok(Outcome::Continue);
                 }
 

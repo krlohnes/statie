@@ -1558,6 +1558,19 @@ either a default or a config knob:
   `multi_file_feature` 0 of 2 with the cap never reached, 4 of 6 on
   the last three batteries of the same code.
 
+  qwen3-coder (build 15, the 30B mixture-of-experts build, same
+  settings as the fixer arm except the model). Under `format: schema`,
+  0 of 16 on the eight short tasks: fifteen runs' first rejection was a
+  router `done` without `next_skill`, repeated identically through four
+  rejections, and one run called a tool named `plan` 142 times. Under
+  `format: json`, 11 of 16 at a median of 19 steps, mean peak prompt
+  10.6k against gemma's 6.7k. Temperature 0.7 under schema: 1 of 6.
+  The decoding format is the variable (D24). Three of the five json
+  misses are a rejected `edit_file` in `plan` followed by a question
+  asking permission to hand off (backlog item 29); one is `trap_rounding`
+  timing out with the file path in the tool's `name` field sixty times,
+  which no guard counts.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

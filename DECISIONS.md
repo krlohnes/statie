@@ -509,3 +509,25 @@ holds the resulting design; this file holds why.
 - **Check.** The item 28 binary reruns the same six runs; zero step-1
   parks. Any later model swap starts with the same smoke test.
 
+## D24. The decoding format is a per-model config choice; schema off for Qwen
+
+- **Decision.** `bench/configs/qwen_json.json` is the Qwen
+  configuration: `format: json`, temperature 0.3, everything else the
+  fixer arm's. The code default stays `schema`, which is what gemma
+  was measured on. No per-model logic in code; the recommendation is
+  the file (the split agreed for the window knobs applies here too).
+- **Evidence (build 15, six-run smoke, then sixteen).** qwen3-coder
+  under `schema`: 0 of 6 and 0 of 16, with the first rejection at the
+  router in fifteen of sixteen runs. Under `json`: 4 of 6, then 11 of
+  16 at a median of 19 steps. Temperature 0.7 under `schema`: 1 of 6.
+  Same binary, same prompts, same seeds.
+- **Why.** Ollama's grammar-constrained decoding steers this model into
+  a fixed output (copy the task, send `done`) that it then repeats
+  regardless of the rejection note quoting the exact shape. Without
+  the grammar the same model reads the note and hands off. The config
+  comment already recorded a milder version of this for gemma on
+  Ollama 0.33. Whatever the mechanism, it is a property of the model
+  and host pair, which is what config files are for.
+- **Check.** Any new model starts with the six-run smoke under both
+  formats before a battery is read as a measurement.
+

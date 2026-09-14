@@ -1771,3 +1771,28 @@ Tests: `core/tests/it/tool_rejected.rs` (the three texts, the third
 strike, an interleaved different call), `skills/tests/it/rejected_handoff.rs`
 (`plan` rejecting `edit_file` names `implement` with the exact shape).
 
+## Milestone 37: a question after the plan is the hand-off (BACKLOG.md item 30)
+
+In `PlanSkill::validate`, right after the empty-question check, an
+`ask_user` whose merged plan (state plus this patch, through the shared
+`merged_plan_nonempty` helper the `done` path also uses) is non-empty
+becomes `done` with `next_skill: "implement"` (an existing `next_skill`
+in the patch is kept). The note, `PLAN_ASK_HANDOFF_NOTE_PREFIX` plus
+the first 200 characters of the question, is recorded on the step. An
+`ask_user` with an empty plan is untouched: that is a question the plan
+does not answer, and it still parks for the user.
+
+Why: seven Qwen runs asked, in `plan`, with a four- to six-step plan
+already written, whether they might hand off to `implement`. The item
+29 note named `implement` and quoted the shape, and two runs still
+asked. The plan is the model's own decision; a question after it is a
+request for permission the harness holds.
+
+The `commitment_rules` fixtures that used `ask_user` as a neutral action
+to commit a plan now use a `list_files` call, since an ask beside a plan
+is no longer neutral.
+
+Tests: `skills/tests/it/plan_ask_handoff.rs` (the hand-off with the
+exact note; an existing `next_skill` kept; an empty plan still parks;
+the 200-character quote).
+

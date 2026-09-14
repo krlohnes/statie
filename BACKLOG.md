@@ -342,6 +342,25 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 30. A question asked after the plan is written is the hand-off
+- **Status.** Committed (Milestone 37). Measured next by `qwen_json_short_b17`. Evidence: seven Qwen runs across the json
+  smoke and builds 15 and 16, every one an `ask_user` in `plan` with a
+  four- to six-step plan already written, asking whether it may hand
+  off to `implement` (item 29's note names `implement` and quotes the
+  shape; two runs on build 16 still asked). gemma never asks there.
+- **What.** In `PlanSkill::validate`, an `ask_user` whose merged plan
+  (state plus this patch) is non-empty becomes `done` with
+  `next_skill: "implement"` (kept if the patch already set it), with a
+  note that quotes the first 200 characters of the question and says
+  the plan answered it. An `ask_user` with an empty plan is untouched:
+  that is a question the plan does not answer.
+- **Why.** The plan is the model's own decision about what to do next;
+  a question asked after it is a request for permission, and the
+  harness holds the permission (D14: a question the harness can answer
+  is a harness defect).
+- **Measure.** No `ask_user` park in `plan` with a non-empty plan on
+  the Qwen short battery; gemma unchanged.
+
 ### 29. A rejected tool call names the skill that has the tool, and repeats count
 - **Status.** Committed (Milestone 36). Measured next by `qwen_json_short_b16` and `short_fixer_b16`. Sized by the json-format short battery (build 15): three of five misses are the permission question after a rejected `edit_file` in `plan`; one is a 140-step timeout with the file path in the tool `name` field sixty times.
 - **Evidence.** qwen3-coder under `format: schema`: one run called a tool

@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 31. Line-addressed edits, and an edit that is a whole file is routed to `write_file`
-- **Status.** Building. Evidence (build 17, Qwen json): three of five
+- **Status.** Committed (Milestone 38). Measured next by `qwen_json_short_b18` and `short_fixer_b18`. Evidence (build 17, Qwen json): three of five
   misses are `edit_file` argument shape. The model sends `content`
   (the whole file) or `new` with no `old`/`after`/`before`, gets
   "exactly one of `old`, `after`, `before` must be set", and loops to

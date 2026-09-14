@@ -230,7 +230,7 @@ for the prompt (the full output stays in the session log).
 |---|---|
 | `read_file` | a file, or a window of it (`offset`/`limit`), with line numbers |
 | `write_file` | whole-file write, atomic; for new files or full rewrites |
-| `edit_file` | replace exactly one anchored occurrence; whitespace-tolerant fallback; reports the closest line on a miss |
+| `edit_file` | replace exactly one anchored occurrence (`old`), insert after/before a unique anchor line, or replace a line range (`lines: "START-END"`, allowed only when the file was read since its last edit); whitespace-tolerant fallback; reports the closest line on a miss; whole-file `content` is pointed at `write_file` |
 | `search` | regex over file contents, with `path`/`glob`/`max_results`; root-relative paths |
 | `list_files` | recursive listing, skipping `.git`, `target`, `node_modules`, `__pycache__`, virtualenvs |
 | `filter_last_tool_call` | regex over the full output of the previous tool call, for when it overflowed |

@@ -1796,3 +1796,32 @@ Tests: `skills/tests/it/plan_ask_handoff.rs` (the hand-off with the
 exact note; an existing `next_skill` kept; an empty plan still parks;
 the 200-character quote).
 
+## Milestone 38: line-addressed edits (BACKLOG.md item 31)
+
+`edit_file` has a fourth addressing form: `lines: "START-END"` (or a
+single `"N"`), 1-based and inclusive, replacing that range with `new`
+and preserving the file's trailing-newline convention. The tool's
+argument errors now name all four forms, and an `edit_file` that
+carries `content` with no addressing, or `new` alone, is pointed at
+`write_file` with its shape. `new` is optional at the serde level so
+those messages come from the tool, not from a deserialiser.
+
+The `implement` skill's `edit_lines_needs_fresh_read` trigger, placed
+right after the item 15 `write_file` confirmation, allows a `lines`
+edit only when the file has been read since its last edit, the same
+condition `write_file` uses, now shared as `read_since_last_edit`. A
+stale or never-read file turns the edit into a `read_file` of that
+range with `EDIT_LINES_STALE_NOTE`. The line numbers the model cites
+are the ones the harness printed, and the harness knows whether they
+still hold; the model does not have to copy the lines back.
+
+Why: the model that exposed this wants to address lines or rewrite
+files, and looped on the anchor contract. This is the first unit that
+moves a copying demand from the model into the harness rather than
+adding a guard around the model's failure to copy.
+
+Tests: `tools/tests/it/edit_file.rs` (single line, range, first and
+last line with the newline kept, every error text), `skills/tests/it/edit_lines.rs`
+(a stale `lines` edit becomes the range read with the exact note; after
+the re-read the same edit runs).
+

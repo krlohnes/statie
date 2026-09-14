@@ -1952,3 +1952,219 @@ async fn edit_on_already_unbalanced_file_not_touching_braces_has_no_note() {
     let text = out.to_string();
     assert!(!text.contains("brace balance"), "output was:\n{text}");
 }
+
+// =======================================================================
+// Unit 31: `lines`-addressed edits.
+// =======================================================================
+
+#[tokio::test]
+async fn lines_replaces_a_single_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("lines_single.txt");
+    std::fs::write(&file, "a\nb\nc\n").unwrap();
+
+    let out = edit_tool()
+        .call(
+            json!({"path": "lines_single.txt", "lines": "2", "new": "B"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    let first_line = text.lines().next().unwrap();
+    assert_eq!(first_line, "edited lines_single.txt: replaced lines 2-2");
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, "a\nB\nc\n");
+}
+
+#[tokio::test]
+async fn lines_replaces_a_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("lines_range.txt");
+    std::fs::write(&file, "a\nb\nc\nd\n").unwrap();
+
+    let out = edit_tool()
+        .call(
+            json!({"path": "lines_range.txt", "lines": "2-3", "new": "X\nY"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    let first_line = text.lines().next().unwrap();
+    assert_eq!(first_line, "edited lines_range.txt: replaced lines 2-3");
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, "a\nX\nY\nd\n");
+}
+
+#[tokio::test]
+async fn lines_replaces_the_first_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("lines_first.txt");
+    std::fs::write(&file, "a\nb\nc\n").unwrap();
+
+    let out = edit_tool()
+        .call(
+            json!({"path": "lines_first.txt", "lines": "1-1", "new": "A"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    let first_line = text.lines().next().unwrap();
+    assert_eq!(first_line, "edited lines_first.txt: replaced lines 1-1");
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, "A\nb\nc\n");
+}
+
+#[tokio::test]
+async fn lines_replaces_the_last_line_and_preserves_trailing_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("lines_last.txt");
+    std::fs::write(&file, "a\nb\nc\n").unwrap();
+
+    let out = edit_tool()
+        .call(
+            json!({"path": "lines_last.txt", "lines": "3-3", "new": "C"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let text = out.to_string();
+    let first_line = text.lines().next().unwrap();
+    assert_eq!(first_line, "edited lines_last.txt: replaced lines 3-3");
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        on_disk, "a\nb\nC\n",
+        "the file's trailing newline convention must be kept"
+    );
+}
+
+#[tokio::test]
+async fn lines_out_of_range_is_invalid_args_and_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("lines_oob.txt");
+    let content = "a\nb\nc\n";
+    std::fs::write(&file, content).unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({"path": "lines_oob.txt", "lines": "4-5", "new": "x"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::InvalidArgs(msg) => {
+            assert_eq!(msg, "lines 4-5 is outside lines_oob.txt (3 lines)")
+        }
+        other => panic!("expected InvalidArgs, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content, "file must be unchanged on error");
+}
+
+#[tokio::test]
+async fn content_with_no_addressing_field_is_invalid_args_with_exact_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("content_only.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({"path": "content_only.txt", "content": "whole new content\n"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::InvalidArgs(msg) => assert_eq!(
+            msg,
+            "`edit_file` changes part of a file: give `new` with one of `old` (exact text to replace), `after`/`before` (an anchor line), or `lines` (\"START-END\" as shown by read_file). To replace the whole file, call `write_file` with `path` and `content`."
+        ),
+        other => panic!("expected InvalidArgs, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_only_with_no_addressing_field_is_invalid_args_with_exact_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("new_only.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+
+    let err = edit_tool()
+        .call(json!({"path": "new_only.txt", "new": "x"}), &ctx)
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::InvalidArgs(msg) => assert_eq!(
+            msg,
+            "`edit_file` changes part of a file: give `new` with one of `old` (exact text to replace), `after`/`before` (an anchor line), or `lines` (\"START-END\" as shown by read_file). To replace the whole file, call `write_file` with `path` and `content`."
+        ),
+        other => panic!("expected InvalidArgs, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn two_addressing_fields_is_invalid_args_with_exact_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("two_forms.txt");
+    std::fs::write(&file, "a\nb\n").unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({"path": "two_forms.txt", "after": "a", "lines": "1", "new": "x"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::InvalidArgs(msg) => assert_eq!(
+            msg,
+            "exactly one of `old`, `after`, `before`, `lines` must be set"
+        ),
+        other => panic!("expected InvalidArgs, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn missing_new_with_lines_is_invalid_args_with_exact_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("missing_new.txt");
+    std::fs::write(&file, "a\nb\n").unwrap();
+
+    let err = edit_tool()
+        .call(json!({"path": "missing_new.txt", "lines": "1"}), &ctx)
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::InvalidArgs(msg) => assert_eq!(
+            msg,
+            "`new` is required: the replacement text (with `old` or `lines`) or the text to insert (with `after`/`before`)"
+        ),
+        other => panic!("expected InvalidArgs, got: {other:?}"),
+    }
+}

@@ -15,13 +15,14 @@ pub struct EditFileArgs {
     #[serde(alias = "file", alias = "file_path")]
     pub path: String,
     /// Exact text to replace with `new` (must occur exactly once). Use
-    /// this OR `after`/`before`.
+    /// this OR `after`/`before`/`lines`.
     /// if `old` is given, `after`/`before` are ignored.
     #[serde(default)]
     pub old: Option<String>,
-    /// Replacement text (with `old`) or the text to insert (with
-    /// `after`/`before`).
-    pub new: String,
+    /// Replacement text (with `old` or `lines`) or the text to insert
+    /// (with `after`/`before`).
+    #[serde(default)]
+    pub new: Option<String>,
     /// One or more consecutive lines (copied verbatim from read_file,
     /// without line numbers) that occur exactly once in the file; `new` is
     /// inserted after them. Easiest way to add code: anchor on one line.
@@ -32,6 +33,15 @@ pub struct EditFileArgs {
     /// inserted before them. Easiest way to add code: anchor on one line.
     #[serde(default)]
     pub before: Option<String>,
+    /// 1-based, inclusive line range to replace with `new`, as
+    /// "START-END" (or "N" for a single line), copied from read_file's
+    /// line numbers.
+    #[serde(default)]
+    pub lines: Option<String>,
+    /// Accepted only so a whole-file `content` gets the redirect-to-
+    /// write_file error below; never applied.
+    #[serde(default)]
+    pub content: Option<String>,
 }
 
 /// Replaces a single exact occurrence of `old` with `new` in an existing
@@ -47,7 +57,7 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &str {
-        "Edit a file in place: replace one exact occurrence of `old` with `new`, or insert `new` after/before a single unique anchor line (`after`/`before`). Prefer the anchor form for additions."
+        "Edit a file in place: replace one exact occurrence of `old` with `new`, insert `new` after/before a single unique anchor line (`after`/`before`), or replace a 1-based inclusive line range (`lines`, \"START-END\") with `new`. Prefer the anchor form for additions."
     }
 
     fn args_schema(&self) -> Schema {
@@ -55,7 +65,10 @@ impl Tool for EditFile {
     }
 
     async fn call(&self, mut args: Value, ctx: &ToolCtx) -> Result<ToolOutputFull, ToolError> {
-        join_string_array_args(&mut args, &["path", "old", "new", "after", "before"]);
+        join_string_array_args(
+            &mut args,
+            &["path", "old", "new", "after", "before", "lines"],
+        );
         let mut args: EditFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
 
@@ -63,6 +76,7 @@ impl Tool for EditFile {
             args.old.is_some(),
             args.after.is_some(),
             args.before.is_some(),
+            args.lines.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
@@ -106,15 +120,38 @@ impl Tool for EditFile {
             args.old.is_some(),
             args.after.is_some(),
             args.before.is_some(),
+            args.lines.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
         .count();
-        if mode_count != 1 {
+
+        // `content` set (whole-file rewrite attempted via edit_file) or
+        // `new` present with no addressing field at all: redirect to
+        // write_file with the same exact message either way.
+        if mode_count == 0 && (args.content.is_some() || args.new.is_some()) {
             return Err(ToolError::InvalidArgs(
-                "exactly one of `old`, `after`, `before` must be set".to_string(),
+                "`edit_file` changes part of a file: give `new` with one of `old` (exact text to \
+                 replace), `after`/`before` (an anchor line), or `lines` (\"START-END\" as shown \
+                 by read_file). To replace the whole file, call `write_file` with `path` and \
+                 `content`."
+                    .to_string(),
             ));
         }
+
+        if mode_count != 1 {
+            return Err(ToolError::InvalidArgs(
+                "exactly one of `old`, `after`, `before`, `lines` must be set".to_string(),
+            ));
+        }
+
+        let Some(new) = args.new.clone() else {
+            return Err(ToolError::InvalidArgs(
+                "`new` is required: the replacement text (with `old` or `lines`) or the text to \
+                 insert (with `after`/`before`)"
+                    .to_string(),
+            ));
+        };
 
         if let Some(old) = &args.old
             && old.is_empty()
@@ -147,20 +184,59 @@ impl Tool for EditFile {
         let content = String::from_utf8(bytes)
             .map_err(|_| ToolError::ExecutionFailed(format!("not valid utf-8: {}", args.path)))?;
 
-        let (new_content, start_line, end_line, header) = if let Some(old) = &args.old {
+        let (new_content, start_line, end_line, header) = if let Some(lines_arg) = &args.lines {
+            let (start, end) = parse_lines_range(lines_arg)?;
+            let file_lines: Vec<&str> = content.lines().collect();
+            let total = file_lines.len();
+            if start < 1 || end < start || end > total {
+                return Err(ToolError::InvalidArgs(format!(
+                    "lines {start}-{end} is outside {} ({total} lines)",
+                    args.path
+                )));
+            }
+
+            let ends_with_newline = content.ends_with('\n');
+            let mut new_content = String::new();
+            for line in &file_lines[..start - 1] {
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
+            new_content.push_str(&new);
+            if end < total {
+                if !new.ends_with('\n') {
+                    new_content.push('\n');
+                }
+                for (i, line) in file_lines[end..].iter().enumerate() {
+                    new_content.push_str(line);
+                    if i + 1 < file_lines[end..].len() || ends_with_newline {
+                        new_content.push('\n');
+                    }
+                }
+            } else if ends_with_newline && !new.ends_with('\n') {
+                new_content.push('\n');
+            }
+
+            let header = format!("edited {}: replaced lines {start}-{end}", args.path);
+            (
+                new_content,
+                start,
+                start + new.matches('\n').count(),
+                header,
+            )
+        } else if let Some(old) = &args.old {
             let match_positions: Vec<usize> = content
                 .match_indices(old.as_str())
                 .map(|(i, _)| i)
                 .collect();
 
             match match_positions.len() {
-                0 => match whitespace_tolerant_replace(&content, old, &args.new) {
+                0 => match whitespace_tolerant_replace(&content, old, &new) {
                     WhitespaceMatch::Unique {
                         new_content,
                         start_line,
                         end_line,
                     } => {
-                        let header = if args.new.is_empty() {
+                        let header = if new.is_empty() {
                             let deleted = end_line - start_line + 1;
                             format!(
                                 "edited {}: deleted {deleted} line(s) (lines {start_line}-{end_line})",
@@ -199,9 +275,9 @@ impl Tool for EditFile {
                                 new_content.push_str(line);
                                 new_content.push('\n');
                             }
-                            new_content.push_str(&args.new);
+                            new_content.push_str(&new);
                             if end_line < file_lines.len() {
-                                if !args.new.ends_with('\n') {
+                                if !new.ends_with('\n') {
                                     new_content.push('\n');
                                 }
                                 for (i, line) in file_lines[end_line..].iter().enumerate() {
@@ -210,11 +286,11 @@ impl Tool for EditFile {
                                         new_content.push('\n');
                                     }
                                 }
-                            } else if ends_with_newline && !args.new.ends_with('\n') {
+                            } else if ends_with_newline && !new.ends_with('\n') {
                                 new_content.push('\n');
                             }
 
-                            let header = if args.new.is_empty() {
+                            let header = if new.is_empty() {
                                 let deleted = end_line - start_line + 1;
                                 format!(
                                     "edited {}: deleted {deleted} line(s) (lines {start_line}-{end_line})",
@@ -267,16 +343,16 @@ impl Tool for EditFile {
                     let match_end = match_start + old.len();
 
                     let mut new_content =
-                        String::with_capacity(content.len() - old.len() + args.new.len());
+                        String::with_capacity(content.len() - old.len() + new.len());
                     new_content.push_str(&content[..match_start]);
-                    new_content.push_str(&args.new);
+                    new_content.push_str(&new);
                     new_content.push_str(&content[match_end..]);
 
                     // 1-based starting line of the replaced region: count
                     // newlines before the match start.
                     let start_line = content[..match_start].matches('\n').count() + 1;
 
-                    if args.new.is_empty() {
+                    if new.is_empty() {
                         // Deletion: report the span of the removed `old`
                         // text rather than the (empty) replacement.
                         let old_line_count = old.matches('\n').count() + 1;
@@ -288,7 +364,7 @@ impl Tool for EditFile {
                         (new_content, start_line, end_line, header)
                     } else {
                         // The new text spans this many lines (at least 1).
-                        let new_line_count = args.new.matches('\n').count() + 1;
+                        let new_line_count = new.matches('\n').count() + 1;
                         let end_line = start_line + new_line_count - 1;
                         let header = format!(
                             "edited {}: replaced 1 occurrence (lines {start_line}-{end_line})",
@@ -309,7 +385,7 @@ impl Tool for EditFile {
             let insert_after = args.after.is_some();
 
             let (stripped_new, repeated_anchor_note) =
-                strip_repeated_anchor(anchor, &args.new, insert_after)?;
+                strip_repeated_anchor(anchor, &new, insert_after)?;
 
             check_not_already_present(&content, stripped_new, &args.path)?;
             check_no_duplicate_definition(&content, stripped_new, &args.path)?;
@@ -354,6 +430,30 @@ impl Tool for EditFile {
 
         Ok(ToolOutputFull::new(cap_output(out, self.max_output_bytes)))
     }
+}
+
+/// Parses a `lines` argument ("START-END", or "N" for a single line) into a
+/// 1-based, inclusive `(start, end)` pair. Accepts optional surrounding
+/// whitespace around the number(s) and the dash. Any other shape (empty,
+/// non-numeric, a dash with no second number, `end < start`, zero, etc.) is
+/// `ToolError::InvalidArgs` naming the raw text.
+fn parse_lines_range(raw: &str) -> Result<(usize, usize), ToolError> {
+    let invalid = || {
+        ToolError::InvalidArgs(format!(
+            "lines must be \"START-END\" or \"N\" (1-based line numbers), got \"{raw}\""
+        ))
+    };
+    let trimmed = raw.trim();
+    let (start_str, end_str) = match trimmed.split_once('-') {
+        Some((s, e)) => (s.trim(), e.trim()),
+        None => (trimmed, trimmed),
+    };
+    let start: usize = start_str.parse().map_err(|_| invalid())?;
+    let end: usize = end_str.parse().map_err(|_| invalid())?;
+    if start < 1 || end < start {
+        return Err(invalid());
+    }
+    Ok((start, end))
 }
 
 /// If `new` (whitespace-tolerant, per-line) begins (in `after` mode) or ends

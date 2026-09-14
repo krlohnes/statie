@@ -6,6 +6,7 @@ mod decision;
 mod delegate;
 mod done_stays_done;
 mod early_park;
+mod edit_lines;
 mod error_think;
 mod grounded_findings;
 mod harness_owned;

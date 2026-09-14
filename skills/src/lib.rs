@@ -7,7 +7,7 @@ mod toy;
 
 pub use child::{ChildBudgets, ChildSkill, ChildSkillConfig, ChildSkillError};
 pub use coding::{
-    CodingWorkspace, Decision, FileNote, ImplementSkill, NO_GREEN_QUESTION,
+    CodingWorkspace, Decision, EDIT_LINES_STALE_NOTE, FileNote, ImplementSkill, NO_GREEN_QUESTION,
     PLAN_ASK_HANDOFF_NOTE_PREFIX, PlanSkill, PlanStep, REPEAT_FAILURE_QUESTION,
     REPEATED_ERROR_QUESTION, REPEATED_SKIP_QUESTION, ReviewSkill, RouterSkill,
     STALLED_PATH_QUESTION, SeenFile, StepStatus, TestRecord, coding_skill_with_tool, coding_skills,

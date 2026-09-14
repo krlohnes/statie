@@ -446,25 +446,32 @@ fn seen_entry<'a>(seen: &'a mut Vec<SeenFile>, path: &str) -> &'a mut SeenFile {
     seen.last_mut().expect("just pushed")
 }
 
+/// Shared per-file freshness condition (BACKLOG.md item 15, reused by unit
+/// 31's `edit_lines_needs_fresh_read`): whether `entry`'s most recent
+/// change of any kind was a read, i.e. either `edited` is empty (never
+/// edited this session) or `read_step == Some(entry.step)` -- the entry's
+/// most recent change of any kind was a full or partial read, so it came
+/// after whatever edit(s) preceded it. An edit-then-reread of the same file
+/// is confirmed by the second half of that OR: the read is the latest
+/// change, even though `edited` itself is left non-empty (`edit_file` never
+/// clears it). A further edit after the read moves `step`/`entry.step`
+/// past `read_step` again, so it goes back to needing a fresh read.
+fn read_since_last_edit(entry: &SeenFile) -> bool {
+    entry.edited.is_empty() || entry.read_step == Some(entry.step)
+}
+
 /// BACKLOG.md item 15: whether `seen` already establishes that a
 /// `write_file` on `path` is safe to allow past `tools/src/write_file.rs`'s
 /// whole-file-rewrite line cap -- the harness has recorded a `read_file` of
 /// the *whole* file (every line from 1 to the entry's `lines`, via one or
 /// several coalesced `read` ranges) since the last time any part of it was
-/// edited. That is: `read` (coalesced) covers 1..=lines, AND either
-/// `edited` is empty (never edited this session) or `read_step ==
-/// Some(entry.step)` -- the entry's most recent change of any kind was
-/// that full read, so it came after whatever edit(s) preceded it. An
-/// edit-then-full-reread of the same file is confirmed by the second half
-/// of that OR: the read is the latest change, even though `edited` itself
-/// is left non-empty (`edit_file` never clears it). A further edit after
-/// the read moves `step`/`entry.step` past `read_step` again, so it goes
-/// back to needing a fresh full read.
+/// edited. That is: `read` (coalesced) covers 1..=lines, AND
+/// `read_since_last_edit` holds.
 pub fn write_file_confirmed_by_seen(seen: &[SeenFile], path: &str) -> bool {
     let Some(entry) = seen.iter().find(|f| f.path == path) else {
         return false;
     };
-    if !entry.edited.is_empty() && entry.read_step != Some(entry.step) {
+    if !read_since_last_edit(entry) {
         return false;
     }
     if entry.lines == 0 {
@@ -2371,6 +2378,80 @@ fn write_file_auto_confirm(
         }
     }
     out.set_action(statie_core::Action::Tool { name, args });
+}
+
+/// Unit 31: the exact note text substituted by [`edit_lines_needs_fresh_read`],
+/// with `{path}` filled in.
+pub const EDIT_LINES_STALE_NOTE: &str = "`lines` addresses the file as last read, and {path} was edited since; the harness read that range again. Send the edit against the fresh window.";
+
+/// Parses an `edit_file` `lines` argument ("START-END" or "N") into a
+/// 1-based, inclusive `(start, end)` pair. Mirrors `tools/src/edit_file.rs`'s
+/// own parsing closely enough for this trigger's purposes; a value this
+/// can't parse is left alone here (the tool itself will reject it with its
+/// own error when the call actually runs).
+fn parse_lines_arg(raw: &str) -> Option<(u64, u64)> {
+    let trimmed = raw.trim();
+    let (start_str, end_str) = match trimmed.split_once('-') {
+        Some((s, e)) => (s.trim(), e.trim()),
+        None => (trimmed, trimmed),
+    };
+    let start: u64 = start_str.parse().ok()?;
+    let end: u64 = end_str.parse().ok()?;
+    if start < 1 || end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Unit 31: run right after `write_file_auto_confirm`, using the same
+/// per-file freshness condition it uses (`read_since_last_edit`, against
+/// `SeenFile.read_step`/`edited` -- see that function's doc). When `out`'s
+/// action is `Tool { name: "edit_file", args }` with a `lines` field set,
+/// and `cur.agent.seen` shows the target path either has no entry or was
+/// NOT read since its last edit, the call is substituted with `read_file
+/// {path, offset: START, limit: END-START+1 (min 1)}` (from the `lines`
+/// range) and [`EDIT_LINES_STALE_NOTE`] (with `{path}` filled in) is
+/// returned as the step's note -- `lines` addresses the file by the line
+/// numbers the model last saw, so an edit against a stale read would land
+/// on the wrong lines; re-reading the same range refreshes it before the
+/// model tries again. A `lines` value this can't parse, or an `edit_file`
+/// action with no `lines` at all, is left alone -- the tool itself handles
+/// the former, and the latter isn't this trigger's concern.
+fn edit_lines_needs_fresh_read(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    let statie_core::Action::Tool { name, args } = out.action() else {
+        return None;
+    };
+    if name != "edit_file" {
+        return None;
+    }
+    let path = args.get("path").and_then(serde_json::Value::as_str)?;
+    let lines_arg = args.get("lines").and_then(serde_json::Value::as_str)?;
+    let (start, end) = parse_lines_arg(lines_arg)?;
+
+    let fresh = cur
+        .agent
+        .seen
+        .iter()
+        .find(|f| f.path == path)
+        .is_some_and(read_since_last_edit);
+    if fresh {
+        return None;
+    }
+
+    let path = path.to_string();
+    let limit = (end - start + 1).max(1);
+    let note = EDIT_LINES_STALE_NOTE.replace("{path}", &path);
+    Some(substitute_action(
+        out,
+        statie_core::Action::Tool {
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": path, "offset": start, "limit": limit}),
+        },
+        note,
+    ))
 }
 
 /// Applies `out`'s raw patch to `cur` the same way `strip_malformed_next`
@@ -4688,6 +4769,13 @@ impl Skill for ImplementSkill {
     /// consults the harness's own record of what the model has read instead
     /// of a fixed line count, silently (no note either way; the tool's own
     /// refusal explains the rule when the flag isn't set). Then
+    /// `edit_lines_needs_fresh_read` (unit 31): an `edit_file` action with a
+    /// `lines` field on a path that was NOT read since its last edit
+    /// (`read_since_last_edit`, the same freshness condition `write_file_
+    /// auto_confirm` uses) is substituted with the equivalent `read_file` of
+    /// that range, with `EDIT_LINES_STALE_NOTE` as the step's note -- `lines`
+    /// addresses the file by the line numbers the model last saw, so an edit
+    /// against a stale read would land on the wrong lines. Then
     /// `implement_repeat_failure_thinks`: with a repeated test failure open
     /// and no `think` since, an edit, an idle test rerun, or a non-question
     /// `ask_user` is replaced with a `think` call instead (see its doc for
@@ -4753,6 +4841,13 @@ impl Skill for ImplementSkill {
         let strip_note = strip_malformed_next(&cur.agent, &mut out);
         let shell_read_note = shell_read_substitution(&mut out);
         write_file_auto_confirm(cur, &mut out);
+        // Unit 31: an `edit_file` with `lines` on a file not read since its
+        // last edit is substituted with the equivalent `read_file` of that
+        // range -- run right after `write_file_auto_confirm`, mirroring its
+        // wiring; the two never target the same action shape (`write_file`
+        // vs. `edit_file`), so ordering between them never matters in
+        // practice.
+        let edit_lines_stale_note = edit_lines_needs_fresh_read(cur, &mut out);
         // Unit 20: a model-chosen `try_fixes` with no failing `tests` record
         // to work from is substituted for `test` before anything else below
         // gets a chance to see (or itself construct) a `try_fixes` action --
@@ -4832,6 +4927,7 @@ impl Skill for ImplementSkill {
             .into_iter()
             .chain(strip_note)
             .chain(shell_read_note)
+            .chain(edit_lines_stale_note)
             .chain(try_fixes_gate_note)
             .chain(repeated_skip_think_note)
             .chain(repeated_error_think_note)

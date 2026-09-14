@@ -342,6 +342,28 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 31. Line-addressed edits, and an edit that is a whole file is routed to `write_file`
+- **Status.** Building. Evidence (build 17, Qwen json): three of five
+  misses are `edit_file` argument shape. The model sends `content`
+  (the whole file) or `new` with no `old`/`after`/`before`, gets
+  "exactly one of `old`, `after`, `before` must be set", and loops to
+  the stalled-path park. gemma copies anchors; Qwen wants to address
+  lines or rewrite the file. The harness numbers every line it shows
+  and knows whether the file changed since; it can take the copying.
+- **What.** (a) `edit_file` accepts `lines: "START-END"` (1-based,
+  inclusive, or a single `"N"`) as a third addressing form: those lines
+  are replaced by `new`. The `implement` skill allows it only when the
+  file has been read since its last edit (the condition `write_file`
+  already uses), and otherwise substitutes a read of that range with a
+  note. (b) The argument error names every form and points whole-file
+  content at `write_file`: an `edit_file` carrying `content` and no
+  addressing gets a note that quotes the `write_file` shape.
+- **Why.** The prime directive: the harness manages state so the model
+  does not have to copy it back. A line reference is state the harness
+  can verify; a verbatim anchor is state the model must reproduce.
+- **Measure.** Qwen short battery: `edit_file` argument errors per run
+  and landing; gemma unchanged.
+
 ### 30. A question asked after the plan is written is the hand-off
 - **Status.** Committed (Milestone 37). Measured (`qwen_json_short_b17`): 11 of 16; the trigger never fired because no run asked in `plan`; the plan-phase rejections handed off on the item 29 note instead. Kept on the seven-run evidence; it costs nothing when it does not fire. Evidence: seven Qwen runs across the json
   smoke and builds 15 and 16, every one an `ask_user` in `plan` with a

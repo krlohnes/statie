@@ -248,7 +248,7 @@ pub async fn run_shell(
 ) -> Result<String, ToolError> {
     if let Some(tool) = detect_in_place_editor(cmd) {
         return Err(ToolError::ExecutionFailed(format!(
-            "refused: `{tool}` edits a file in place from remembered line numbers. Use edit_file (old/new, or after/before + new) so the change is anchored on the file's current text."
+            "refused: `{tool}` edits a file in place from remembered line numbers. Use edit_file (old/new, after/before + new, or lines + new) so the change is checked against the file's current text."
         )));
     }
 

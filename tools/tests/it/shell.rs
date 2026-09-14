@@ -240,7 +240,7 @@ async fn sed_i_is_refused_and_leaves_file_untouched() {
         matches!(
             err,
             ToolError::ExecutionFailed(ref msg)
-                if msg == "refused: `sed -i` edits a file in place from remembered line numbers. Use edit_file (old/new, or after/before + new) so the change is anchored on the file's current text."
+                if msg == "refused: `sed -i` edits a file in place from remembered line numbers. Use edit_file (old/new, after/before + new, or lines + new) so the change is checked against the file's current text."
         ),
         "got: {err:?}"
     );

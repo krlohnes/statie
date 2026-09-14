@@ -153,6 +153,51 @@ async fn router_ask_user_is_rejected_not_parked() {
     );
 }
 
+/// A router `done` with no `next_skill` is rejected with the hand-off note,
+/// and that note offers neither `yield` nor `ask_user`: the router allows
+/// neither, so the pause clause is empty (`core/src/skill.rs`,
+/// `validate_default`, item 28). Exact text, so a change to either flag or
+/// to the note's wording breaks a visible assertion.
+#[tokio::test]
+async fn router_done_without_next_skill_note_offers_no_pause_action() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![MockTurn::new(
+        json!({"patch": {}, "action": {"type": "done"}}).to_string(),
+    )];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_router_session(Arc::clone(&model), session_config(&root));
+
+    let skill: Arc<RouterSkill> = Arc::new(RouterSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let entries = rec.entries().to_vec();
+    let outcome = log.append_record(rec).unwrap();
+    assert!(matches!(outcome, Outcome::Continue), "{outcome:?}");
+
+    let rejected = entries
+        .iter()
+        .find(|e| {
+            e.kind == LogKind::System
+                && e.payload.get("event").and_then(Value::as_str) == Some("rejected")
+        })
+        .expect("expected a rejected system log entry");
+    let reason = rejected
+        .payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        reason,
+        "skill rule violated: action `done` is only valid when the workspace is terminal or \
+         hands off: set `next_skill` to one of [\"plan\", \"implement\", \"review\"] (you are \
+         `router`) and send `done` again, or keep working with a tool\n\
+         Exact shape: {\"patch\": {\"next_skill\": \"plan\"}, \"action\": {\"type\": \"done\", \
+         \"name\": \"\", \"args\": {}}, \"ack_inbox\": []}"
+    );
+}
+
 /// `allows_ask_user()` is `false` for `RouterSkill` and `true` for
 /// `PlanSkill`/`ImplementSkill` (the default the `Skill` trait provides,
 /// left un-overridden by either).

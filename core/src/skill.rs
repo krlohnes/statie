@@ -1003,10 +1003,13 @@ where
                  condition"
                     .to_string()
             } else {
-                let pause = if skill.yield_allowed() {
-                    "`yield`/`ask_user`"
-                } else {
-                    "`ask_user`"
+                // Only offer the pause actions this skill's own rules accept
+                // (item 28: the router can neither `yield` nor `ask_user`).
+                let pause = match (skill.yield_allowed(), skill.ask_user_allowed()) {
+                    (true, true) => ", or use `yield`/`ask_user`",
+                    (true, false) => ", or use `yield`",
+                    (false, true) => ", or use `ask_user`",
+                    (false, false) => "",
                 };
                 let first_target = transitions
                     .first()
@@ -1014,7 +1017,7 @@ where
                 format!(
                     "action `done` is only valid when the workspace is terminal or hands off: \
                      set `next_skill` to one of {:?} (you are `{}`) and send `done` again, or \
-                     keep working with a tool, or use {pause}\n\
+                     keep working with a tool{pause}\n\
                      Exact shape: {{\"patch\": {{\"next_skill\": \"{first_target}\"}}, \
                      \"action\": {{\"type\": \"done\", \"name\": \"\", \"args\": {{}}}}, \
                      \"ack_inbox\": []}}",

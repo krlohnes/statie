@@ -155,15 +155,18 @@ fn set_next_and_read_turn(next: Value, path: &str) -> MockTurn {
 }
 
 /// A single-step turn: patches `plan` to the given raw JSON array and takes
-/// action `ask_user` (never rejected by the yield/tool gates, so the only
+/// a `list_files` call (never rejected by the yield/tool gates, so the only
 /// thing that can reject the step is the rule under test). Used by the
 /// `plan_rules` tests (`skills/src/coding/mod.rs`) to first commit a plan,
 /// then attempt a regression against it in a following turn.
 fn set_plan_turn(plan: Value) -> MockTurn {
+    // A `list_files` call, not `ask_user`: since item 30, an `ask_user`
+    // sent alongside a non-empty plan is the hand-off to `implement`, and
+    // these tests need to stay in `plan` for their second turn.
     MockTurn::new(
         json!({
             "patch": {"plan": plan},
-            "action": {"type": "ask_user", "message": "confirm?"},
+            "action": {"type": "tool", "name": "list_files", "args": {"path": "."}},
         })
         .to_string(),
     )

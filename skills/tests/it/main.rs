@@ -13,6 +13,7 @@ mod implement_done;
 mod no_green;
 mod no_green_runs_test;
 mod no_green_think;
+mod plan_ask_handoff;
 mod plan_done;
 mod plan_options;
 mod premature_done;

@@ -2393,6 +2393,22 @@ fn merged_workspace(
     })
 }
 
+/// Whether applying `out`'s raw patch to `cur` (via `merged_workspace`)
+/// yields a non-empty `plan`. Shared by `PlanSkill::validate`'s `is_done`
+/// block (unit 22) and its `ask_user`-with-a-written-plan hand-off (unit
+/// 30): both need the same peek at the merged plan before deciding how to
+/// treat the step's action. `None` (patch fails to deserialize/apply) is
+/// distinct from `Some(false)` (patch applies cleanly to an empty plan) --
+/// callers that only care about the non-empty case can collapse the two
+/// with `== Some(true)`; the `is_done` block still needs to keep them
+/// separate so a malformed patch falls through to `validate_default`.
+fn merged_plan_nonempty(
+    cur: &CodingWorkspace,
+    out: &statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<bool> {
+    merged_workspace(cur, out).map(|next| !next.plan.is_empty())
+}
+
 /// Whether `merged.next_skill` names a real handoff for `skill_name`: `Some`
 /// naming any OTHER skill counts; `None`, or `Some` naming `skill_name`
 /// itself, does not -- a self-handoff is never valid (`common_handoff`
@@ -4018,6 +4034,15 @@ impl PlanSkill {
     }
 }
 
+/// The note `PlanSkill::validate` attaches when it converts an `ask_user`
+/// into the plan-is-written hand-off (unit 30, "a question asked after the
+/// plan is written is the hand-off"): followed by the first 200 characters
+/// (chars, not bytes) of the `ask_user` message, plus `…` if that truncated
+/// it.
+pub const PLAN_ASK_HANDOFF_NOTE_PREFIX: &str = "The plan is written, so the harness handed off \
+     to `implement` instead of asking. The plan answers the question; `implement` has the \
+     editing tools. The question was: ";
+
 impl Skill for PlanSkill {
     type Workspace = CodingWorkspace;
     type Patch = JsonMergePatch<CodingWorkspace>;
@@ -4198,6 +4223,24 @@ impl Skill for PlanSkill {
     /// "I will now proceed to implement") without ever adding the field the
     /// rejection asked for.
     ///
+    /// Right after `ask_user_empty_note` and before this `is_done` block
+    /// (unit 30, "a question asked after the plan is written is the
+    /// hand-off"): a model whose plan is already written sometimes asks
+    /// permission to move on instead of just handing off ("Should I hand
+    /// off to the implement skill now?") -- an `ask_user` the harness can
+    /// answer itself, since the plan already answers it. If `out.action()`
+    /// is `Action::AskUser { message }` and the merged plan (via
+    /// `merged_plan_nonempty`, the same helper the `is_done` block below
+    /// uses) is non-empty, the step is converted to the intended hand-off
+    /// instead of parking: inject `next_skill: "implement"` into the raw
+    /// patch when the patch does not already name one (an explicit
+    /// `next_skill` already in the patch, e.g. `"review"`, is left alone),
+    /// set the action to `Action::Done`, and attach
+    /// `PLAN_ASK_HANDOFF_NOTE_PREFIX` followed by the first 200 characters
+    /// of `message` (plus `…` if truncated) as the step's note. An
+    /// `ask_user` with an EMPTY merged plan is left untouched here -- it
+    /// parks as `Park::AskUser`, same as always.
+    ///
     /// An EMPTY merged plan is handled the same way `premature_done_note`
     /// handles a premature `done` in `implement`: `done` (with or without
     /// `next_skill` -- a model sending both together, having read the
@@ -4239,6 +4282,34 @@ impl Skill for PlanSkill {
             out.set_action(statie_core::Action::Continue { note });
         }
 
+        // Unit 30, "a question asked after the plan is written is the
+        // hand-off": an `ask_user` whose message is a real question (the
+        // empty/statement cases above already converted anything else) but
+        // whose merged plan is already non-empty gets converted straight to
+        // the intended hand-off instead of parking -- the plan answers the
+        // question, and `implement` is the skill with the editing tools.
+        // An empty merged plan is left alone here: it parks as
+        // `Park::AskUser`, same as always.
+        if let statie_core::Action::AskUser { message } = out.action()
+            && merged_plan_nonempty(&cur.agent, &out) == Some(true)
+        {
+            let message = message.clone();
+            if out.patch().0.get("next_skill").is_none()
+                && let Some(obj) = out.patch_mut().0.as_object_mut()
+            {
+                obj.insert(
+                    "next_skill".to_string(),
+                    serde_json::Value::String("implement".to_string()),
+                );
+            }
+            out.set_action(statie_core::Action::Done);
+            let mut quoted: String = message.chars().take(200).collect();
+            if message.chars().count() > 200 {
+                quoted.push('…');
+            }
+            notes.push(format!("{PLAN_ASK_HANDOFF_NOTE_PREFIX}{quoted}"));
+        }
+
         let is_done = matches!(out.action(), statie_core::Action::Done);
         if is_done {
             // Apply the patch strategy the same way `validate_default` is
@@ -4246,17 +4317,7 @@ impl Skill for PlanSkill {
             // non-empty. A patch that fails to deserialize/apply is left
             // alone here -- it falls straight through to
             // `validate_default` below, which reports the real error.
-            let merged_plan_nonempty = serde_json::from_value::<
-                <Self::Patch as statie_core::PatchStrategy<CodingWorkspace>>::Patch,
-            >(out.patch().0.clone())
-            .ok()
-            .and_then(|patch| {
-                <Self::Patch as statie_core::PatchStrategy<CodingWorkspace>>::apply(
-                    &cur.agent, &patch,
-                )
-                .ok()
-            })
-            .map(|next| !next.plan.is_empty());
+            let merged_plan_nonempty = merged_plan_nonempty(&cur.agent, &out);
 
             match merged_plan_nonempty {
                 Some(true)

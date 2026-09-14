@@ -342,6 +342,28 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 29. A rejected tool call names the skill that has the tool, and repeats count
+- **Status.** Proposed on the Qwen smoke runs (build 15); sized by the
+  json-format short battery.
+- **Evidence.** qwen3-coder under `format: schema`: one run called a tool
+  named `plan` from the router 142 times to the step cap; no guard
+  counts a rejected call. Under `format: json`: two of six runs reached
+  `plan`, called `edit_file` there (rejected: not active), then asked
+  the user whether to hand off to `implement`, and parked. The
+  rejection text says "hand off to a skill that has it" without naming
+  the skill or the shape.
+- **What.** (a) The inactive-tool rejection names the allowed
+  transition whose tool list has that tool and quotes the hand-off
+  shape (`{"patch": {"next_skill": "implement"}, "action": {"type":
+  "done"}}`), or says no skill has it. (b) A rejected call joins the
+  identical-tool-error streak (item 22, 25): same name and args twice
+  is the question, three times the park, with the shape
+  `rejected {name}`.
+- **Why.** The harness knows the answer to the question the model
+  asked. A question the harness can answer is a harness defect (D14).
+- **Measure.** No `ask_user` park whose message asks about handing off;
+  no run spends more than three steps on an inactive tool.
+
 ### 28. The router cannot ask, and no example carries a copyable message
 - **Status.** Committed (Milestone 35). Found on the first Qwen run (build 15): six of
   six runs parked at step 1 with `ask_user` "Which file?", the exact

@@ -1825,3 +1825,33 @@ last line with the newline kept, every error text), `skills/tests/it/edit_lines.
 (a stale `lines` edit becomes the range read with the exact note; after
 the re-read the same edit runs).
 
+## Milestone 39: a nameless tool call is named by its arguments (BACKLOG.md item 32)
+
+`infer_tool_name(args)` maps a distinctive argument shape to one tool:
+`question` to `think`, `path` with `content` to `write_file`, `path`
+with `new` and exactly one of `old`/`after`/`before`/`lines` to
+`edit_file`, `pattern` to `search`; anything else is `None`. The
+`infer_empty_tool_name` trigger runs first in the `plan`, `implement`,
+and `review` `validate`, renames a `tool` action whose name is empty
+when the inference is unambiguous, and records
+`INFERRED_TOOL_NOTE_PREFIX` plus the tool. It does not check whether
+the tool is active; the item 29 rejection does that with the right
+note, so a nameless `edit_file` in `plan` still gets pointed at
+`implement`.
+
+The `edit_file` anchor-miss error now ends by offering `lines` as the
+alternative to copying the anchor again.
+
+Why: two Qwen batteries running parked the same task the same way, a
+`think` sent with an empty name and the question in `args`, three
+times to the third strike; and an anchor copied with the wrong
+whitespace three times because the error text only said to copy it
+again. Both are steps the harness could complete from what the model
+already wrote.
+
+Tests: `skills/src/coding/tests.rs` (every arm of the inference and the
+`None` cases), `skills/tests/it/infer_tool.rs` (a nameless question runs
+`think` with the exact note; a nameless edit in `plan` carries both the
+inference note and the item 29 note), `tools/tests/it/edit_file.rs`
+(the exact anchor-miss text with and without the closest-line hint).
+

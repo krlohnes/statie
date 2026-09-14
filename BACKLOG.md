@@ -342,6 +342,23 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 28. The router cannot ask, and no example carries a copyable message
+- **Status.** Committed (Milestone 35). Found on the first Qwen run (build 15): six of
+  six runs parked at step 1 with `ask_user` "Which file?", the exact
+  text of the prompt's example shape, on tasks that name the file.
+  gemma never copied it in 300 runs; qwen3-coder copies it every time.
+- **What.** `RouterSkill::allows_ask_user` returns false: the router's
+  spec already says it hands off in one step and has no basis to ask.
+  The schema enum and the example lines follow. The `ask_user` example
+  message in `core/src/prompt.rs` becomes a placeholder that is not a
+  question (`<your question for the user>`), so a skill that may ask
+  never shows a real question to copy, and a model that copies the
+  placeholder anyway hits the non-question-ask guard (item 7).
+- **Why.** The harness must not hand the model a plausible answer in
+  the instructions. A second model made the defect visible in one run.
+- **Measure.** `qwen_smoke2` again: no step-1 parks; then the eight
+  short tasks.
+
 ### 27. A run without a green test in N test runs stops
 - **Status.** Committed (4307eb8; Milestone 34). Measured (`refactor_b10`): both `refactor_signature` seeds parked at exactly the sixteenth failing test after four questions each, at 1265 s and 1387 s against a 1500 s timeout. The cap names the shape and saves a tenth of the budget; it does not land the task. `trap_rounding` 2 of 2, `multi_file_feature` 0 of 2 with the cap never firing (7 and 11 failing tests; 4 of 6 across the last three batteries). Kept (D21). Evidence across 79 landed runs (builds 10 and 11): the most failing `test` runs before the first pass was 13 (one `multi_file_feature` seed), the 90th percentile 6, the median 2. The five `refactor_signature` misses ran 29, 24, 22, 14, and 11 failing tests.
 - **What.** The harness counts failing `test` runs since the last pass in

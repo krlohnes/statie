@@ -1713,3 +1713,28 @@ Tests: `core/tests/it/no_green_cap.rs` (the count climbs 1 to 16 and the
 sixteenth parks with the exact shape; a pass resets it) and
 `skills/tests/it/no_green_think.rs` (twelve failures then a read becomes
 the exact question; a `test` action at the same point is left alone).
+
+## Milestone 35: the router cannot ask (BACKLOG.md item 28)
+
+`RouterSkill::allows_ask_user` returns false. The schema's action enum
+and the "Exact shapes" example lines follow from that flag
+(`restrict_action_types` in `Active` activation), so the router never
+sees an `ask_user` shape, and `validate_default` rejects one anyway
+with "action `ask_user` is not allowed in skill `router`". The router's
+spec says so in words as well: an unclear task is handed to `plan`,
+which can ask.
+
+The `ask_user` example message in `core/src/prompt.rs` is now
+`<your question for the user>` instead of `Which file?`. The first
+Qwen runs copied the old example verbatim on the router turn, six of
+six, on tasks that named the file. An example in the instructions must
+not be a plausible answer. The placeholder is not a question, so a
+model that copies it in a skill that may ask hits the non-question-ask
+guard (Milestone 20 area, `consecutive_non_question_asks`) instead of
+parking the run.
+
+Tests: `core/tests/it/prompt.rs` (a tool-and-done schema renders no
+`ask_user` example line), `skills/tests/it/router.rs` (an `ask_user`
+from the router is rejected with the exact note, not parked; the flag
+is false only for the router).
+

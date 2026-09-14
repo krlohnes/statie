@@ -488,3 +488,24 @@ holds the resulting design; this file holds why.
   README field notes say "not distinguishable at two seeds" for those
   comparisons.
 
+## D23. A second model is a prompt lint; examples must not be answers
+
+- **Decision.** Every example shape in the harness prompt carries a
+  placeholder, never a plausible literal. The router cannot `ask_user`.
+  Before any Qwen battery counts as a measurement, the eight short
+  tasks run first as a smoke test, and any step-1 park is treated as a
+  harness defect until shown otherwise.
+- **Evidence (build 15).** qwen3-coder parked six of six runs at step 1
+  with `ask_user` "Which file?", the literal example text, in about
+  one second each, on tasks whose first sentence names the file. gemma
+  never copied that example in 300 runs. The harness had handed the
+  model an answer in the instructions and one model happened not to
+  take it.
+- **Why this is a harness result and not a Qwen result.** The prime
+  directive puts the harness in charge of what the model sees. A prompt
+  whose example is copyable is a harness defect regardless of which
+  model copies it. A model with a different prior is the cheapest lint
+  for that class of defect: one run, one second, no ambiguity.
+- **Check.** The item 28 binary reruns the same six runs; zero step-1
+  parks. Any later model swap starts with the same smoke test.
+

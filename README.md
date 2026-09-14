@@ -1611,6 +1611,16 @@ either a default or a config knob:
   shapes. Item 31 changes nothing for gemma on this evidence and gives
   Qwen a form it has not yet used.
 
+  Build 19 (item 32 in), Qwen json: 13 of 16 again, median 21.5 steps.
+  The name inference never fired: of the forty nameless calls, twenty-
+  nine carried no arguments at all and the rest only a `path`, neither
+  of which names one tool. Qwen sent its first six `lines` edits, on
+  the build whose anchor-miss error offers the form. The three misses
+  are a search spiral after an `edit_file` sent with Cargo.lock's
+  contents, a read loop after an anchor miss (the re-read question
+  fired three times), and a `trap_rounding` timeout with seven edits.
+  Five Qwen batteries on the json config: 11, 12, 11, 13, 13 of 16.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

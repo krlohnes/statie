@@ -431,11 +431,11 @@ impl SystemPrompt {
         if show("ask_user") {
             if has_delegates {
                 s.push_str(
-                    "{\"patch\": {...}, \"action\": {\"type\": \"ask_user\", \"name\": \"\", \"args\": {}, \"message\": \"Which file?\", \"skill\": \"\", \"task\": \"\"}, \"ack_inbox\": []}\n",
+                    "{\"patch\": {...}, \"action\": {\"type\": \"ask_user\", \"name\": \"\", \"args\": {}, \"message\": \"<your question for the user>\", \"skill\": \"\", \"task\": \"\"}, \"ack_inbox\": []}\n",
                 );
             } else {
                 s.push_str(
-                    "{\"patch\": {...}, \"action\": {\"type\": \"ask_user\", \"name\": \"\", \"args\": {}, \"message\": \"Which file?\"}, \"ack_inbox\": []}\n",
+                    "{\"patch\": {...}, \"action\": {\"type\": \"ask_user\", \"name\": \"\", \"args\": {}, \"message\": \"<your question for the user>\"}, \"ack_inbox\": []}\n",
                 );
             }
         }

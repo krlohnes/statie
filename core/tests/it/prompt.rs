@@ -3,8 +3,8 @@ use std::sync::Arc;
 use statie_core::{
     AgentState, Augmentation, Budgets, Capabilities, Commitment, HarnessState, HarnessView,
     HeuristicTokenizer, InboxItem, LogEntry, LogKind, MemoryLog, OverBudget, Pinned, PromptBuilder,
-    Promptable, SessionLog, SkillSpec, SystemPrompt, ToolSet, Version, WorkingSet,
-    WorkingSetConfig,
+    Promptable, Schema, SessionLog, SkillSpec, StepOutput, SystemPrompt, ToolSet, Version,
+    WorkingSet, WorkingSetConfig, restrict_action_types,
 };
 
 fn budgets() -> Budgets {
@@ -274,6 +274,48 @@ fn for_harness_omits_delegate_text_when_no_delegates() {
     let rendered = sys.render();
     assert!(!rendered.contains("\"type\": \"delegate\""));
     assert!(!rendered.contains("delegate`"));
+}
+
+/// `SystemPrompt::for_harness` given a schema whose `action.type` enum is
+/// `["tool", "done"]` (the shape `restrict_action_types` produces for a
+/// skill with `allows_ask_user() == false` and `allows_yield() == false`,
+/// e.g. `RouterSkill`, item 28): the "Exact shapes" block must contain no
+/// `ask_user` example line, and must still contain the `tool` and `done`
+/// example lines.
+#[test]
+fn for_harness_with_tool_and_done_only_schema_omits_ask_user_example() {
+    let mut schema = Schema::of::<StepOutput<serde_json::Value>>();
+    restrict_action_types(&mut schema, &["tool", "done"]);
+
+    let sys = SystemPrompt::for_harness(
+        &Capabilities {
+            native_thinking: true,
+            schema_constrained: true,
+            prefix_cache: true,
+        },
+        "json-merge-patch (RFC 7386)",
+        "merge patch semantics",
+        Some(&schema),
+        &[],
+    );
+    let rendered = sys.render();
+
+    assert!(
+        !rendered.contains(r#""type": "ask_user""#),
+        "expected no ask_user example shape, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "{\"patch\": {...}, \"action\": {\"type\": \"tool\", \"name\": \"list_files\", \"args\": {\"path\": \".\"}, \"message\": \"\"}, \"ack_inbox\": [1]}"
+        ),
+        "expected the tool example shape, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "{\"patch\": {...}, \"action\": {\"type\": \"done\", \"name\": \"\", \"args\": {}, \"message\": \"\"}, \"ack_inbox\": []}"
+        ),
+        "expected the done example shape, got:\n{rendered}"
+    );
 }
 
 #[test]

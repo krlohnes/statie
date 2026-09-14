@@ -3803,7 +3803,8 @@ impl Skill for RouterSkill {
              - Set `next_skill` to that choice.\n\n\
              When to hand off: always, in a single step. Ack every inbox item you read, \
              then set action `done`. Do not leave the router activation without a \
-             `next_skill` set.\n\n\
+             `next_skill` set. The router cannot ask the user anything; if the task is \
+             unclear, hand off to `plan`, which can.\n\n\
              History is searchable with the `recall` tool, but the router has no tools \
              and should not need it. `recent_summary` is the only memory that survives \
              across steps and across skill handoffs -- keep it current if you touch it."
@@ -3837,6 +3838,14 @@ impl Skill for RouterSkill {
     }
 
     fn allows_yield(&self) -> bool {
+        false
+    }
+
+    /// The router cannot talk to the user -- see the spec's last sentence
+    /// in the "When to hand off" paragraph, added alongside this override.
+    /// A task that needs clarification is handed off to `plan`, which can
+    /// `ask_user`.
+    fn allows_ask_user(&self) -> bool {
         false
     }
 

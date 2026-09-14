@@ -20,6 +20,7 @@ mod recovery;
 mod review_blind;
 mod review_looks;
 mod review_sendback;
+mod router;
 mod seen;
 mod shell_reads;
 mod situational;

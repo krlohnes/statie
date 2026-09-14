@@ -730,7 +730,7 @@ fn insert_by_anchor(
             CollapsedMatch::None => {
                 let hint = closest_line_hint(content, anchor);
                 return Err(ToolError::ExecutionFailed(format!(
-                    "anchor line not found in {path}; re-read the file and copy the line(s) exactly (whitespace matters){hint}"
+                    "anchor line not found in {path}; re-read the file and copy the line(s) exactly (whitespace matters), or address the range with `lines: \"START-END\"` from the read window instead of copying it{hint}"
                 )));
             }
         }

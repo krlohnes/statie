@@ -561,6 +561,88 @@ async fn missing_anchor_reports_closest_line() {
     assert_eq!(on_disk, content);
 }
 
+// Unit 32: `CollapsedMatch::None`'s anchor error carries the exact new
+// text (the "or address the range with `lines: ..." addition), with
+// `{hint}` filled in exactly the way `closest_line_hint` builds it --
+// pinned as a full string, not `contains`, per the brief.
+#[tokio::test]
+async fn missing_anchor_error_is_the_exact_new_text_with_the_closest_line_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("anchor_missing_exact.txt");
+    let content = "one\nlet result = compute_value(x, y);\nthree\n";
+    std::fs::write(&file, content).unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({
+                "path": "anchor_missing_exact.txt",
+                "after": "let result = compute_values(x, y);",
+                "new": "x"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    let expected_hint = "; closest match is near line 2; the file there reads:\n    1 | one\n    \
+                          2 | let result = compute_value(x, y);\n    3 | three\ncopy the lines \
+                          you want to replace from this window into `old`, verbatim.";
+    let expected = format!(
+        "anchor line not found in anchor_missing_exact.txt; re-read the file and copy the \
+         line(s) exactly (whitespace matters), or address the range with `lines: \
+         \"START-END\"` from the read window instead of copying it{expected_hint}"
+    );
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => assert_eq!(msg, &expected),
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content);
+}
+
+// The no-hint twin: an `after` anchor whose only non-empty line is empty
+// after normalization never happens in practice for a real anchor, so this
+// instead exercises the exact prefix text alone by using a file with no
+// non-empty lines at all -- `closest_line_hint` returns "" when `old` (here
+// `after`, both feed the same anchor lookup) has no non-empty line, or when
+// the file itself has none of its own to compare against is irrelevant
+// here; what matters is the anchor's own first non-empty line is empty.
+#[tokio::test]
+async fn missing_anchor_error_with_a_blank_anchor_has_no_hint_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("anchor_missing_blank.txt");
+    let content = "one\ntwo\nthree\n";
+    std::fs::write(&file, content).unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({
+                "path": "anchor_missing_blank.txt",
+                "after": "   \n\t\n  ",
+                "new": "x"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    let expected = "anchor line not found in anchor_missing_blank.txt; re-read the file and \
+                     copy the line(s) exactly (whitespace matters), or address the range with \
+                     `lines: \"START-END\"` from the read window instead of copying it";
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => assert_eq!(msg, expected),
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content);
+}
+
 #[tokio::test]
 async fn old_and_after_with_different_text_old_wins_and_notes_ignored_after() {
     let dir = tempfile::tempdir().unwrap();

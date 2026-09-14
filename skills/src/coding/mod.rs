@@ -1174,6 +1174,80 @@ enum Reason {
     MissingPath(String),
 }
 
+/// Unit 32: guesses the tool a nameless call meant, from the shape of its
+/// `args` alone -- the model sent a well-formed call but left `name` empty.
+/// Checked in order, returning the first that applies:
+/// 1. `question` present (any other keys ignored) -- `think`.
+/// 2. `path` and `content` present, no `new` -- `write_file`.
+/// 3. `path` and `new` present, and exactly one of `old`/`after`/`before`/
+///    `lines` -- `edit_file`.
+/// 4. `pattern` present -- `search`.
+///
+/// `None` when nothing above matches (e.g. `path` alone, `path`+`new` with
+/// two or zero anchors, or a `cmd`-shaped `shell`/`test` call -- those two
+/// tools' calls are never namable from `args` alone, since `cmd` doesn't
+/// distinguish them).
+pub fn infer_tool_name(args: &serde_json::Value) -> Option<&'static str> {
+    let obj = args.as_object()?;
+    if obj.contains_key("question") {
+        return Some("think");
+    }
+    if obj.contains_key("path") {
+        let has_content = obj.contains_key("content");
+        let has_new = obj.contains_key("new");
+        if has_content && !has_new {
+            return Some("write_file");
+        }
+        if has_new {
+            let anchor_count = ["old", "after", "before", "lines"]
+                .iter()
+                .filter(|k| obj.contains_key(**k))
+                .count();
+            if anchor_count == 1 {
+                return Some("edit_file");
+            }
+        }
+    }
+    if obj.contains_key("pattern") {
+        return Some("search");
+    }
+    None
+}
+
+/// Unit 32: the note [`infer_empty_tool_name`] attaches, with `{t}` filled
+/// from [`infer_tool_name`]'s guess.
+pub const INFERRED_TOOL_NOTE_PREFIX: &str =
+    "The tool call had no name; from its arguments the harness ran ";
+
+/// `plan`/`implement`/`review`-shared trigger (unit 32), run FIRST in each
+/// skill's `validate`, before `strip_harness_owned`: when `out`'s action is
+/// `Action::Tool { name, args }` with `name` empty (after trimming) and
+/// [`infer_tool_name`] recognises `args`' shape, the action's name is set to
+/// the inferred tool (`args` unchanged) and the note is returned. Does NOT
+/// check whether the inferred tool is active for this skill -- the existing
+/// inactive-tool rejection (`core/src/session.rs`, item 29) handles that
+/// itself, with the right note for that case (naming the skill that has the
+/// tool, when one does). A `name` that is already non-empty, or an empty
+/// name `infer_tool_name` can't guess from, is left alone.
+fn infer_empty_tool_name(
+    _cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    let statie_core::Action::Tool { name, args } = out.action() else {
+        return None;
+    };
+    if !name.trim().is_empty() {
+        return None;
+    }
+    let inferred = infer_tool_name(args)?;
+    let args = args.clone();
+    out.set_action(statie_core::Action::Tool {
+        name: inferred.to_string(),
+        args,
+    });
+    Some(format!("{INFERRED_TOOL_NOTE_PREFIX}`{inferred}`."))
+}
+
 /// The question the harness asks `think` on the model's behalf when
 /// [`implement_repeated_skip_thinks`] fires (unit 21): a second refused
 /// re-read (7.7/7.8's `skipped_redundant` guard, `core/src/session.rs`) of
@@ -4354,7 +4428,9 @@ impl Skill for PlanSkill {
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
+        let inferred_name_note = infer_empty_tool_name(cur, &mut out);
         let mut notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
+        notes.extend(inferred_name_note);
         let note = strip_malformed_next(&cur.agent, &mut out);
         let shell_read_note = shell_read_substitution(&mut out);
         write_file_auto_confirm(cur, &mut out);
@@ -4837,6 +4913,7 @@ impl Skill for ImplementSkill {
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
+        let inferred_name_note = infer_empty_tool_name(cur, &mut out);
         let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let strip_note = strip_malformed_next(&cur.agent, &mut out);
         let shell_read_note = shell_read_substitution(&mut out);
@@ -4925,6 +5002,7 @@ impl Skill for ImplementSkill {
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
         let notes: Vec<String> = owned_notes
             .into_iter()
+            .chain(inferred_name_note)
             .chain(strip_note)
             .chain(shell_read_note)
             .chain(edit_lines_stale_note)
@@ -5211,6 +5289,7 @@ impl Skill for ReviewSkill {
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
+        let inferred_name_note = infer_empty_tool_name(cur, &mut out);
         let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let note = strip_malformed_next(&cur.agent, &mut out);
         let shell_read_note = shell_read_substitution(&mut out);
@@ -5237,6 +5316,7 @@ impl Skill for ReviewSkill {
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
         let notes: Vec<String> = owned_notes
             .into_iter()
+            .chain(inferred_name_note)
             .chain(note)
             .chain(shell_read_note)
             .chain(sendback_note)

@@ -9,12 +9,12 @@ use statie_core::{
 use statie_patch::JsonMergePatch;
 
 use super::{
-    CodingWorkspace, Decision, FileNote, ImplementSkill, PlanSkill, PlanStep, ReadFileArgs,
-    ReviewSkill, RouterSkill, SeenFile, StepStatus, TestRecord, coding_skills,
-    coding_skills_with_delegates, common_after_tool, count_lines, failing_test_names,
-    finding_is_grounded, first_error_line, has_named_handoff, merge_range, parse_edit_header,
-    parse_finding_location, parse_revert_lines, seen_entry, shell_read_as_read_file,
-    write_file_confirmed_by_seen,
+    CodingWorkspace, Decision, FileNote, INFERRED_TOOL_NOTE_PREFIX, ImplementSkill, PlanSkill,
+    PlanStep, ReadFileArgs, ReviewSkill, RouterSkill, SeenFile, StepStatus, TestRecord,
+    coding_skills, coding_skills_with_delegates, common_after_tool, count_lines,
+    failing_test_names, finding_is_grounded, first_error_line, has_named_handoff, infer_tool_name,
+    merge_range, parse_edit_header, parse_finding_location, parse_revert_lines, seen_entry,
+    shell_read_as_read_file, write_file_confirmed_by_seen,
 };
 
 fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
@@ -5239,4 +5239,200 @@ fn plan_write_file_auto_confirm_is_a_no_op_without_write_file_tool() {
         }
         other => panic!("expected a write_file tool call, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------
+// Unit 32: `infer_tool_name` -- every arm and the `None` cases.
+// ---------------------------------------------------------------------
+
+#[test]
+fn infer_tool_name_question_present_is_think() {
+    assert_eq!(infer_tool_name(&json!({"question": "why?"})), Some("think"));
+}
+
+#[test]
+fn infer_tool_name_question_present_with_other_keys_is_still_think() {
+    // "any other keys ignored" -- question wins even alongside a path/new
+    // shape that would otherwise read as edit_file.
+    assert_eq!(
+        infer_tool_name(&json!({"question": "why?", "path": "a.rs", "new": "x"})),
+        Some("think")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_and_content_no_new_is_write_file() {
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a.rs", "content": "hello"})),
+        Some("write_file")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_content_and_new_is_not_write_file() {
+    // `new` present disqualifies the write_file arm even with `content` also
+    // present.
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a.rs", "content": "hello", "new": "x"})),
+        None
+    );
+}
+
+#[test]
+fn infer_tool_name_path_new_and_old_is_edit_file() {
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a.rs", "new": "b", "old": "a"})),
+        Some("edit_file")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_new_and_after_is_edit_file() {
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a.rs", "new": "b", "after": "anchor"})),
+        Some("edit_file")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_new_and_before_is_edit_file() {
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a.rs", "new": "b", "before": "anchor"})),
+        Some("edit_file")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_new_and_lines_is_edit_file() {
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a.rs", "new": "b", "lines": "1-2"})),
+        Some("edit_file")
+    );
+}
+
+#[test]
+fn infer_tool_name_pattern_present_is_search() {
+    assert_eq!(
+        infer_tool_name(&json!({"pattern": "foo.*bar"})),
+        Some("search")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_alone_is_none() {
+    assert_eq!(infer_tool_name(&json!({"path": "a.rs"})), None);
+}
+
+#[test]
+fn infer_tool_name_path_and_new_with_two_anchors_is_none() {
+    assert_eq!(
+        infer_tool_name(&json!({
+            "path": "a.rs",
+            "new": "b",
+            "old": "a",
+            "after": "anchor"
+        })),
+        None
+    );
+}
+
+#[test]
+fn infer_tool_name_path_and_new_with_zero_anchors_is_none() {
+    assert_eq!(infer_tool_name(&json!({"path": "a.rs", "new": "b"})), None);
+}
+
+#[test]
+fn infer_tool_name_cmd_alone_is_none() {
+    // `shell`/`test` calls are never namable from `args` alone: `cmd`
+    // doesn't distinguish the two tools.
+    assert_eq!(infer_tool_name(&json!({"cmd": "cargo test"})), None);
+}
+
+#[test]
+fn infer_tool_name_empty_object_is_none() {
+    assert_eq!(infer_tool_name(&json!({})), None);
+}
+
+// ---------------------------------------------------------------------
+// Unit 32: `infer_empty_tool_name`'s wiring into `validate` -- exercised
+// through `PlanSkill`/`ImplementSkill`/`ReviewSkill` directly (the
+// `validate`-level substitution), complementing the end-to-end proof in
+// `skills/tests/it/infer_tool.rs`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn implement_infers_edit_file_from_a_nameless_call_and_notes_it() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "",
+            "args": {"path": "a.rs", "old": "a", "new": "b"},
+        },
+        "ack_inbox": [],
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "edit_file");
+            assert_eq!(args, &json!({"path": "a.rs", "old": "a", "new": "b"}));
+        }
+        other => panic!("expected an edit_file tool call, got {other:?}"),
+    }
+    assert_eq!(
+        step.notes(),
+        &[format!("{INFERRED_TOOL_NOTE_PREFIX}`edit_file`.")]
+    );
+}
+
+#[test]
+fn implement_leaves_a_named_tool_call_alone() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "search",
+            "args": {"pattern": "foo"},
+        },
+        "ack_inbox": [],
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, .. } => assert_eq!(name, "search"),
+        other => panic!("expected a search tool call, got {other:?}"),
+    }
+    assert!(
+        step.notes().iter().all(|n| !n.contains("had no name")),
+        "a named call must not get the inferred-name note, got {:?}",
+        step.notes()
+    );
+}
+
+#[test]
+fn implement_leaves_an_unguessable_empty_name_call_alone() {
+    // No `infer_tool_name` arm matches an empty `args`; the name stays
+    // empty and falls through to the ordinary empty-name rejection
+    // (core/src/session.rs, item 29) at execution time -- `validate` itself
+    // does not reject it.
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {},
+        "action": {"type": "tool", "name": "", "args": {}},
+        "ack_inbox": [],
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, .. } => assert_eq!(name, ""),
+        other => panic!("expected a tool call with an empty name, got {other:?}"),
+    }
+    assert!(
+        step.notes().iter().all(|n| !n.contains("had no name")),
+        "an unguessable call must not get the inferred-name note, got {:?}",
+        step.notes()
+    );
 }

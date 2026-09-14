@@ -11,6 +11,7 @@ mod error_think;
 mod grounded_findings;
 mod harness_owned;
 mod implement_done;
+mod infer_tool;
 mod no_green;
 mod no_green_runs_test;
 mod no_green_think;

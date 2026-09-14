@@ -429,6 +429,64 @@ moves the metric it was built for. Ordered within each tier.
 - **Status.** Committed (896fb14; Milestone 33). Measured (`situational_b9` against `arm_harness_max_b9`, same binary): 22 of 26 both ways, three more median steps and no prompt saving at the peak with the switch on. Stays off (D20).
 - **Depends on.** Nothing; P2 because the evidence is from other models.
 
+### 28. Line-addressed edits: the harness finds the location, the model supplies the text
+- **Status.** Specified, not built. Waits on a second model on the host
+  (Qwen first, a hybrid state-space model after) so the measurement is
+  paired across models from the start.
+- **What.** A third form for `edit_file`: `{path, lines: [start, end],
+  read_at: step, new}` replaces the inclusive 1-based range as it stood
+  in the `read_file` window the model got at `read_at`. The harness
+  resolves the range against its own record of that read (`SeenFile`,
+  the read window's header and step) and applies the edit only if the
+  file's content on those lines is unchanged since that step; otherwise
+  it refuses with the current lines and their numbers, so the model can
+  re-address without re-reading. `old`, `after`, and `before` stay; the
+  tool description recommends `lines` when the target was read this
+  activation. `lines` with `new: ""` deletes. Same for a `lines` form
+  of the insertion anchors (`after_line`). The spec text for
+  `implement` tells the model it never needs to copy lines it can see.
+- **Why.** The model's one remaining verbatim-copy job is `old` and the
+  anchors. The harness already owns every fact needed to resolve a line
+  reference: which step read which range of which file, and whether
+  the file has changed since. Exact in-context copying is the weakest
+  skill of the models with cheap long context (state-space hybrids),
+  and a harness whose purpose is to own state should not be asking any
+  model to do retrieval for it. This is the prime directive applied to
+  the edit tool.
+- **Measure.** `edit_file` errors and "old text occurs N times" refusals
+  per landed run, skipped re-reads after an edit refusal, and landing
+  on the eight short tasks; paired across the gemma config and each
+  later model's config file. The tell is the error count, not landing.
+- **Depends on.** Nothing in code. Item 29 gives it a second model to
+  measure against.
+
+### 29. The window sweep takes a base config and overrides, not a model
+- **Status.** Specified, not built.
+- **What.** Generalise `bench/run_sweep.sh`: `bench/run_sweep.sh
+  <label> <base_config> --set key.path=v1,v2,... [--set ...] [--task ..]
+  [--seeds N]`. The runner writes one derived config per combination
+  under `bench-runs/<label>/configs/`, runs the battery on each, and
+  writes a table (knob values, landed, median steps, mean peak prompt,
+  minutes) to `bench-runs/<label>.summary`. It refuses a combination
+  whose `budget.working_set` plus the maintainer budget plus 2000
+  tokens of fixed prompt exceeds `model.num_ctx`, and says so in the
+  summary. Keys are any JSON path in the config; the model is one.
+  Recommended settings for a model are committed as
+  `bench/configs/<model>_<profile>.json` files with a DECISIONS line
+  naming the sweep that picked them. The code's defaults stay the gemma
+  numbers.
+- **Why.** `working_set.max_windows`, `budget.working_set`, and
+  `num_ctx` are knobs today but were never swept, because gemma's peak
+  was already near the 16k ceiling. A model with cheap long context
+  lifts that ceiling, and how much working set turns into landing is
+  then the first question to ask of it. The runner must not know what
+  a model is; per-model defaults live in files, not code.
+- **Measure.** The sweep's own table. The first sweep: `max_windows`
+  4, 8, 16 by `budget.working_set` 6000, 12000, 24000 on the gemma
+  base and on the Qwen base, eight short tasks, four seeds (D22).
+- **Depends on.** A second model pulled on the host. Runs before item
+  28 so the edit change is measured at each model's chosen window.
+
 ## Not doing
 
 - Multi-agent debate as a thinking pattern: 0 of 6 here, and the

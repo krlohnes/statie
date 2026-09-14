@@ -342,6 +342,27 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 33. A knob sweep runner: the model is a config field, the knobs are the experiment
+- **Status.** Building. Agreed with the user: no per-model defaults in
+  code; a recommendation is a config file; the sweep varies the knobs
+  on whatever base config it is given.
+- **What.** `bench/run_sweep.sh <label> <base_config> --set a.b=v1,v2
+  [--set ...] [--task ...] [--seeds N] [--dry-run]` derives one config
+  per combination (cartesian product) under `bench-runs/<label>/configs/`,
+  refuses a combination whose `budget.working_set` exceeds
+  `budget.total` or whose `budget.total` exceeds `model.num_ctx`, runs
+  the batteries one after another (D8), and appends to
+  `bench-runs/<label>.done`. `bench/sweep_summary.py <label>` prints
+  one row per combination: the knob values, landed, median steps, mean
+  peak prompt, mean seconds. The maintainer sweep becomes one call.
+- **Why.** Qwen's peak prompt runs 10.6k of a 16k window against
+  gemma's 6.7k; whether more working set or a bigger window turns into
+  landing is the next question, and it must be asked per model without
+  the runner knowing what a model is.
+- **Measure.** The first sweep: Qwen json, `working_set.max_windows`
+  4 and 8, `budget.working_set` 6000 and 9000, `model.num_ctx` 16384
+  and 24576, on the eight short tasks.
+
 ### 32. A tool call with no name is named by its arguments; an anchor miss names `lines`
 - **Status.** Committed (Milestone 39). Measured (`qwen_json_short_b19`): 13 of 16; the inference never fired (the nameless calls had no arguments, or a bare `path`); Qwen's first six `lines` edits arrived on this build. Kept: it costs nothing and the two-battery shape it was built for did not recur. Evidence: two Qwen batteries running (builds 17
   and 18) parked `trap_rounding` the same way: a tool call with an

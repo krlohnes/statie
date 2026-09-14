@@ -363,7 +363,7 @@ moves the metric it was built for. Ordered within each tier.
   first `lines` edit in a live run.
 
 ### 31. Line-addressed edits, and an edit that is a whole file is routed to `write_file`
-- **Status.** Committed (Milestone 38). Measured next by `qwen_json_short_b18` and `short_fixer_b18`. Evidence (build 17, Qwen json): three of five
+- **Status.** Committed (Milestone 38). Measured (build 18): Qwen json 13 of 16, best Qwen battery, within noise of 11 and 12 (D22); Qwen never sent a `lines` edit, the `content` note fired three times. gemma 13 of 16 as on build 16; it sent nine `lines` edits unprompted, none stale, misses unrelated. Evidence (build 17, Qwen json): three of five
   misses are `edit_file` argument shape. The model sends `content`
   (the whole file) or `new` with no `old`/`after`/`before`, gets
   "exactly one of `old`, `after`, `before` must be set", and loops to

@@ -1603,6 +1603,14 @@ either a default or a config knob:
   `think` sent with an empty tool name and the question in `args`,
   three times to the park (backlog item 32).
 
+  gemma on the same build: 13 of 16, as on build 16, median 12 steps.
+  gemma found the `lines` form on its own and sent it nine times, one
+  of them on a task it then lost to a test-after-failure stall; no
+  stale substitution fired. The other misses are an anchor copied with
+  the wrong whitespace and a `done` with an open plan step, both old
+  shapes. Item 31 changes nothing for gemma on this evidence and gives
+  Qwen a form it has not yet used.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

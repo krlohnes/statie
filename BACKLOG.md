@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 32. A tool call with no name is named by its arguments; an anchor miss names `lines`
-- **Status.** Building. Evidence: two Qwen batteries running (builds 17
+- **Status.** Built (Milestone 39); in the twenty-first gate. Measured next by `qwen_json_short_b19`. Evidence: two Qwen batteries running (builds 17
   and 18) parked `trap_rounding` the same way: a tool call with an
   empty `name` and a `question` in `args`, three times to the third
   strike. The model meant `think`. And the build 18 anchor-miss park:

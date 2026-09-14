@@ -1571,6 +1571,18 @@ either a default or a config knob:
   timing out with the file path in the tool's `name` field sixty times,
   which no guard counts.
 
+  Build 16 (items 28 to 29 in): Qwen json 12 of 16 against 11 on build
+  15, mean secs per run 95 against 147; two runs still asked
+  permission to hand off after reading the note that names
+  `implement` and quotes the shape (item 30). gemma fixer arm 13 of 16
+  against 15 on build 13: `trap_rounding` twice (a 33-probe loop to
+  the timeout, and an early park) and one early park on
+  `rename_across_files`, none through the new code; the two-run gap is
+  inside D22's noise, and the paired audit D19 asks for found no shape
+  shared with the new items. One artefact in every gemma battery since
+  build 12: an empty-name tool call at step 5 of nearly every run,
+  rejected, never repeated.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

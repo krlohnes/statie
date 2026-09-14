@@ -362,7 +362,7 @@ moves the metric it was built for. Ordered within each tier.
   the Qwen short battery; gemma unchanged.
 
 ### 29. A rejected tool call names the skill that has the tool, and repeats count
-- **Status.** Committed (Milestone 36). Measured next by `qwen_json_short_b16` and `short_fixer_b16`. Sized by the json-format short battery (build 15): three of five misses are the permission question after a rejected `edit_file` in `plan`; one is a 140-step timeout with the file path in the tool `name` field sixty times.
+- **Status.** Committed (Milestone 36). Measured (build 16): Qwen json 12 of 16 against 11, not distinguishable at two seeds (D22); the rejection note is read and the asks persist (item 30). gemma 13 of 16 against 15, misses not through this code. Sized by the json-format short battery (build 15): three of five misses are the permission question after a rejected `edit_file` in `plan`; one is a 140-step timeout with the file path in the tool `name` field sixty times.
 - **Evidence.** qwen3-coder under `format: schema`: one run called a tool
   named `plan` from the router 142 times to the step cap; no guard
   counts a rejected call. Under `format: json`: two of six runs reached

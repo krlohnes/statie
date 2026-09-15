@@ -370,6 +370,12 @@ pub struct SkippedRead {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RepeatedToolError {
     /// The tool name the error came from (e.g. `"edit_file"`, `"think"`).
+    /// Unit 39: for the `"not a tool"` class (see `shape` below) this is
+    /// NOT a stable identity for the streak -- it is only the LATEST
+    /// rejected call's own `name` (possibly empty), which may differ from
+    /// the `name` any earlier call in the same streak carried, since the
+    /// class groups every call that named no usable tool regardless of what
+    /// (if anything) it put in `name`.
     pub tool: String,
     /// The failing call's own arguments, exactly as the committed action
     /// carried them -- compared against a later `Action::Tool { name, args
@@ -386,7 +392,13 @@ pub struct RepeatedToolError {
     /// so two errors of the same kind but naming a different line number or
     /// file still count as the SAME streak. Read by the coding skills'
     /// `implement_repeated_error_thinks` (`skills/src/coding/mod.rs`) to
-    /// match on shape rather than identical args.
+    /// match on shape rather than identical args. Unit 39: a `tool_rejected`
+    /// entry whose reason says the call named no usable tool at all
+    /// (`core/src/session.rs`'s `is_not_a_tool_rejection`) is keyed as the
+    /// fixed class `("<not a tool>", "not a tool")` instead -- this field is
+    /// then exactly `"not a tool"`, and the streak this record's `count`
+    /// advances spans every such call regardless of what `name` (if any)
+    /// each one carried; `tool` above still records only the latest one.
     pub shape: String,
     /// Consecutive count of this same identical-shape `(tool, shape)`
     /// error, mirroring `Session::tool_error_repeat_count` at the step that

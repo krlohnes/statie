@@ -108,7 +108,7 @@ pub use report::{FileNote, Report, ReportOutcome, ReportStats, ReportWorkspace};
 pub use sandbox::{SandboxPath, SandboxRoot};
 pub use session::{
     Active, CancelHandle, NO_GREEN_PARK_AT, NO_GREEN_THINK_AT, Session, SessionConfig,
-    detected_test_command, error_shape, read_call_key,
+    detected_test_command, error_shape, is_not_a_tool_rejection, read_call_key,
 };
 pub use skill::{
     Commitment, ParsedOutput, Patch, Skill, SkillRules, SkillSpec, ValidatedStep, check_inbox,

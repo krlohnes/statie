@@ -1955,3 +1955,31 @@ answer, exact for both settings; the answer and reasoning-character
 count read from `content` with the flag off, unchunked and over two
 chunks), `models/tests/it/ollama_model.rs` (`think()` for both settings).
 
+## Milestone 45: calls that name no tool are one streak (BACKLOG.md item 39)
+
+`core/src/session.rs` keys the repeated-tool-error streak on `(tool,
+error_shape(reason))`. A `tool_rejected` entry whose reason is one of
+the not-a-tool texts (an empty `name`, or a `name` that is not an
+active tool of the skill, in either of its two forms; recognised by
+`is_not_a_tool_rejection`) is keyed instead as the class
+`("<not a tool>", "not a tool")`, so the count spans differing names.
+The `RepeatedToolError` on the harness state keeps the latest name and
+reason for the `think` question. At count 2 the observation is
+prefixed with "[harness] This is the second call in a row that named no
+tool (`{name}` is not one); a third parks the session. Put one of the
+active tools in `name`."; at `CONTINUE_REPEAT_CAP` (3) the session parks
+with the shape `repeated tool error: <not a tool>`. Real tool errors
+keep their identical-call key.
+
+Why: `qwen_json_short_b23/rename_across_files/seed1`, 107 rejected
+calls alternating an empty name and a file path in `name`; the per-name
+key alternated and the third-strike park (D19) never fired; the run
+timed out at 126 steps.
+
+Tests: `core/tests/it/tool_rejected.rs` (alternating names park on the
+third with the exact shape and the exact count-2 prefix; three
+different bad names park; a real call between resets the count; two
+different real tool errors still do not share a streak;
+`is_not_a_tool_rejection` on the three producer texts and two real
+error texts).
+

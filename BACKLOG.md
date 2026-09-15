@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 39. Calls that name no tool are one streak, whatever the name
-- **Status.** Proposed. Evidence: `qwen_json_short_b23/rename_across_files/seed1`,
+- **Status.** Committed (Milestone 45). Measured next on the Qwen short battery. Evidence: `qwen_json_short_b23/rename_across_files/seed1`,
   107 rejected calls in a row alternating an empty `name` and a file
   path in `name`; the repeated-error streak keys on the name, so the
   two alternated and the third-strike park never fired; the run timed

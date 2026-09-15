@@ -351,6 +351,38 @@ pub fn error_shape(reason: &str) -> String {
     }
 }
 
+/// Unit 39: true when `reason` is one of the `tool_rejected` texts produced
+/// when the call named no USABLE tool at all, rather than a real tool that
+/// then failed -- so the repeated-tool-error streak below can key every such
+/// call together as one class (`is_not_a_tool_rejection`'s caller in
+/// `Active::execute`), instead of splintering into one key per distinct
+/// (often garbage) `name`. Bench `qwen_json_short_b23/rename_across_files/
+/// seed1`: the model sent 107 rejected calls in a row, alternating
+/// `name: ""` and `name: "src/config.rs"`; keyed on name as before, the two
+/// alternated and the streak's count never reached `CONTINUE_REPEAT_CAP`, so
+/// the run timed out at 126 steps instead of parking. Recognises, by fixed
+/// prefix/phrase (not the whole text, so the path/skill names and the
+/// active-tool list embedded in the real messages don't have to match):
+/// - the empty-`name` text ("action.name is empty: put the tool's name in
+///   `name` and its arguments in `args`; available tools: ..."), produced
+///   right here in `Active::execute` when `name.is_empty()`;
+/// - the "not available in skill" text's TWO forms, both produced right
+///   here in `Active::execute`'s inactive-tool branch -- the hand-off form
+///   ("tool `X` is not available in skill `S`; `T` has it. Finish this
+///   skill's job, then hand off: ...", when `Skill::skill_with_tool` found
+///   another skill that has it) and the plain form ("tool `X` is not
+///   available in skill `S`; available tools: ...There is no tool by that
+///   name; if `X` is a path, it belongs in `args`.", when no skill has it).
+///
+/// A real tool's own `tool_error` reason (e.g. `read_file`'s "no such file",
+/// `edit_file`'s anchor-miss) never starts with either phrase, so this
+/// returns `false` for those, keeping their own `(tool, error_shape(reason))`
+/// key untouched.
+pub fn is_not_a_tool_rejection(reason: &str) -> bool {
+    reason.starts_with("action.name is empty: ")
+        || (reason.starts_with("tool `") && reason.contains("` is not available in skill `"))
+}
+
 /// Splits `s` into alternating non-whitespace/whitespace runs, in order,
 /// covering the whole string -- used by [`error_shape`] to walk tokens while
 /// keeping the original whitespace between them intact for step 4's later
@@ -2776,8 +2808,30 @@ where
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let shape = error_shape(&reason);
-            let key = (tool.clone(), shape.clone());
+            // Unit 39: a `tool_rejected` entry (never a real `tool_error`,
+            // whose reason text never matches `is_not_a_tool_rejection`)
+            // whose reason says the call named no usable tool at all joins
+            // one shared class, `("<not a tool>", "not a tool")`, instead of
+            // its own `(name, error_shape(reason))` key -- so a model that
+            // alternates between an empty `name` and a bogus/path `name`
+            // (bench `qwen_json_short_b23/rename_across_files/seed1`: 107
+            // rejected calls alternating `name: ""` and
+            // `name: "src/config.rs"`) still advances ONE streak instead of
+            // splintering into per-name keys that individually never reach
+            // `CONTINUE_REPEAT_CAP`.
+            let is_rejected =
+                e.payload.get("event").and_then(Value::as_str) == Some("tool_rejected");
+            let not_a_tool = is_rejected && is_not_a_tool_rejection(&reason);
+            let shape = if not_a_tool {
+                "not a tool".to_string()
+            } else {
+                error_shape(&reason)
+            };
+            let key = if not_a_tool {
+                ("<not a tool>".to_string(), shape.clone())
+            } else {
+                (tool.clone(), shape.clone())
+            };
             if self.session.last_tool_error_key.as_ref() == Some(&key) {
                 self.session.tool_error_repeat_count += 1;
             } else {
@@ -2824,13 +2878,24 @@ where
                 // that repeating the call will not change the outcome --
                 // mirrors the loop guard's own prefix placement (prepended,
                 // so it survives `truncate_with_report`'s budget clamp on a
-                // long error message).
+                // long error message). Unit 39: for the "not a tool" class
+                // the prefix names the LATEST `name` (verbatim, possibly
+                // empty) instead of a tool, since the whole point of this
+                // class is that no tool was actually named.
                 if let Some(obs) = self.session.pending_observation.take() {
-                    let text = format!(
-                        "[harness] This is the same `{tool}` error as the previous step; \
-                         repeating the call will not change it.\n\n{}",
-                        obs.as_str()
-                    );
+                    let prefix = if not_a_tool {
+                        format!(
+                            "[harness] This is the second call in a row that named no tool \
+                             (`{tool}` is not one); a third parks the session. Put one of the \
+                             active tools in `name`."
+                        )
+                    } else {
+                        format!(
+                            "[harness] This is the same `{tool}` error as the previous step; \
+                             repeating the call will not change it."
+                        )
+                    };
+                    let text = format!("{prefix}\n\n{}", obs.as_str());
                     let (new_obs, _overflow) = Observation::truncate_with_report(
                         &crate::promptable::ToolOutputFull::new(text),
                         self.session.config.budgets.observation,
@@ -2853,9 +2918,14 @@ where
                 // step is neither a `Continue` conversion nor a skip, so the
                 // mixed-shape guard below would otherwise reset the streak
                 // on this very step), so push this step's own shape first.
+                // Unit 39: the "not a tool" class always pushes the fixed
+                // `<not a tool>` label, never the latest (possibly empty, or
+                // varying) `name` -- the whole park shape names the CLASS,
+                // not any one of the names that made it up.
+                let park_shape_name = if not_a_tool { "<not a tool>" } else { &tool };
                 self.session
                     .non_progress_shapes
-                    .push(format!("repeated tool error: {tool}"));
+                    .push(format!("repeated tool error: {park_shape_name}"));
                 outcome = self.park_non_progress_cap(
                     next_harness.step,
                     &mut entries,

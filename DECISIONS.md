@@ -531,3 +531,43 @@ holds the resulting design; this file holds why.
 - **Check.** Any new model starts with the six-run smoke under both
   formats before a battery is read as a measurement.
 
+## D25. The outside baseline: statie's cost is the cache, not the tokens
+
+- **Decision.** The next harness work is the prompt's cacheable prefix,
+  not another guard. Every future battery reports Ollama's
+  `prompt_eval_duration` per step (item 35), so the share of each
+  prompt that was actually evaluated is a first-class number beside
+  landing and steps. Until statie's per-step time is within a small
+  factor of the append-only baseline on the same model, landing
+  comparisons between the two are read as "at best equal".
+- **Evidence (build 20).** OpenCode with gemma: 16 of 16 on the eight
+  short tasks at 21 s a run; with Qwen 14 of 16 at 15 s. statie on the
+  same tasks, models, and seeds: 13 to 15 of 16 at 100 to 178 s with
+  gemma, 13 of 16 at 75 to 211 s with Qwen. OpenCode's turns read about
+  8,000 tokens from the prefix cache and send about 200 new; a direct
+  probe measured a cached prompt at a tenth of its cold evaluation
+  time. statie's median model step is 3.9 s for a 6,100-token prompt,
+  which is the cold rate.
+- **Why this follows from the prime directive rather than against
+  it.** "Manage limited context via mutable state" was measured on
+  prompt size, where it wins (7k against 9k peak on gemma). It was never
+  measured on evaluation cost, where rewriting the prefix loses the
+  cache every step. The prefix cache is the model host's own mutable
+  state; a harness that owns state should be laying its prompt out so
+  the host can keep it. Stable sections first (system, spec, rules,
+  task), volatile sections last (working set, observation), and
+  per-step edits that append rather than rewrite where the state
+  allows it.
+- **Confounds recorded.** OpenCode ran at the server's 32k default
+  context against statie's pinned 16k; its tool set and system prompt
+  are its own; its steps are tool calls, not model turns. None of
+  these explain a tenfold time gap on tasks that take six to fifteen
+  tool calls.
+- **Ruled out.** Reading the landing gap as a harness verdict on gemma
+  (one to three runs at two seeds, D22). Dropping harness-owned state:
+  the arms measurement (D15) still stands on steps; the cost is in
+  prompt layout, not in who owns the state.
+- **Check.** A build whose per-step time on gemma is under 1.5 s at
+  the same prompt size, and whose landing is unchanged, closes this
+  entry.
+

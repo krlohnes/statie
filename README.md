@@ -1621,6 +1621,31 @@ either a default or a config knob:
   fired three times), and a `trap_rounding` timeout with seven edits.
   Five Qwen batteries on the json config: 11, 12, 11, 13, 13 of 16.
 
+  The outside baseline (build 20, backlog item 34, D25). OpenCode, the
+  same two models, the same eight tasks and seeds, scored the same way
+  (tests pass, protected files untouched):
+
+  | harness, model | landed | mean secs a run | mean prompt peak |
+  |---|---|---|---|
+  | OpenCode, gemma (32k window) | 16/16 | 21 | 9,382 |
+  | statie build 18, gemma (16k) | 13/16 | 178 | 7,140 |
+  | statie build 13, gemma (16k) | 15/16 | 100 | 6,721 |
+  | OpenCode, qwen (32k) | 14/16 | 15 | 9,106 |
+  | statie build 19, qwen json (16k) | 13/16 | 211 | 11,223 |
+
+  Landing: OpenCode is one to three runs ahead on gemma and one on
+  Qwen, inside D22's noise on Qwen and at its edge on gemma. Time: an
+  order of magnitude. The event streams say why. OpenCode's history is
+  append-only, so each turn sends about 200 new tokens and reads about
+  8,000 from Ollama's prefix cache; a two-request probe on the host
+  showed a cached 2,422-token prompt evaluating in 0.09 s against 0.97 s
+  cold. statie rewrites its prompt every step, so most of each 6,000
+  to 11,000-token prompt is evaluated again: about 4 s a step against
+  well under one. The state design saves tokens in the prompt and
+  spends them in the cache. Qwen's two OpenCode misses: a tool call
+  emitted as text (`<function=grep>`) that ended the run at step 0,
+  and a reasoning stall with no edit.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

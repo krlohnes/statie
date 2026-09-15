@@ -342,8 +342,23 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 35. Every step records how much of its prompt was evaluated
+- **Status.** Building. Evidence: D25; the probe showed
+  `prompt_eval_count` reports the whole prompt whether cached or not,
+  while `prompt_eval_duration` drops tenfold on a cache hit, so the
+  duration is the only signal the host gives.
+- **What.** `Usage` gains `prompt_eval_secs` and `eval_secs` (from
+  Ollama's `prompt_eval_duration` and `eval_duration`, nanoseconds;
+  absent on other backends), logged with each step's usage. The bench
+  outcome line gains `peval=<mean prompt-eval seconds per step>` and
+  the task table a `mean peval` column; `sweep_summary.py` shows it.
+- **Why.** Without it the cache cost of any prompt-layout change is
+  invisible, and item 36 (a cacheable prefix) cannot be measured.
+- **Measure.** The eight short tasks on gemma: mean peval per step on
+  build 21, as the baseline for item 36.
+
 ### 34. An outside baseline: OpenCode with the same models on the same tasks
-- **Status.** Runner committed (3d3b6fb), verified against a stub. The real event shape is unverified until the host is back: the first real run is a one-task smoke, then the parser is checked against `events.jsonl` before any battery is read. Agreed with the user: every number so far is
+- **Status.** Measured on the eight short tasks (build 20, README, D25): OpenCode gemma 16 of 16 at 21 s a run, Qwen 14 of 16 at 15 s; statie 13 to 15 and 13 at 100 to 211 s. The five long tasks are running. The prompt peak in the OpenCode events is uncached input plus cached prefix. Agreed with the user: every number so far is
   statie against statie; a generic agent loop with the same model on
   the same tasks says whether 13 to 15 of 16 is good, whether the
   guards buy landing or only cost, and whether `refactor_signature` is

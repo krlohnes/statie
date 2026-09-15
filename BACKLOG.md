@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 38. The thinker sends the model's configured `think` flag
-- **Status.** Committed (Milestone 44). Measured next on the Qwen short battery (`qwen_json_short_b23`). Evidence: every Qwen battery (`qwen_json_short_b15`
+- **Status.** Committed (Milestone 44). Measured on `qwen_json_short_b23`: eight `think` calls, zero errors, every one answered; 15 of 16, the best Qwen battery (11 to 13 before), one ahead of OpenCode's 14. Evidence: every Qwen battery (`qwen_json_short_b15`
   to `b19`, `qwen_json_long_b22`): 14 to 82 `think` failures each, all
   `400 "qwen3-coder:latest" does not support thinking`. No `think` has
   ever run under Qwen; every guard that substitutes one (repeated

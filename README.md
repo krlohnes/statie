@@ -1721,6 +1721,16 @@ either a default or a config knob:
   `rename_across_files` at 56 steps and 17 edits, which is D22 noise
   at two seeds. `peval` 0.48 s a step, the same as builds 21 and 22.
 
+  Build 23, Qwen json (item 38 in: the thinker sends the configured
+  `think` flag): 15 of 16, against 11, 12, 11, 13, 13 on the five
+  earlier Qwen batteries, median 17.5 steps, 138 s a run. Eight
+  `think` calls ran and all eight answered, against zero answers in
+  every earlier Qwen battery. This is the first Qwen battery ahead of
+  OpenCode's 14 of 16 on landing, at nine times its wall clock. The
+  one miss is a `rename_across_files` timeout at 126 steps: the model
+  put a file path or nothing in the tool's `name` 107 times, and the
+  rejections alternated between two texts (backlog item 39).
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

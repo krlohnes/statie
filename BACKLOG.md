@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 34. An outside baseline: OpenCode with the same models on the same tasks
-- **Status.** Building. Agreed with the user: every number so far is
+- **Status.** Runner committed (3d3b6fb), verified against a stub. The real event shape is unverified until the host is back: the first real run is a one-task smoke, then the parser is checked against `events.jsonl` before any battery is read. Agreed with the user: every number so far is
   statie against statie; a generic agent loop with the same model on
   the same tasks says whether 13 to 15 of 16 is good, whether the
   guards buy landing or only cost, and whether `refactor_signature` is

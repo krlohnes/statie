@@ -573,3 +573,31 @@ async fn missing_pattern_and_path_reports_what_is_needed() {
         other => panic!("expected InvalidArgs, got: {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Unit 40: the description states the tool's forms and output shape up
+// front, at most 130 words.
+// ---------------------------------------------------------------------
+
+#[test]
+fn description_names_every_argument_and_says_regex_and_output_form() {
+    let desc = tool().description().to_string();
+
+    for arg in ["pattern", "path"] {
+        assert!(desc.contains(arg), "description missing `{arg}`: {desc}");
+    }
+    assert!(
+        desc.contains("regular expression"),
+        "description must say pattern is a regular expression: {desc}"
+    );
+    assert!(
+        desc.contains("path:line"),
+        "description must describe the output form: {desc}"
+    );
+
+    assert!(
+        desc.split_whitespace().count() <= 130,
+        "description is {} words, over the 130-word cap: {desc}",
+        desc.split_whitespace().count()
+    );
+}

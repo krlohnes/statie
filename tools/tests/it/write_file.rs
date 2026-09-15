@@ -2,7 +2,7 @@ use super::support;
 
 use serde_json::json;
 use statie_core::{Tool, ToolError};
-use statie_tools::{ReadFile, WriteFile};
+use statie_tools::{EXISTS_WITH_LINES_SUFFIX, ReadFile, WriteFile};
 
 fn write_tool() -> WriteFile {
     WriteFile {
@@ -92,7 +92,7 @@ async fn rewriting_large_existing_file_is_rejected_and_leaves_it_untouched() {
         ToolError::ExecutionFailed(msg) => {
             assert_eq!(
                 msg,
-                "big.txt exists with 41 lines; write_file replaces the whole file and you would be writing it from memory. Use edit_file (old/new, or after/before + new) for changes to an existing file. If the file is beyond repair, `revert_file` restores its content from before this session's first edit. If you have read the whole file since your last edit of it, the harness allows the rewrite automatically."
+                format!("big.txt exists with 41 lines{EXISTS_WITH_LINES_SUFFIX}")
             );
         }
         other => panic!("expected ExecutionFailed, got: {other:?}"),
@@ -123,7 +123,7 @@ async fn a_62_line_file_is_refused_with_the_extended_message_without_the_flag() 
         ToolError::ExecutionFailed(msg) => {
             assert_eq!(
                 msg,
-                "big.txt exists with 62 lines; write_file replaces the whole file and you would be writing it from memory. Use edit_file (old/new, or after/before + new) for changes to an existing file. If the file is beyond repair, `revert_file` restores its content from before this session's first edit. If you have read the whole file since your last edit of it, the harness allows the rewrite automatically."
+                format!("big.txt exists with 62 lines{EXISTS_WITH_LINES_SUFFIX}")
             );
         }
         other => panic!("expected ExecutionFailed, got: {other:?}"),
@@ -191,4 +191,56 @@ async fn writing_a_new_path_succeeds_regardless_of_content_size() {
 
     let on_disk = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
     assert_eq!(on_disk, content);
+}
+
+// ---------------------------------------------------------------------
+// Unit 40: the description states the tool's forms and failure texts up
+// front, at most 130 words, built from the same const the tool's
+// large-existing-file refusal uses (D13).
+// ---------------------------------------------------------------------
+
+#[test]
+fn description_names_every_argument_and_quotes_the_const_failure_text() {
+    let desc = write_tool().description().to_string();
+
+    for arg in ["path", "content"] {
+        assert!(desc.contains(arg), "description missing `{arg}`: {desc}");
+    }
+    assert!(
+        desc.contains("replaces the whole file"),
+        "description must say it replaces the whole file: {desc}"
+    );
+    assert!(
+        desc.contains(EXISTS_WITH_LINES_SUFFIX),
+        "description missing EXISTS_WITH_LINES_SUFFIX: {desc}"
+    );
+
+    assert!(
+        desc.split_whitespace().count() <= 130,
+        "description is {} words, over the 130-word cap: {desc}",
+        desc.split_whitespace().count()
+    );
+}
+
+#[tokio::test]
+async fn large_file_refusal_matches_the_const_the_description_quotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("big.txt");
+    std::fs::write(&file, lines(50)).unwrap();
+
+    let err = write_tool()
+        .call(json!({"path": "big.txt", "content": "replaced"}), &ctx)
+        .await
+        .unwrap_err();
+
+    match err {
+        ToolError::ExecutionFailed(msg) => {
+            assert_eq!(
+                msg,
+                format!("big.txt exists with 50 lines{EXISTS_WITH_LINES_SUFFIX}")
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
 }

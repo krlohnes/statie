@@ -10,6 +10,12 @@ use statie_core::{Schema, Tool, ToolCtx, ToolError, ToolOutputFull};
 
 use crate::common::{cap_output, join_string_array_args, run_shell};
 
+/// Exact text of the error returned when `cmd` is omitted and no test
+/// command could be auto-detected from the sandbox root's project files.
+/// Quoted (verbatim) in [`TestTool::description`], per D13, so the two
+/// cannot drift.
+pub const NO_TEST_COMMAND_DETECTED_MSG: &str = "no test command detected; pass cmd";
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TestArgs {
     /// The test command to run. If omitted, it is auto-detected from
@@ -32,7 +38,17 @@ impl Tool for TestTool {
     }
 
     fn description(&self) -> &str {
-        "Run the project's test suite (auto-detected, or an explicit command)."
+        static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DESCRIPTION.get_or_init(|| {
+            format!(
+                "Run the project's test suite. cmd (the shell command to run) is optional: if \
+                 omitted, it is auto-detected from project files in the sandbox root (cargo \
+                 test, npm test, pytest, go test ./..., or make test); if none of those files \
+                 are found, the call fails with \"{NO_TEST_COMMAND_DETECTED_MSG}\". Output \
+                 starts with the command and a pass/fail verdict line, followed by a failure \
+                 summary (on failure) and the raw output, with passing-test noise stripped."
+            )
+        })
     }
 
     fn args_schema(&self) -> Schema {
@@ -47,7 +63,7 @@ impl Tool for TestTool {
         let cmd = match args.cmd {
             Some(c) => c,
             None => detect_test_command(ctx.root.path()).ok_or_else(|| {
-                ToolError::ExecutionFailed("no test command detected; pass cmd".to_string())
+                ToolError::ExecutionFailed(NO_TEST_COMMAND_DETECTED_MSG.to_string())
             })?,
         };
 

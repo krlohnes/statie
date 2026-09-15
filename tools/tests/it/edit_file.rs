@@ -2,7 +2,7 @@ use super::support;
 
 use serde_json::json;
 use statie_core::{Tool, ToolError};
-use statie_tools::EditFile;
+use statie_tools::{EditFile, OLD_NOT_FOUND_PREFIX, OLD_NOT_FOUND_SUFFIX, WRONG_FORM_MSG};
 
 fn edit_tool() -> EditFile {
     EditFile {
@@ -157,7 +157,7 @@ fn description_and_schema_document_anchor_insertion() {
         tool.description()
     );
     assert!(
-        tool.description().contains("Prefer the anchor form"),
+        tool.description().contains("anchor"),
         "description was: {}",
         tool.description()
     );
@@ -726,7 +726,8 @@ async fn old_missing_with_matching_after_still_errors_and_leaves_file_unchanged(
 
     match &err {
         ToolError::ExecutionFailed(msg) => {
-            assert!(msg.contains("old text not found"), "got: {msg}");
+            assert!(msg.starts_with(OLD_NOT_FOUND_PREFIX), "got: {msg}");
+            assert!(msg.contains(OLD_NOT_FOUND_SUFFIX), "got: {msg}");
         }
         other => panic!("expected ExecutionFailed, got: {other:?}"),
     }
@@ -2177,10 +2178,7 @@ async fn content_with_no_addressing_field_is_invalid_args_with_exact_message() {
         .unwrap_err();
 
     match &err {
-        ToolError::InvalidArgs(msg) => assert_eq!(
-            msg,
-            "`edit_file` changes part of a file: give `new` with one of `old` (exact text to replace), `after`/`before` (an anchor line), or `lines` (\"START-END\" as shown by read_file). To replace the whole file, call `write_file` with `path` and `content`."
-        ),
+        ToolError::InvalidArgs(msg) => assert_eq!(msg, WRONG_FORM_MSG),
         other => panic!("expected InvalidArgs, got: {other:?}"),
     }
 }
@@ -2198,10 +2196,7 @@ async fn new_only_with_no_addressing_field_is_invalid_args_with_exact_message() 
         .unwrap_err();
 
     match &err {
-        ToolError::InvalidArgs(msg) => assert_eq!(
-            msg,
-            "`edit_file` changes part of a file: give `new` with one of `old` (exact text to replace), `after`/`before` (an anchor line), or `lines` (\"START-END\" as shown by read_file). To replace the whole file, call `write_file` with `path` and `content`."
-        ),
+        ToolError::InvalidArgs(msg) => assert_eq!(msg, WRONG_FORM_MSG),
         other => panic!("expected InvalidArgs, got: {other:?}"),
     }
 }
@@ -2248,5 +2243,66 @@ async fn missing_new_with_lines_is_invalid_args_with_exact_message() {
             "`new` is required: the replacement text (with `old` or `lines`) or the text to insert (with `after`/`before`)"
         ),
         other => panic!("expected InvalidArgs, got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Unit 40: the description states the tool's forms and failure texts up
+// front, at most 130 words, built from the same consts the tool's errors
+// use (D13).
+// ---------------------------------------------------------------------
+
+#[test]
+fn description_names_every_argument_and_quotes_the_const_failure_texts() {
+    let desc = edit_tool().description().to_string();
+
+    for arg in ["path", "old", "new", "after", "before", "lines"] {
+        assert!(desc.contains(arg), "description missing `{arg}`: {desc}");
+    }
+
+    assert!(
+        desc.contains(OLD_NOT_FOUND_PREFIX),
+        "description missing OLD_NOT_FOUND_PREFIX: {desc}"
+    );
+    assert!(
+        desc.contains(OLD_NOT_FOUND_SUFFIX),
+        "description missing OLD_NOT_FOUND_SUFFIX: {desc}"
+    );
+    assert!(
+        desc.contains(WRONG_FORM_MSG),
+        "description missing WRONG_FORM_MSG: {desc}"
+    );
+
+    assert!(
+        desc.split_whitespace().count() <= 130,
+        "description is {} words, over the 130-word cap: {desc}",
+        desc.split_whitespace().count()
+    );
+}
+
+#[tokio::test]
+async fn old_not_found_error_matches_the_consts_the_description_quotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("nope.txt");
+    std::fs::write(&file, "line one\nline two\n").unwrap();
+
+    let err = edit_tool()
+        .call(
+            json!({"path": "nope.txt", "old": "zzz not present zzz", "new": "x"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => {
+            let expected_fixed = format!("{OLD_NOT_FOUND_PREFIX}nope.txt{OLD_NOT_FOUND_SUFFIX}");
+            assert!(
+                msg.starts_with(&expected_fixed),
+                "got: {msg}, expected prefix: {expected_fixed}"
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
     }
 }

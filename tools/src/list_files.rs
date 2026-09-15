@@ -43,7 +43,11 @@ impl Tool for ListFiles {
     }
 
     fn description(&self) -> &str {
-        "Recursively list files and directories under a sandbox path."
+        "Recursively list files and directories under a sandbox path. Give path (a directory \
+         relative to the sandbox root, default \".\"), and optionally max (maximum entries to \
+         return, default 200). Skips common noise directories (.git, target, node_modules, \
+         .statie, __pycache__, .venv, venv). Directories are listed with a trailing slash; if \
+         there are more entries than max, a final line notes how many were omitted."
     }
 
     fn args_schema(&self) -> Schema {

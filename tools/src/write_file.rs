@@ -15,6 +15,15 @@ use crate::common::{backup_before_edit, cap_output, join_string_array_args, writ
 /// size or larger.
 const MAX_EXISTING_FILE_LINES: usize = 40;
 
+/// Fixed part of the large-existing-file refusal, following `"{path} exists
+/// with {n} lines"`. Quoted (verbatim) in [`WriteFile::description`], per
+/// D13, so the two cannot drift.
+pub const EXISTS_WITH_LINES_SUFFIX: &str = "; write_file replaces the whole file and you would \
+    be writing it from memory. Use edit_file (old/new, or after/before + new) for changes to an \
+    existing file. If the file is beyond repair, `revert_file` restores its content from before \
+    this session's first edit. If you have read the whole file since your last edit of it, the \
+    harness allows the rewrite automatically.";
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteFileArgs {
     /// Path to the file, relative to the sandbox root. Parent directories
@@ -48,7 +57,17 @@ impl Tool for WriteFile {
     }
 
     fn description(&self) -> &str {
-        "Write a text file into the sandbox, creating parent directories as needed."
+        static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DESCRIPTION.get_or_init(|| {
+            format!(
+                "Write a text file into the sandbox, creating parent directories as needed. \
+                 Give path and content (the full file contents); write_file replaces the whole \
+                 file, it does not patch it. An existing file over 40 lines is refused (name \
+                 and line count first) unless the harness has recorded a full recent read of \
+                 it, with the text \"{EXISTS_WITH_LINES_SUFFIX}\" For changes to an existing \
+                 file, prefer edit_file."
+            )
+        })
     }
 
     fn args_schema(&self) -> Schema {
@@ -73,7 +92,7 @@ impl Tool for WriteFile {
             let n = bytecount_lines(&existing);
             if n > MAX_EXISTING_FILE_LINES && !args.confirmed_full_read {
                 return Err(ToolError::ExecutionFailed(format!(
-                    "{} exists with {n} lines; write_file replaces the whole file and you would be writing it from memory. Use edit_file (old/new, or after/before + new) for changes to an existing file. If the file is beyond repair, `revert_file` restores its content from before this session's first edit. If you have read the whole file since your last edit of it, the harness allows the rewrite automatically.",
+                    "{} exists with {n} lines{EXISTS_WITH_LINES_SUFFIX}",
                     args.path
                 )));
             }

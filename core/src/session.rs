@@ -351,6 +351,11 @@ pub fn error_shape(reason: &str) -> String {
     }
 }
 
+/// The fixed opening of the redundant-identical-read refusal below (7.8),
+/// exported so `tools/src/read_file.rs` can quote it in `read_file`'s
+/// description without a second copy of the text (D13).
+pub const REDUNDANT_READ_PREFIX: &str = "you already ran";
+
 /// Unit 39: true when `reason` is one of the `tool_rejected` texts produced
 /// when the call named no USABLE tool at all, rather than a real tool that
 /// then failed -- so the repeated-tool-error streak below can key every such
@@ -2303,7 +2308,7 @@ where
                     };
                     skip = Some(SkippedCall {
                         reason: format!(
-                            "you already ran `{name} {args}` at step {at_step} and nothing has \
+                            "{REDUNDANT_READ_PREFIX} `{name} {args}` at step {at_step} and nothing has \
                              changed since; {where_clause}. Read a different range (pass \
                              offset/limit), search for what you need, or make the change you \
                              committed to"

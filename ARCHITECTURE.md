@@ -2009,3 +2009,28 @@ instructions contains the paragraph exactly once; the plan bullet is
 the new one and not the old; the three full-instruction snapshots,
 exact).
 
+## Milestone 47: tool descriptions state their forms and failure texts (BACKLOG.md item 40)
+
+The six core tools' `description()` (`tools/src/edit_file.rs`,
+`read_file.rs`, `write_file.rs`, `search.rs`, `list_files.rs`,
+`test_tool.rs`) now say, in order, what the tool does, every argument
+and which are alternatives, the rules batteries show broken (anchors
+copied byte-exact with leading whitespace, an anchor matching one line,
+`content` not being an `edit_file` argument), and the exact text the
+tool returns when a call is wrong. Each quoted failure text is a `pub
+const` the error itself is built from (`WRONG_FORM_MSG`,
+`OLD_NOT_FOUND_PREFIX`/`_SUFFIX`, `EXISTS_WITH_LINES_SUFFIX`,
+`NO_TEST_COMMAND_DETECTED_MSG`); the redundant-read refusal's opening
+lives in core as `REDUNDANT_READ_PREFIX`, used by the session's guard
+and imported by `read_file`'s description. Descriptions are at most 130
+words and render in the system block, so they cost the cached prefix.
+
+Why: OpenCode's edit tool description states the exact-match rule and
+its failure texts before the first call; statie taught the same rules
+as rejections after the miss, a step each time. The whitespace anchor
+miss ends gemma runs across builds 16 to 22.
+
+Tests: `tools/tests/it/<tool>.rs` for each of the six (the description
+names every argument and contains the imported failure consts; the
+word cap; the tool's actual error equals the const-built text).
+

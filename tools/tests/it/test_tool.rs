@@ -2,7 +2,7 @@ use super::support;
 
 use serde_json::json;
 use statie_core::Tool;
-use statie_tools::{TestTool, detect_test_command};
+use statie_tools::{NO_TEST_COMMAND_DETECTED_MSG, TestTool, detect_test_command};
 
 fn tool() -> TestTool {
     TestTool {
@@ -46,7 +46,7 @@ async fn no_cmd_and_no_detection_is_execution_failed() {
 
     let err = tool().call(json!({}), &ctx).await.unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("no test command detected"), "got: {msg}");
+    assert!(msg.contains(NO_TEST_COMMAND_DETECTED_MSG), "got: {msg}");
 }
 
 #[tokio::test]
@@ -334,4 +334,45 @@ async fn passing_run_with_no_filtered_line_gets_no_note() {
         !text.contains("filtered out by this command"),
         "got: {text}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Unit 40: the description names `cmd` and states the no-`cmd` behaviour
+// and its exact failure text, at most 130 words, built from the same
+// const the tool's error uses (D13).
+// ---------------------------------------------------------------------
+
+#[test]
+fn description_names_cmd_and_quotes_the_const_failure_text() {
+    let desc = tool().description().to_string();
+
+    assert!(desc.contains("cmd"), "description missing `cmd`: {desc}");
+    assert!(
+        desc.contains(NO_TEST_COMMAND_DETECTED_MSG),
+        "description missing NO_TEST_COMMAND_DETECTED_MSG: {desc}"
+    );
+    assert!(
+        desc.contains("auto-detected"),
+        "description must say a missing cmd is auto-detected: {desc}"
+    );
+
+    assert!(
+        desc.split_whitespace().count() <= 130,
+        "description is {} words, over the 130-word cap: {desc}",
+        desc.split_whitespace().count()
+    );
+}
+
+#[tokio::test]
+async fn no_cmd_error_matches_the_const_the_description_quotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+
+    let err = tool().call(json!({}), &ctx).await.unwrap_err();
+    match err {
+        statie_core::ToolError::ExecutionFailed(msg) => {
+            assert_eq!(msg, NO_TEST_COMMAND_DETECTED_MSG);
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
 }

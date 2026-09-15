@@ -51,7 +51,14 @@ impl Tool for Search {
     }
 
     fn description(&self) -> &str {
-        "Search file contents under the sandbox with a regular expression; returns path:line: text. Use it to find definitions and usages before reading whole files."
+        "Search file contents under the sandbox with a regular expression (Rust regex syntax). \
+         Give pattern (required, unless path names a single file, in which case an omitted \
+         pattern shows the start of that file instead of searching) and optionally path (a \
+         directory or file to search under, default the sandbox root), glob, case_insensitive, \
+         and max_results. Output is one or more \"path:line: text\" rows (a leading \
+         path:line- row is context, not a match), preceded by a match count and, on a hit, a \
+         trailer suggesting an edit_file or read_file call at the first match. Use it to find \
+         definitions and usages before reading whole files."
     }
 
     fn args_schema(&self) -> Schema {

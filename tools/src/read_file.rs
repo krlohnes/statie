@@ -8,6 +8,16 @@ use statie_core::{Schema, Tool, ToolCtx, ToolError, ToolOutputFull};
 
 use crate::common::{cap_output, join_string_array_args};
 
+/// Fixed prefix of the redundant-identical-read refusal that
+/// `core/src/session.rs`'s 7.8 guard returns for a repeated `read_file`
+/// call over an unchanged range (the rest of the message names the call,
+/// step, and where to find the earlier output, and is not fixed text).
+/// Quoted (verbatim) in [`ReadFile::description`]. This text is produced by
+/// the harness's session guard, not by this tool, so it cannot be built
+/// from a shared `pub const` without a core source change (out of scope
+/// here); it is reproduced here as a literal instead.
+pub const REDUNDANT_READ_REFUSAL_PREFIX: &str = statie_core::REDUNDANT_READ_PREFIX;
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
     /// Path to the file, relative to the sandbox root.
@@ -62,7 +72,18 @@ impl Tool for ReadFile {
     }
 
     fn description(&self) -> &str {
-        "Read a window of a text file (default 100 lines, size-capped). Use offset/limit to page; the output tells you the next offset."
+        static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DESCRIPTION.get_or_init(|| {
+            format!(
+                "Read a window of a text file. Give path, and optionally offset (1-based start \
+                 line, default 1) and limit (max lines, default 100; the window is also \
+                 size-capped). The output header shows the total line count and the range \
+                 actually shown, and ends with a trailer naming the next offset when more lines \
+                 remain. Calling this again with the same path/offset/limit after nothing has \
+                 changed is refused, starting \"{REDUNDANT_READ_REFUSAL_PREFIX}\"; pass a \
+                 different offset/limit, or search, or make the change you committed to."
+            )
+        })
     }
 
     fn args_schema(&self) -> Schema {

@@ -388,7 +388,7 @@ moves the metric it was built for. Ordered within each tier.
   and 24.
 
 ### 40. Tool descriptions state their forms and failure texts up front
-- **Status.** Proposed. Evidence: OpenCode's `default.txt` prompt (what
+- **Status.** Committed (Milestone 47). Measured next on the gemma and Qwen short batteries (build 26, after item 41's build 25). Evidence: OpenCode's `default.txt` prompt (what
   it sends to Ollama models; no Qwen or gemma tuning) and its 231-word
   edit tool description state the exact-match rule and its failure
   texts before the first call; statie's `edit_file` description is one

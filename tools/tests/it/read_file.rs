@@ -2,7 +2,7 @@ use super::support;
 
 use serde_json::json;
 use statie_core::{Tool, ToolError};
-use statie_tools::ReadFile;
+use statie_tools::{REDUNDANT_READ_REFUSAL_PREFIX, ReadFile};
 
 fn tool() -> ReadFile {
     ReadFile::new(200_000)
@@ -216,5 +216,39 @@ async fn file_path_alias_is_accepted_for_path() {
     assert!(
         text.starts_with("f.txt (3 lines, showing 1-3)\n"),
         "got: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unit 40: the description states the tool's forms and failure texts up
+// front, at most 130 words. The redundant-identical-read refusal quoted
+// here is produced by the harness's session guard (`core/src/session.rs`,
+// 7.8), not by this tool -- `read_file` never returns it itself -- so it
+// cannot be exercised via `ReadFile::call` here; see
+// `REDUNDANT_READ_REFUSAL_PREFIX`'s doc comment.
+// ---------------------------------------------------------------------
+
+#[test]
+fn description_names_every_argument_and_quotes_the_redundant_read_refusal_prefix() {
+    let tool = tool();
+    let desc = tool.description().to_string();
+
+    for arg in ["path", "offset", "limit"] {
+        assert!(desc.contains(arg), "description missing `{arg}`: {desc}");
+    }
+
+    assert!(
+        desc.contains(REDUNDANT_READ_REFUSAL_PREFIX),
+        "description missing REDUNDANT_READ_REFUSAL_PREFIX: {desc}"
+    );
+    assert!(
+        desc.contains("next offset"),
+        "description must say the output ends with the next offset: {desc}"
+    );
+
+    assert!(
+        desc.split_whitespace().count() <= 130,
+        "description is {} words, over the 130-word cap: {desc}",
+        desc.split_whitespace().count()
     );
 }

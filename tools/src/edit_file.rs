@@ -8,6 +8,26 @@ use statie_core::{Schema, Tool, ToolCtx, ToolError, ToolOutputFull};
 
 use crate::common::{backup_before_edit, cap_output, join_string_array_args, write_atomic};
 
+/// Exact text of the error returned when `edit_file` is called with no
+/// addressing field (`old`/`after`/`before`/`lines`) but `new` or `content`
+/// is present -- the whole-file-rewrite redirect to `write_file`. Built
+/// from and quoted (verbatim) in [`EditFile::description`], per D13, so the
+/// two cannot drift.
+pub const WRONG_FORM_MSG: &str = "`edit_file` changes part of a file: give `new` with one of \
+     `old` (exact text to replace), `after`/`before` (an anchor line), or `lines` \
+     (\"START-END\" as shown by read_file). To replace the whole file, call `write_file` with \
+     `path` and `content`.";
+
+/// Fixed prefix of the "old text not found" error (`{path}` follows this,
+/// then [`OLD_NOT_FOUND_SUFFIX`], then an optional closest-match hint).
+/// Quoted (verbatim) in [`EditFile::description`], per D13.
+pub const OLD_NOT_FOUND_PREFIX: &str = "old text not found in ";
+
+/// Fixed suffix of the "old text not found" error, following the path. See
+/// [`OLD_NOT_FOUND_PREFIX`].
+pub const OLD_NOT_FOUND_SUFFIX: &str =
+    "; re-read the file and copy the text exactly (whitespace matters)";
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EditFileArgs {
     /// Path to the file, relative to the sandbox root. Must already exist
@@ -57,7 +77,19 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &str {
-        "Edit a file in place: replace one exact occurrence of `old` with `new`, insert `new` after/before a single unique anchor line (`after`/`before`), or replace a 1-based inclusive line range (`lines`, \"START-END\") with `new`. Prefer the anchor form for additions."
+        static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DESCRIPTION.get_or_init(|| {
+            format!(
+                "Edit part of an existing text file. Give path and new, plus exactly one of: \
+                 old (exact text to replace, occurring once), after or before (a unique anchor \
+                 line new is inserted after/before), or lines (\"START-END\", 1-based, replaced \
+                 by new). Copy old and anchors byte-exact from a read_file window, leading \
+                 whitespace included; an anchor must match exactly one line. content is not an \
+                 argument; a whole-file rewrite is write_file. A miss returns \
+                 \"{OLD_NOT_FOUND_PREFIX}`path`{OLD_NOT_FOUND_SUFFIX}\". new alone returns \
+                 \"{WRONG_FORM_MSG}\""
+            )
+        })
     }
 
     fn args_schema(&self) -> Schema {
@@ -130,13 +162,7 @@ impl Tool for EditFile {
         // `new` present with no addressing field at all: redirect to
         // write_file with the same exact message either way.
         if mode_count == 0 && (args.content.is_some() || args.new.is_some()) {
-            return Err(ToolError::InvalidArgs(
-                "`edit_file` changes part of a file: give `new` with one of `old` (exact text to \
-                 replace), `after`/`before` (an anchor line), or `lines` (\"START-END\" as shown \
-                 by read_file). To replace the whole file, call `write_file` with `path` and \
-                 `content`."
-                    .to_string(),
-            ));
+            return Err(ToolError::InvalidArgs(WRONG_FORM_MSG.to_string()));
         }
 
         if mode_count != 1 {
@@ -332,7 +358,7 @@ impl Tool for EditFile {
                         CollapsedMatch::None => {
                             let hint = closest_line_hint(&content, old);
                             return Err(ToolError::ExecutionFailed(format!(
-                                "old text not found in {}; re-read the file and copy the text exactly (whitespace matters){hint}",
+                                "{OLD_NOT_FOUND_PREFIX}{}{OLD_NOT_FOUND_SUFFIX}{hint}",
                                 args.path
                             )));
                         }

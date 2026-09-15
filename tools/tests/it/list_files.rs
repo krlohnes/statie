@@ -61,3 +61,21 @@ async fn truncates_with_more_line() {
     assert_eq!(lines[0], "README.md");
     assert!(lines[1].starts_with("… ") && lines[1].ends_with(" more"));
 }
+
+// ---------------------------------------------------------------------
+// Unit 40: the description names the tool's argument up front, at most
+// 130 words.
+// ---------------------------------------------------------------------
+
+#[test]
+fn description_names_path_argument() {
+    let desc = tool().description().to_string();
+
+    assert!(desc.contains("path"), "description missing `path`: {desc}");
+
+    assert!(
+        desc.split_whitespace().count() <= 130,
+        "description is {} words, over the 130-word cap: {desc}",
+        desc.split_whitespace().count()
+    );
+}

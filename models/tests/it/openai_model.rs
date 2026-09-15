@@ -70,6 +70,8 @@ async fn happy_path_streams_reasoning_and_content_and_captures_request() {
         Some(Usage {
             prompt_tokens: 100,
             completion_tokens: 7,
+            prompt_eval_secs: None,
+            eval_secs: None,
         })
     );
 
@@ -288,6 +290,8 @@ async fn finish_reason_length_is_reported() {
         Some(Usage {
             prompt_tokens: 100,
             completion_tokens: 1100,
+            prompt_eval_secs: None,
+            eval_secs: None,
         })
     );
 }

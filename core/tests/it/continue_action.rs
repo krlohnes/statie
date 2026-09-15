@@ -21,8 +21,8 @@ use statie_core::{
     Action, ApplyFn, Budgets, Capabilities, CommittedState, Event, HarnessState, LogKind,
     LoggedPatch, Model, ModelError, NullSink, Outcome, Park, ParsedOutput, PatchError,
     PatchStrategy, RawOutput, SandboxRoot, Schema, Session, SessionConfig, SessionLog,
-    SessionLogExt, Skill, SkillSpec, StateStore, StepSink, StoreError, ValidatedStep, Version,
-    validate_default,
+    SessionLogExt, Skill, SkillSpec, StateStore, StepSink, StoreError, Usage, ValidatedStep,
+    Version, validate_default,
 };
 
 // ---------------------------------------------------------------------
@@ -154,6 +154,10 @@ where
 struct ScriptedModel {
     turns: Mutex<Vec<String>>,
     prompts: Mutex<Vec<String>>,
+    /// Usage to attach to each turn's `RawOutput`, by index; a turn beyond
+    /// this list (or an entry of `None`) reports no usage, matching
+    /// `ScriptedModel::new`'s previous no-usage behaviour.
+    usages: Mutex<Vec<Option<Usage>>>,
 }
 
 impl ScriptedModel {
@@ -161,6 +165,17 @@ impl ScriptedModel {
         Arc::new(ScriptedModel {
             turns: Mutex::new(turns.into_iter().map(|v| v.to_string()).collect()),
             prompts: Mutex::new(Vec::new()),
+            usages: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Like `new`, but each turn also reports the corresponding `Usage`
+    /// (`None` for a turn with no server-reported usage).
+    fn new_with_usage(turns: Vec<Value>, usages: Vec<Option<Usage>>) -> Arc<ScriptedModel> {
+        Arc::new(ScriptedModel {
+            turns: Mutex::new(turns.into_iter().map(|v| v.to_string()).collect()),
+            prompts: Mutex::new(Vec::new()),
+            usages: Mutex::new(usages),
         })
     }
 
@@ -192,7 +207,17 @@ impl Model for ScriptedModel {
             return Err(ModelError::Backend("script exhausted".to_string()));
         }
         let content = turns.remove(0);
-        Ok(RawOutput::new(prompt.version(), None, content))
+        let mut usages = self.usages.lock().unwrap();
+        let usage = if usages.is_empty() {
+            None
+        } else {
+            usages.remove(0)
+        };
+        let out = RawOutput::new(prompt.version(), None, content);
+        Ok(match usage {
+            Some(u) => out.with_usage(u),
+            None => out,
+        })
     }
 }
 
@@ -709,4 +734,132 @@ async fn three_identical_no_action_outputs_in_a_row_park_via_repeat_cap() {
         }
         other => panic!("step 3: expected Parked(AskUser(_)), got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------
+// The `patch` log entry's `usage` payload (core/src/session.rs, `Active::
+// commit`/`execute`): built from `serde_json::to_value(self.session.
+// last_usage)`, so `Usage`'s own `#[serde(skip_serializing_if =
+// "Option::is_none")]` on `prompt_eval_secs`/`eval_secs` governs whether the
+// keys appear at all (unit 35: "every step records how much of its prompt
+// was evaluated").
+// ---------------------------------------------------------------------
+
+/// A step whose model call reports `Usage` with both timing fields set logs
+/// them, by exact key and value, in the `patch` entry's `usage` object.
+#[tokio::test]
+async fn patch_entry_usage_includes_prompt_eval_secs_when_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let model = ScriptedModel::new_with_usage(
+        vec![step_output(
+            serde_json::json!({"value": 1}),
+            serde_json::json!({"type": "done"}),
+        )],
+        vec![Some(Usage {
+            prompt_tokens: 6136,
+            completion_tokens: 80,
+            prompt_eval_secs: Some(2.4),
+            eval_secs: Some(2.0),
+        })],
+    );
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        statie_core::ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+
+    let skill = Arc::new(ContinueSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let patch_entry = rec
+        .entries()
+        .iter()
+        .find(|e| e.kind == LogKind::Patch)
+        .expect("a committed step logs a Patch entry")
+        .clone();
+    let _ = SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+
+    let usage = patch_entry
+        .payload
+        .get("usage")
+        .expect("Patch entry must carry a usage object when the model call reported one");
+    assert_eq!(
+        usage,
+        &serde_json::json!({
+            "prompt_tokens": 6136,
+            "completion_tokens": 80,
+            "prompt_eval_secs": 2.4,
+            "eval_secs": 2.0
+        }),
+        "patch entry usage payload: {usage}"
+    );
+}
+
+/// A step whose model call reports `Usage` with no timing (both `None`)
+/// logs `prompt_tokens`/`completion_tokens` but omits `prompt_eval_secs`
+/// and `eval_secs` entirely from the `patch` entry's `usage` object --
+/// `skip_serializing_if` on `Usage`, not a `null` value.
+#[tokio::test]
+async fn patch_entry_usage_omits_timing_keys_when_not_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let model = ScriptedModel::new_with_usage(
+        vec![step_output(
+            serde_json::json!({"value": 1}),
+            serde_json::json!({"type": "done"}),
+        )],
+        vec![Some(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            prompt_eval_secs: None,
+            eval_secs: None,
+        })],
+    );
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        statie_core::ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+
+    let skill = Arc::new(ContinueSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let patch_entry = rec
+        .entries()
+        .iter()
+        .find(|e| e.kind == LogKind::Patch)
+        .expect("a committed step logs a Patch entry")
+        .clone();
+    let _ = SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+
+    let usage = patch_entry
+        .payload
+        .get("usage")
+        .expect("Patch entry must carry a usage object when the model call reported one");
+    assert_eq!(
+        usage,
+        &serde_json::json!({"prompt_tokens": 100, "completion_tokens": 10}),
+        "patch entry usage payload must omit prompt_eval_secs/eval_secs keys entirely: {usage}"
+    );
+    assert!(
+        usage.get("prompt_eval_secs").is_none(),
+        "prompt_eval_secs key must be absent, not null: {usage}"
+    );
+    assert!(
+        usage.get("eval_secs").is_none(),
+        "eval_secs key must be absent, not null: {usage}"
+    );
 }

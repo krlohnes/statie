@@ -214,7 +214,10 @@ print('true' if ok else 'false')
     # Parse events.jsonl defensively via bench/opencode_events.py.
     read -r steps tool_err edits srv_max <<< "$(python3 bench/opencode_events.py "$events_file")"
 
-    line="$task_name seed=$seed outcome=$outcome landed=$landed steps=$steps rej=0 tool_err=$tool_err edits=$edits green=$green srv_max=$srv_max secs=$wall_secs"
+    # opencode's events.jsonl carries no Ollama prompt/eval timing, so this
+    # runner always reports peval=- (unit 35: only statie's own Ollama
+    # backend reports prompt_eval_secs/eval_secs).
+    line="$task_name seed=$seed outcome=$outcome landed=$landed steps=$steps rej=0 tool_err=$tool_err edits=$edits green=$green srv_max=$srv_max secs=$wall_secs peval=-"
     echo "$line"
     echo "$line" >> "$out_file"
 
@@ -227,8 +230,10 @@ if [ "$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-# Task table: task | landed k/n | median steps | mean srv_max | mean secs |
-# outcomes -- same shape as cli/src/bench.rs::print_task_table.
+# Task table: task | landed k/n | median steps | mean srv_max | mean peval |
+# mean secs | outcomes -- same shape as cli/src/bench.rs::print_task_table.
+# opencode's events.jsonl carries no Ollama prompt/eval timing, so mean peval
+# is always "-" here (unit 35).
 table=$(python3 - "$out_dir" "${task_names[@]}" <<'PY'
 import statistics
 import sys
@@ -236,7 +241,7 @@ import sys
 out_dir = sys.argv[1]
 task_names = sys.argv[2:]
 
-print(f"{'task':<24} {'landed':>10} {'median steps':>13} {'mean srv_max':>13} {'mean secs':>10}  outcomes")
+print(f"{'task':<24} {'landed':>10} {'median steps':>13} {'mean srv_max':>13} {'mean peval':>10} {'mean secs':>10}  outcomes")
 for name in task_names:
     path = f"{out_dir}/.rows_{name}.tmp"
     try:
@@ -264,7 +269,7 @@ for name in task_names:
     for r in rows:
         outcomes[r[5]] = outcomes.get(r[5], 0) + 1
     outcomes_str = ",".join(f"{k}={v}" for k, v in sorted(outcomes.items()))
-    print(f"{name:<24} {landed:>7}/{total:<2} {median_steps:>13.1f} {mean_srv:>13.1f} {mean_secs:>10.1f}  {outcomes_str}")
+    print(f"{name:<24} {landed:>7}/{total:<2} {median_steps:>13.1f} {mean_srv:>13.1f} {'-':>10} {mean_secs:>10.1f}  {outcomes_str}")
 PY
 )
 

@@ -383,6 +383,24 @@ pub fn server_prompt_token_stats(entries: &[LogEntry]) -> Option<ServerTokenStat
     Some(ServerTokenStats { max, mean, last })
 }
 
+/// Pulls `payload.usage.prompt_eval_secs` from every `Patch` entry that has
+/// one, in log order, and reduces to the mean. `None` if no entry carried
+/// the field (e.g. an OpenAI-compatible backend, which never reports it, or
+/// the mock backend with no scripted timing).
+pub fn mean_prompt_eval_secs(entries: &[LogEntry]) -> Option<f64> {
+    let values: Vec<f64> = entries
+        .iter()
+        .filter(|e| e.kind == statie_core::LogKind::Patch)
+        .filter_map(|e| e.payload.get("usage")?.get("prompt_eval_secs")?.as_f64())
+        .collect();
+
+    if values.is_empty() {
+        return None;
+    }
+
+    Some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
 /// Whether every file listed in `protected` still has byte-identical
 /// contents to the fixture's copy. `None` (rather than `false`) means the
 /// protected list was empty -- there's nothing to violate, so `ok` is
@@ -431,6 +449,10 @@ pub struct RunResult {
     pub edits_landed: usize,
     pub green_checkpoints: usize,
     pub server_tokens: Option<ServerTokenStats>,
+    /// Mean of `usage.prompt_eval_secs` across this run's `Patch` entries
+    /// that reported it (see `mean_prompt_eval_secs`). `None` when no step
+    /// reported prompt-eval timing.
+    pub mean_prompt_eval_secs: Option<f64>,
     pub wall_secs: f64,
     /// Present only on a non-landing run (verify output tail).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -447,6 +469,10 @@ pub struct TaskSummary {
     pub total: usize,
     pub median_steps: f64,
     pub mean_server_max: f64,
+    /// Mean of the per-run `mean_prompt_eval_secs` values that exist across
+    /// this task's runs. `None` when no run in the task reported any
+    /// prompt-eval timing.
+    pub mean_peval: Option<f64>,
     pub mean_secs: f64,
     pub outcomes: BTreeMap<String, usize>,
 }
@@ -536,6 +562,7 @@ pub async fn run_one(
     };
     let summary = MetricsSummary::from_entries(&entries);
     let server_tokens = server_prompt_token_stats(&entries);
+    let mean_prompt_eval_secs = mean_prompt_eval_secs(&entries);
 
     let mut verify_full = String::new();
     let (landed, landed_reason, verify_tail) = match &run_output.outcome {
@@ -579,6 +606,7 @@ pub async fn run_one(
         edits_landed: summary.log.edits_landed,
         green_checkpoints: summary.log.green_checkpoints,
         server_tokens,
+        mean_prompt_eval_secs,
         wall_secs: run_output.wall.as_secs_f64(),
         verify_tail,
         stderr_tail,
@@ -638,15 +666,20 @@ fn persist_run_artifacts(
 }
 
 /// The one-line-per-run summary printed as each run finishes:
-/// `task seed outcome landed steps rej tool_err edits green srv_max secs`.
+/// `task seed outcome landed steps rej tool_err edits green srv_max secs
+/// peval`.
 pub fn format_run_line(r: &RunResult) -> String {
     let srv_max = r
         .server_tokens
         .as_ref()
         .map(|s| s.max.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let peval = r
+        .mean_prompt_eval_secs
+        .map(|v| format!("{v:.2}"))
+        .unwrap_or_else(|| "-".to_string());
     format!(
-        "{} seed={} outcome={} landed={} steps={} rej={} tool_err={} edits={} green={} srv_max={} secs={:.1}",
+        "{} seed={} outcome={} landed={} steps={} rej={} tool_err={} edits={} green={} srv_max={} secs={:.1} peval={}",
         r.task,
         r.seed,
         r.outcome,
@@ -658,6 +691,7 @@ pub fn format_run_line(r: &RunResult) -> String {
         r.green_checkpoints,
         srv_max,
         r.wall_secs,
+        peval,
     )
 }
 
@@ -696,6 +730,15 @@ pub fn summarize_task(runs: &[&RunResult]) -> TaskSummary {
         .filter_map(|r| r.server_tokens.as_ref().map(|s| s.max as f64))
         .collect();
     let secs: Vec<f64> = runs.iter().map(|r| r.wall_secs).collect();
+    let peval: Vec<f64> = runs
+        .iter()
+        .filter_map(|r| r.mean_prompt_eval_secs)
+        .collect();
+    let mean_peval = if peval.is_empty() {
+        None
+    } else {
+        Some(mean_f64(&peval))
+    };
 
     let mut outcomes: BTreeMap<String, usize> = BTreeMap::new();
     for r in runs {
@@ -707,27 +750,34 @@ pub fn summarize_task(runs: &[&RunResult]) -> TaskSummary {
         total,
         median_steps: median_usize(&steps),
         mean_server_max: mean_f64(&srv_max),
+        mean_peval,
         mean_secs: mean_f64(&secs),
         outcomes,
     }
 }
 
 /// Prints the per-task summary table:
-/// `task | landed k/n | median steps | mean srv_max | mean secs | outcomes`.
+/// `task | landed k/n | median steps | mean srv_max | mean peval | mean secs
+/// | outcomes`.
 pub fn print_task_table(tasks: &BTreeMap<String, TaskSummary>) {
     println!(
-        "{:<24} {:>10} {:>13} {:>13} {:>10}  outcomes",
-        "task", "landed", "median steps", "mean srv_max", "mean secs"
+        "{:<24} {:>10} {:>13} {:>13} {:>10} {:>10}  outcomes",
+        "task", "landed", "median steps", "mean srv_max", "mean peval", "mean secs"
     );
     for (name, s) in tasks {
         let outcomes: Vec<String> = s.outcomes.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mean_peval = s
+            .mean_peval
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "{:<24} {:>7}/{:<2} {:>13.1} {:>13.1} {:>10.1}  {}",
+            "{:<24} {:>7}/{:<2} {:>13.1} {:>13.1} {:>10} {:>10.1}  {}",
             name,
             s.landed,
             s.total,
             s.median_steps,
             s.mean_server_max,
+            mean_peval,
             s.mean_secs,
             outcomes.join(","),
         );
@@ -1236,6 +1286,7 @@ mod tests {
                 mean: 100,
                 last: 100,
             }),
+            mean_prompt_eval_secs: Some(1.0),
             wall_secs: 2.0,
             verify_tail: None,
             stderr_tail: None,
@@ -1250,6 +1301,7 @@ mod tests {
             mean: 200,
             last: 200,
         });
+        r2.mean_prompt_eval_secs = Some(3.0);
         r2.wall_secs = 4.0;
 
         let refs = vec![&r1, &r2];
@@ -1258,7 +1310,121 @@ mod tests {
         assert_eq!(summary.total, 2);
         assert_eq!(summary.median_steps, 3.0);
         assert_eq!(summary.mean_server_max, 150.0);
+        assert_eq!(summary.mean_peval, Some(2.0));
         assert_eq!(summary.mean_secs, 3.0);
         assert_eq!(summary.outcomes.get("done"), Some(&2));
+    }
+
+    /// A task whose runs never reported `mean_prompt_eval_secs` (e.g. an
+    /// OpenAI-compatible backend, which never reports prompt-eval timing)
+    /// summarizes to `mean_peval: None`, not `Some(0.0)`.
+    #[test]
+    fn summarize_task_mean_peval_is_none_when_no_run_reported_it() {
+        let r1 = RunResult {
+            task: "t".to_string(),
+            seed: 1,
+            outcome: "done".to_string(),
+            landed: true,
+            landed_reason: None,
+            steps: 2,
+            rejections: 0,
+            tool_errors: 0,
+            edits_landed: 1,
+            green_checkpoints: 0,
+            server_tokens: None,
+            mean_prompt_eval_secs: None,
+            wall_secs: 2.0,
+            verify_tail: None,
+            stderr_tail: None,
+        };
+        let refs = vec![&r1];
+        let summary = summarize_task(&refs);
+        assert_eq!(summary.mean_peval, None);
+    }
+
+    // -- format_run_line --
+
+    fn base_run_result() -> RunResult {
+        RunResult {
+            task: "t".to_string(),
+            seed: 1,
+            outcome: "done".to_string(),
+            landed: true,
+            landed_reason: None,
+            steps: 2,
+            rejections: 0,
+            tool_errors: 0,
+            edits_landed: 1,
+            green_checkpoints: 0,
+            server_tokens: None,
+            mean_prompt_eval_secs: None,
+            wall_secs: 12.34,
+            verify_tail: None,
+            stderr_tail: None,
+        }
+    }
+
+    /// `format_run_line` with `mean_prompt_eval_secs: Some(1.234)` ends
+    /// with ` secs=12.3 peval=1.23` (unit 35 acceptance).
+    #[test]
+    fn format_run_line_with_prompt_eval_secs_ends_with_secs_then_peval() {
+        let mut r = base_run_result();
+        r.mean_prompt_eval_secs = Some(1.234);
+        let line = format_run_line(&r);
+        assert!(line.ends_with(" secs=12.3 peval=1.23"), "got: {line}");
+    }
+
+    /// `format_run_line` with `mean_prompt_eval_secs: None` ends with
+    /// ` peval=-` (unit 35 acceptance).
+    #[test]
+    fn format_run_line_without_prompt_eval_secs_ends_with_peval_dash() {
+        let r = base_run_result();
+        let line = format_run_line(&r);
+        assert!(line.ends_with(" peval=-"), "got: {line}");
+    }
+
+    // -- print_task_table --
+
+    /// The task table header gains a `mean peval` column after `mean
+    /// srv_max`, with every existing column and width unchanged.
+    #[test]
+    fn print_task_table_header_has_mean_peval_after_mean_srv_max() {
+        assert_eq!(
+            format!(
+                "{:<24} {:>10} {:>13} {:>13} {:>10} {:>10}  outcomes",
+                "task", "landed", "median steps", "mean srv_max", "mean peval", "mean secs"
+            ),
+            "task                         landed  median steps  mean srv_max mean peval  mean secs  outcomes"
+        );
+    }
+
+    /// A task summary with `mean_peval: Some(1.234)` renders `1.23` in the
+    /// `mean peval` column; one with `mean_peval: None` renders `-`.
+    #[test]
+    fn print_task_table_row_renders_mean_peval_or_dash() {
+        let with_peval = TaskSummary {
+            landed: 1,
+            total: 2,
+            median_steps: 3.0,
+            mean_server_max: 150.0,
+            mean_peval: Some(1.234),
+            mean_secs: 3.0,
+            outcomes: BTreeMap::new(),
+        };
+        let mean_peval = with_peval
+            .mean_peval
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        assert_eq!(mean_peval, "1.23");
+
+        let without_peval = TaskSummary {
+            mean_peval: None,
+            ..with_peval
+        };
+        let mean_peval = without_peval
+            .mean_peval
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        assert_eq!(mean_peval, "-");
     }
 }

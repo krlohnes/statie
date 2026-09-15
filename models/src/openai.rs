@@ -305,6 +305,8 @@ impl OpenAiCompatModel {
             *usage = Some(Usage {
                 prompt_tokens,
                 completion_tokens: u.completion_tokens.unwrap_or(0),
+                prompt_eval_secs: None,
+                eval_secs: None,
             });
         }
 

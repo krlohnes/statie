@@ -243,6 +243,8 @@ async fn with_usage_round_trips_to_raw_output() {
         Some(Usage {
             prompt_tokens: 123,
             completion_tokens: 45,
+            prompt_eval_secs: None,
+            eval_secs: None,
         })
     );
 }

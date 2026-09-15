@@ -294,10 +294,20 @@ fn join_with_and(items: &[String]) -> String {
 /// (which approximates prompt size with the cl100k encoding), these counts
 /// come from the backend's own tokenizer and are authoritative for that
 /// model.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Seconds the backend spent evaluating (processing) the prompt, when
+    /// reported. Derived from Ollama's `prompt_eval_duration` (nanoseconds);
+    /// `None` for backends that don't report it (e.g. OpenAI-compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_secs: Option<f64>,
+    /// Seconds the backend spent generating the completion, when reported.
+    /// Derived from Ollama's `eval_duration` (nanoseconds); `None` for
+    /// backends that don't report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_secs: Option<f64>,
 }
 
 /// Raw model output for a step: optional reasoning, raw content string, the

@@ -108,6 +108,14 @@ struct ChatLine {
     /// Present on the final (`done: true`) line: number of tokens generated.
     #[serde(default)]
     eval_count: Option<u64>,
+    /// Present on the final (`done: true`) line: nanoseconds spent
+    /// evaluating (processing) the prompt.
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+    /// Present on the final (`done: true`) line: nanoseconds spent
+    /// generating the completion.
+    #[serde(default)]
+    eval_duration: Option<u64>,
     /// Present on the final (`done: true`) line: why generation stopped
     /// (e.g. `"stop"`, `"length"`).
     #[serde(default)]
@@ -504,6 +512,8 @@ fn process_line(
     let usage = parsed.prompt_eval_count.map(|prompt_tokens| Usage {
         prompt_tokens,
         completion_tokens: parsed.eval_count.unwrap_or(0),
+        prompt_eval_secs: parsed.prompt_eval_duration.map(|ns| ns as f64 / 1e9),
+        eval_secs: parsed.eval_duration.map(|ns| ns as f64 / 1e9),
     });
     Ok(Some((usage, parsed.done_reason)))
 }

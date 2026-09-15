@@ -69,7 +69,26 @@ impl MockTurn {
         self.usage = Some(Usage {
             prompt_tokens,
             completion_tokens,
+            prompt_eval_secs: None,
+            eval_secs: None,
         });
+        self
+    }
+
+    /// Sets `prompt_eval_secs` and `eval_secs` on this turn's reported
+    /// `Usage`, for tests exercising prompt/eval timing (`peval=` in bench
+    /// output, the session log's `usage` entry). Chain after
+    /// [`Self::with_usage`] to also set token counts; if no `Usage` has been
+    /// set yet, this starts one with `0` token counts.
+    pub fn with_usage_timing(
+        mut self,
+        prompt_eval_secs: Option<f64>,
+        eval_secs: Option<f64>,
+    ) -> Self {
+        let mut usage = self.usage.unwrap_or_default();
+        usage.prompt_eval_secs = prompt_eval_secs;
+        usage.eval_secs = eval_secs;
+        self.usage = Some(usage);
         self
     }
 

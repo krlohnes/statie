@@ -73,6 +73,8 @@ async fn happy_path_streams_thinking_and_content_and_captures_request() {
         Some(Usage {
             prompt_tokens: 260,
             completion_tokens: 12,
+            prompt_eval_secs: None,
+            eval_secs: None,
         })
     );
 
@@ -339,6 +341,97 @@ async fn done_reason_length_is_reported_as_finish_reason() {
         Some(Usage {
             prompt_tokens: 260,
             completion_tokens: 1100,
+            prompt_eval_secs: None,
+            eval_secs: None,
+        })
+    );
+}
+
+/// A `done` line that reports `prompt_eval_duration`/`eval_duration`
+/// (nanoseconds) converts them to seconds (`ns as f64 / 1e9`) on `Usage`.
+#[tokio::test]
+async fn done_line_with_durations_reports_prompt_eval_and_eval_secs() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"content":"{\"patch\":{}"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop","prompt_eval_count":6136,"prompt_eval_duration":2400000000,"eval_count":80,"eval_duration":2000000000}"#,
+            ],
+        )
+        .await;
+    });
+
+    let model = OllamaModel::new(cfg_for(addr)).expect("build model");
+    let schema = schema();
+
+    let out = model
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("step succeeds");
+
+    assert_eq!(
+        out.usage,
+        Some(Usage {
+            prompt_tokens: 6136,
+            completion_tokens: 80,
+            prompt_eval_secs: Some(2.4),
+            eval_secs: Some(2.0),
+        })
+    );
+}
+
+/// A `done` line without `prompt_eval_duration`/`eval_duration` reports
+/// `None` for both timing fields, even though `prompt_eval_count` and
+/// `eval_count` are present.
+#[tokio::test]
+async fn done_line_without_durations_reports_none_timing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"content":"{\"patch\":{}"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop","prompt_eval_count":6136,"eval_count":80}"#,
+            ],
+        )
+        .await;
+    });
+
+    let model = OllamaModel::new(cfg_for(addr)).expect("build model");
+    let schema = schema();
+
+    let out = model
+        .step(
+            build_prompt(Version(0)),
+            &schema,
+            &mut NullSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("step succeeds");
+
+    assert_eq!(
+        out.usage,
+        Some(Usage {
+            prompt_tokens: 6136,
+            completion_tokens: 80,
+            prompt_eval_secs: None,
+            eval_secs: None,
         })
     );
 }

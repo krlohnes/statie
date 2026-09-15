@@ -519,6 +519,8 @@ async fn last_usage_reflects_the_most_recent_model_call() {
         Some(Usage {
             prompt_tokens: 200,
             completion_tokens: 20,
+            prompt_eval_secs: None,
+            eval_secs: None,
         })
     );
 }
@@ -571,6 +573,8 @@ async fn rejected_output_with_usage_records_last_usage_and_log_payload() {
         Some(Usage {
             prompt_tokens: 50,
             completion_tokens: 3,
+            prompt_eval_secs: None,
+            eval_secs: None,
         })
     );
 

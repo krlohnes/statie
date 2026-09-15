@@ -6,12 +6,13 @@
 Reads every bench-runs/<label>/*.out file (one per combo, written by
 bench/run_sweep.sh), parses each battery's "outcome=" lines (the same
 format the batteries print: task, seed, outcome, landed, steps, rej,
-tool_err, edits, green, srv_max, secs), and prints one row per combo:
+tool_err, edits, green, srv_max, secs, peval), and prints one row per combo:
 
-    combo  landed/total  median steps  mean srv_max  mean secs
+    combo  landed/total  median steps  mean srv_max  mean peval  mean secs
 
-sorted by landed descending, then median steps ascending. srv_max values of
-"-" are skipped when computing the mean srv_max for a combo.
+sorted by landed descending, then median steps ascending. srv_max/peval
+values of "-" are skipped when computing that combo's mean; a combo with no
+peval value at all reports "-" for mean peval rather than 0.0.
 """
 import statistics
 import sys
@@ -65,6 +66,13 @@ def summarize(label):
         secs = [float(r["secs"]) for r in rows if "secs" in r]
         mean_secs = sum(secs) / len(secs) if secs else 0.0
 
+        pevals = [
+            float(r["peval"])
+            for r in rows
+            if r.get("peval") not in (None, "-")
+        ]
+        mean_peval = sum(pevals) / len(pevals) if pevals else None
+
         combo_rows.append(
             {
                 "combo": combo,
@@ -72,6 +80,7 @@ def summarize(label):
                 "total": total,
                 "median_steps": median_steps,
                 "mean_srv_max": mean_srv_max,
+                "mean_peval": mean_peval,
                 "mean_secs": mean_secs,
             }
         )
@@ -81,17 +90,26 @@ def summarize(label):
 
 
 def format_table(combo_rows):
-    header = ("combo", "landed", "median steps", "mean srv_max", "mean secs")
+    header = (
+        "combo",
+        "landed",
+        "median steps",
+        "mean srv_max",
+        "mean peval",
+        "mean secs",
+    )
     lines = []
 
     body = []
     for r in combo_rows:
+        mean_peval = r["mean_peval"]
         body.append(
             (
                 r["combo"],
                 f"{r['landed']}/{r['total']}",
                 f"{r['median_steps']:.1f}",
                 f"{r['mean_srv_max']:.1f}",
+                f"{mean_peval:.2f}" if mean_peval is not None else "-",
                 f"{r['mean_secs']:.1f}",
             )
         )

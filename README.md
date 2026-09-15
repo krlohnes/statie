@@ -1658,6 +1658,24 @@ either a default or a config knob:
   confined to its working directory, and one Qwen run compiled a
   scratch program in the repository root.
 
+  Build 21 (item 35 in: `prompt_eval_duration` reported per step),
+  gemma on the short tasks: 16 of 16, the first full battery on gemma,
+  median 12.5 steps, 84 s a run. The new column is the finding. Mean
+  prompt evaluation was 0.46 s a step for 6,000 to 8,800-token prompts;
+  at the cold rate measured on build 20 those prompts would take about
+  2.4 s, and 150 of the 266 steps came in under half a second. Ollama
+  is already serving most of statie's prompt from its prefix cache:
+  the system block is stable, and the working set changes only where
+  the model edited it. D25's diagnosis was wrong about where the time
+  goes. The median step is 3.25 s, split as: 0.5 s prompt evaluation,
+  1.1 s generation (median 220 completion tokens, p90 482, at about 200
+  tokens a second), 1.4 s for the maintainer's second model call, and
+  the rest in tools. OpenCode's gemma turn writes a median 49 tokens.
+  statie's step is long because the model writes a state patch every
+  step and a second model then writes notes about it, not because the
+  host re-reads the prompt. D25 addendum; item 36's layout change is
+  now expected to move `peval` by tenths of a second, not seconds.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

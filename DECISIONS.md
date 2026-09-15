@@ -578,4 +578,21 @@ holds the resulting design; this file holds why.
   out of statie's reach with Qwen is measured on build 21; if statie
   misses it, the four-window layout is the limiter, which is this
   entry's conclusion from the other side.
+- **Addendum (build 21): the diagnosis was wrong; the check still
+  stands.** With `prompt_eval_duration` reported per step (item 35),
+  gemma's build-21 battery (16 of 16) evaluated its 6,000 to 8,800-token
+  prompts in a mean 0.46 s a step, a fifth of the cold rate, with 150
+  of 266 steps under 0.5 s. The prefix cache is already doing most of
+  its work: the system block never changes and the working set is
+  rewritten only where the model edited it. The 3.25 s median step
+  splits into 0.5 s prompt evaluation, 1.1 s generation (median 220
+  completion tokens against OpenCode's 49), 1.4 s for the maintainer's
+  own model call, and about 0.3 s of tools. Two thirds of the step is
+  output, and the maintainer's share was never counted in D17, which
+  weighed it in steps alone. The cacheable-prefix work (item 36) keeps
+  a small ceiling, tenths of a second a step. The levers that could
+  meet the 1.5 s check are the size of the patch the model writes each
+  step and whether the maintainer runs on every step. Neither is
+  decided here; item 36's measurement (build 22) comes first, and the
+  maintainer's time cost joins D17's evidence when it is weighed again.
 

@@ -361,7 +361,7 @@ moves the metric it was built for. Ordered within each tier.
   `short_fixer_b21`; landing and steps unchanged.
 
 ### 35. Every step records how much of its prompt was evaluated
-- **Status.** Committed (Milestone 41). Baseline next: `short_fixer_b21` on gemma. Evidence: D25; the probe showed
+- **Status.** Committed (Milestone 41). Measured on `short_fixer_b21` (gemma, 16/16): mean `peval` 0.46 s a step at 6k to 8.8k prompts, a fifth of the cold rate, so the cache is already mostly hitting; the step's time is generation (1.1 s) and the maintainer call (1.4 s). D25 addendum. Evidence: D25; the probe showed
   `prompt_eval_count` reports the whole prompt whether cached or not,
   while `prompt_eval_duration` drops tenfold on a cache hit, so the
   duration is the only signal the host gives.

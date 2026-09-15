@@ -4,6 +4,11 @@
 #   bench/run_opencode.sh <label> <provider/model> [--task NAME ...] \
 #     [--seeds N] [--dry-run]
 #
+# OPENCODE_TEMPLATE=<path> picks the opencode.json template (default
+# bench/opencode.template.json); bench/opencode.16k.template.json declares a
+# 16k `limit.context` on both models so OpenCode compacts its history to the
+# window statie pins, instead of riding the host's 32k server default.
+#
 # Runs the opencode CLI (or a stub via OPENCODE_BIN, for testing -- the real
 # model host is down and must never be invoked by this script) over the same
 # bench/tasks/<name>/ fixtures `statie bench` uses, and scores each run the
@@ -141,7 +146,7 @@ for task_name in "${task_names[@]}"; do
     # by -m on the command line, so the template carries only the provider
     # block (both models declared, no top-level "model" key -- see
     # bench/opencode.template.json).
-    cp bench/opencode.template.json "$sandbox/opencode.json"
+    cp "${OPENCODE_TEMPLATE:-bench/opencode.template.json}" "$sandbox/opencode.json"
 
     cmd=("$opencode_bin" run --dir "$sandbox" -m "$model" --auto --format json --pure "$prompt")
 

@@ -455,6 +455,19 @@ holds the resulting design; this file holds why.
   appears in a park only on runs that would otherwise have timed out.
   A landed-task regression that carries that shape reopens the
   threshold.
+- **Addendum (build 22, statie with Qwen on the long tasks).**
+  `refactor_signature` missed on both seeds with Qwen too (19 and 30
+  steps, never green), inside a battery of 3 of 10 against OpenCode's
+  10 of 10 on the same model and seeds (README, build 22). The
+  "capability miss" reading is closed: the model lands it in a generic
+  loop with a 32k window; statie does not with four windows of 16k
+  (prompt peaks 12.4k to 14.3k) and, in this battery, a `think` that
+  failed on every call (item 38). D25's addendum said this outcome
+  would name the four-window layout as the limiter. It does. What to
+  do about the layout is the next decision, taken after item 38 gives
+  Qwen a working `think` and the numbers are re-measured once; the
+  window count and size are config (item 33's sweep, six combinations
+  unrun) and the sweep is the instrument.
 
 ## D22. Two-seed comparisons pick defaults; they do not establish effects
 

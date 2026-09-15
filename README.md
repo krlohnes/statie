@@ -1694,6 +1694,24 @@ either a default or a config knob:
   (D26): null on its own measure, and the order with the 16 of 16
   battery behind it is the one to keep.
 
+  statie with Qwen on the five long tasks (build 22, `qwen_json_long_b22`):
+  3 of 10 at 277 s a run, against OpenCode's 10 of 10 at 159 s with the
+  same model, tasks and seeds. Landed: `design_fork` once and
+  `python_three_modules` twice. `refactor_signature` missed both seeds
+  (19 and 30 steps, 3 and 2 edits, never green), `multi_file_feature`
+  both (53 and 39 steps, 9 and 4 edits, never green), `trap_interest`
+  both (122 and 69 steps, 12 and 11 edits, never green). Prompt peaks
+  ran 12.4k to 14.3k on the pinned 16k window; OpenCode's peaks on the
+  same runs ran 11k to 33k, above 16k on four of the ten. Two caveats
+  that cut the same way. Every `think` in every Qwen battery, this one
+  included, failed with Ollama's `does not support thinking` because
+  the thinker sends the flag regardless of the model's config (backlog
+  item 38): the guards that substitute a `think` spent their step on an
+  error, 76 times here. And the working set is four windows of a 16k
+  context (D3, D21) on tasks OpenCode needed twice that to land. The
+  D21 question is answered from the other side: the task is not out of
+  the model's reach, it is out of this layout's.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

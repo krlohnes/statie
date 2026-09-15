@@ -417,7 +417,7 @@ moves the metric it was built for. Ordered within each tier.
   build 21, as the baseline for item 36.
 
 ### 34. An outside baseline: OpenCode with the same models on the same tasks
-- **Status.** Measured on the eight short tasks (build 20, README, D25): OpenCode gemma 16 of 16 at 21 s a run, Qwen 14 of 16 at 15 s; statie 13 to 15 and 13 at 100 to 211 s. Long tasks: gemma 8 of 10 (its refactor passes edited the protected tests), Qwen 10 of 10 with `refactor_signature` landed honestly on both seeds. The prompt peak in the OpenCode events is uncached input plus cached prefix. Agreed with the user: every number so far is
+- **Status.** Measured on the eight short tasks (build 20, README, D25): OpenCode gemma 16 of 16 at 21 s a run, Qwen 14 of 16 at 15 s; statie 13 to 15 and 13 at 100 to 211 s. Long tasks: gemma 8 of 10 (its refactor passes edited the protected tests), Qwen 10 of 10 with `refactor_signature` landed honestly on both seeds. statie with Qwen on the long tasks (build 22): 3 of 10 at 277 s a run, `refactor_signature` 0 of 2, with `think` failing on every call (item 38); D21 addendum. The prompt peak in the OpenCode events is uncached input plus cached prefix. Agreed with the user: every number so far is
   statie against statie; a generic agent loop with the same model on
   the same tasks says whether 13 to 15 of 16 is good, whether the
   guards buy landing or only cost, and whether `refactor_signature` is

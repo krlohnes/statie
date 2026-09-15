@@ -342,6 +342,30 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 34. An outside baseline: OpenCode with the same models on the same tasks
+- **Status.** Building. Agreed with the user: every number so far is
+  statie against statie; a generic agent loop with the same model on
+  the same tasks says whether 13 to 15 of 16 is good, whether the
+  guards buy landing or only cost, and whether `refactor_signature` is
+  a model limit or a statie limit.
+- **What.** `bench/run_opencode.sh <label> <provider/model> [--task ..]
+  [--seeds N]`: per task and seed, copy the fixture to a sandbox, run
+  `opencode run --auto --format json` with the task prompt under the
+  task's timeout, then score exactly as `statie bench` does: `test_cmd`
+  exit 0 and protected files byte-identical to the fixture. Write the
+  same `outcome=` line shape so `sweep_summary.py` and the audit read
+  it (steps = tool calls counted from the events; prompt tokens from
+  the events when present). Two seeds, both models, the eight short
+  tasks first, then the five long ones.
+- **Why.** Item 2's arms compared two statie designs. This compares
+  statie to not-statie.
+- **Measure.** Landed per model, OpenCode against statie's latest
+  build on the same tasks; wall clock; prompt tokens where the events
+  carry them.
+- **Caveat.** OpenCode talks to Ollama through the OpenAI-compatible
+  endpoint, which cannot set `num_ctx`; the loaded context is whatever
+  the server defaults to. Recorded from `/api/ps` at run time.
+
 ### 33. A knob sweep runner: the model is a config field, the knobs are the experiment
 - **Status.** Committed (Milestone 40). First sweep running: `qwen_sweep_16k` and `qwen_sweep_24k` (see Measure; the window pairs `num_ctx` with `budget.total`, so it is two base configs rather than a third knob). Agreed with the user: no per-model defaults in
   code; a recommendation is a config file; the sweep varies the knobs

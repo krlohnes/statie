@@ -1765,6 +1765,14 @@ either a default or a config knob:
   OpenCode's ten at 32k; at equal room it is still three runs ahead
   of statie and five times faster.
 
+  Build 24, Qwen json (item 39 in: calls that name no tool are one
+  streak): 15 of 16 again, median 16 steps, 112 s a run. No run sent
+  two nameless or path-named calls in a row, so the class park had
+  nothing to catch this time; two Qwen batteries at 15 of 16 on the
+  builds with a working `think`. The miss is `add_function` seed 2, an
+  edit churn: 14 edits and 8 test runs, never green, parked on a
+  question at 42 steps, an old shape.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

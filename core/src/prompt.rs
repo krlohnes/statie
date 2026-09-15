@@ -26,9 +26,7 @@ pub enum Section {
     Notes,
     HarnessView,
     /// Unit 26 (situational rules): `Skill::situational`'s localised,
-    /// per-step guidance. Unit 36 moved this (with the rest of the user
-    /// block) so it renders right after notes and before augmentation,
-    /// not after the harness view.
+    /// per-step guidance, rendered right after the harness view.
     Situational,
     WorkingSet,
     Augmentation,
@@ -64,14 +62,10 @@ pub struct OverBudget {
     pub limit: usize,
 }
 
-/// Builds a `BoundedPrompt`. Sections may be supplied in any call order.
-/// The system block is always emitted System, Spec, Tools. The user block
-/// is always emitted AgentState, WorkingSet, Notes, Situational,
-/// Augmentation, HarnessView, Observation (unit 36: this layout keeps the
-/// harness's per-step counters, which change every step, at the end of the
-/// user block, so the prefix through the working set stays byte-identical
-/// across consecutive steps and is eligible for prompt-prefix caching). A
-/// section that was never supplied is simply omitted.
+/// Builds a `BoundedPrompt`. Sections may be supplied in any call order;
+/// they are always emitted in the fixed order System, Spec, Tools,
+/// AgentState, Notes, HarnessView, Situational, WorkingSet, Augmentation,
+/// Observation. A section that was never supplied is simply omitted.
 pub struct PromptBuilder<'t> {
     tokenizer: &'t dyn Tokenizer,
     budgets: Budgets,
@@ -157,9 +151,8 @@ impl<'t> PromptBuilder<'t> {
     }
 
     /// Renders `Skill::situational`'s localised, per-step guidance (unit
-    /// 26), placed right after notes and before augmentation (unit 36).
-    /// `None` or empty text renders nothing -- the same as never calling
-    /// this method, so a
+    /// 26), placed right after the harness view. `None` or empty text
+    /// renders nothing -- the same as never calling this method, so a
     /// skill with the switch off (or with no situational text for this
     /// step) leaves the prompt byte-identical to before this section
     /// existed. Budgeted the same as `notes` (see `build`'s per-section
@@ -292,11 +285,11 @@ impl<'t> PromptBuilder<'t> {
             .join("\n\n");
         let user: String = [
             IDX_AGENT,
-            IDX_WORKING_SET,
             IDX_NOTES,
-            IDX_SITUATIONAL,
-            IDX_AUGMENTATION,
             IDX_HARNESS,
+            IDX_SITUATIONAL,
+            IDX_WORKING_SET,
+            IDX_AUGMENTATION,
             IDX_OBSERVATION,
         ]
         .iter()
@@ -315,8 +308,8 @@ impl<'t> PromptBuilder<'t> {
 }
 
 /// A prompt that has been checked against every budget. `system()` is
-/// sections System+Spec+Tools; `user()` is AgentState+WorkingSet+Notes+
-/// Situational+Augmentation+HarnessView+Observation.
+/// sections System+Spec+Tools; `user()` is AgentState+HarnessView+
+/// Augmentation+Observation.
 #[derive(Debug)]
 pub struct BoundedPrompt {
     system: String,

@@ -3,10 +3,8 @@
 //! (`skills/src/coding/mod.rs`). With the switch on, `Skill::situational`
 //! (`core/src/skill.rs`) returns `procedure::render(procedure::
 //! situation(cur))` (`skills/src/coding/procedure.rs`), rendered by the
-//! session as its own `## Now` section (`core/src/session.rs`), placed
-//! right after notes and before augmentation in the user block (unit 36
-//! reordered the user block so the harness view, with its per-step
-//! counters, now renders last). With the switch off (the default), nothing
+//! session as its own `## Now` section right after the harness view
+//! (`core/src/session.rs`). With the switch off (the default), nothing
 //! changes anywhere: no `## Now` section, and the skill's `spec()`
 //! instructions are byte-identical to before this unit existed.
 //!

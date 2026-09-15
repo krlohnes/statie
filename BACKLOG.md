@@ -342,6 +342,22 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 39. Calls that name no tool are one streak, whatever the name
+- **Status.** Proposed. Evidence: `qwen_json_short_b23/rename_across_files/seed1`,
+  107 rejected calls in a row alternating an empty `name` and a file
+  path in `name`; the repeated-error streak keys on the name, so the
+  two alternated and the third-strike park never fired; the run timed
+  out at 126 steps. The same shape appears in `qwen_json_long_b22`.
+- **What.** A `tool_rejected` whose reason is "name is empty" or "not
+  available in skill" is keyed as one class, `<not a tool>`, so the
+  count spans differing names: the second gets a prefix that says a
+  third parks, the third parks with `repeated tool error: <not a
+  tool>`. Real tool errors keep their identical-call key.
+- **Why.** D19: second strike a question, third a park. The class was
+  already a park shape; the key let alternation dodge it for 105 steps.
+- **Measure.** No run on the next Qwen battery with more than three
+  consecutive not-a-tool rejections; landing against build 23 (15/16).
+
 ### 38. The thinker sends the model's configured `think` flag
 - **Status.** Committed (Milestone 44). Measured on `qwen_json_short_b23`: eight `think` calls, zero errors, every one answered; 15 of 16, the best Qwen battery (11 to 13 before), one ahead of OpenCode's 14. Evidence: every Qwen battery (`qwen_json_short_b15`
   to `b19`, `qwen_json_long_b22`): 14 to 82 `think` failures each, all

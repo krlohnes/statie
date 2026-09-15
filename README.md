@@ -1786,6 +1786,24 @@ either a default or a config knob:
   the long tasks, at 13k-token prompts, Qwen drops the tool name and
   keeps the arguments. Backlog item 42.
 
+  Build 25, gemma (item 41 in: the coding skills say "patch what
+  changed"), the same binary otherwise as build 23: 13 of 16, median
+  12.5 steps, 86 s a run against 113. Output moved the way the
+  paragraph asked, part of the way: median completion 168 tokens a
+  step against 214, median generation 0.84 s against 1.02, and the
+  unchanged `task` still resent on 96 of 260 steps against 115 of 308.
+  The whole plan was resent more often, 57 against 40. `peval` rose
+  to 0.49 to 0.73 a step from 0.42 to 0.57, unexplained by a paragraph
+  that sits in the cached system block. The three misses: an
+  `edit_file` repeated three times after "already applied", a
+  `fix_off_by_one` run that answered item 37's repeat refusal with
+  `done` again until it parked at step 8 with no edit, and a
+  `rename_across_files` run that skipped its test and asked nothing
+  twice. Two seeds do not fix the size of the landing move (D22); its
+  direction is the same as build 22's, where less state written went
+  with fewer runs landed. The Qwen battery on this build is next; the
+  decision on the paragraph waits for it.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

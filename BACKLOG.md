@@ -366,7 +366,7 @@ moves the metric it was built for. Ordered within each tier.
   the next Qwen long battery against build 24 (six parks); landing.
 
 ### 41. The coding skills say "patch what changed" where the model reads it
-- **Status.** Committed (Milestone 46). Measured next on the gemma and Qwen short batteries (build 25). Evidence: `short_fixer_b23` (gemma), the
+- **Status.** Committed (Milestone 46). Measured on `short_fixer_b25` (gemma): completion 168 tokens a step against 214, generation 0.84 s against 1.02, 86 s a run against 113; landing 13 of 16 against 16; `task` still resent on 37% of steps. Qwen next; the decision waits for it. Evidence: `short_fixer_b23` (gemma), the
   unchanged `task` resent on 115 of 308 steps and the whole plan on 40;
   `plan` is half of all patch characters. `qwen_json_short_b24`:
   `recent_summary` is 53% of patch characters. Median completion 220

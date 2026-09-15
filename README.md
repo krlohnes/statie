@@ -1731,6 +1731,15 @@ either a default or a config knob:
   put a file path or nothing in the tool's `name` 107 times, and the
   rejections alternated between two texts (backlog item 39).
 
+  Build 23, gemma, the fixer arm with the maintainer off
+  (`short_nomaint_b23`, D17 addendum): 13 of 16 at 68 s a run against
+  16 of 16 at 113 s with it on, median step gap 2.24 s against 3.54.
+  The maintainer's second model call is 1.3 s of every step and two
+  fifths of the wall clock. The three misses, `trap_rounding` on both
+  seeds and one `fix_off_by_one`, all parked on a question, two of
+  them without an edit. The maintainer stays on; the number is what a
+  cheaper maintainer has to beat.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

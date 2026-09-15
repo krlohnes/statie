@@ -350,6 +350,19 @@ holds the resulting design; this file holds why.
   out the working set at peak (mean peak prompt rises with the budget,
   which the 800 row hints at: 8627 against 7857), revisit 200.
 
+- **Addendum (build 23, the fixer arm with the maintainer off).** Same
+  binary, same tasks and seeds, `bench/configs/arm_harness_max_nomaint.json`:
+  13 of 16 against 16 of 16, 68 s a run against 113, median step gap
+  2.24 s against 3.54. The maintainer's call costs 1.3 s a step, two
+  fifths of the wall clock, and the three lost runs (`trap_rounding`
+  both seeds, one `fix_off_by_one`, all parked on a question, two with
+  no edit) are on the tasks whose notes carry the most. Two seeds do
+  not fix the size of the landing effect (D22); its direction agrees
+  with this entry. The maintainer stays on. What this prices is the
+  lever: a maintainer that runs on fewer steps, or writes less, is
+  worth up to 1.3 s a step, and its cost in landing is what a battery
+  has to show is still zero.
+
 ## D18. One integration test binary per crate
 - **Decision.** Each crate's integration tests move from one file per
   binary (`tests/<name>.rs`) to one binary per crate: `tests/it/main.rs`

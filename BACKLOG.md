@@ -342,8 +342,31 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 42. A nameless call with `read_file`'s arguments is a `read_file` call
+- **Status.** Proposed. Evidence: `qwen_json_long_b24`, 106 tool calls
+  with no usable name across ten runs; 72 had an empty `name` with
+  `path`, `offset` and `limit`, 12 had a file path as the `name` with
+  `path` in `args`, 2 had a path as the `name` with `old`/`new`/`path`.
+  Six runs parked on `repeated tool error: <not a tool>` (item 39).
+  `infer_tool_name` (item 32) infers `think`, `write_file`,
+  `edit_file` and `search` from arguments and only when `name` is
+  empty; it has no rule for `read_file` and does not run when the name
+  is a path.
+- **What.** `infer_tool_name` gains: `path` with `offset` or `limit`
+  (and no `content`/`new`/`pattern`) is `read_file`. The inference
+  also runs when `name` is not an active tool and looks like a path
+  (contains `/` or ends in a file extension) and `args` identifies a
+  tool; if `args` has no `path`, the path-like name becomes `args.path`
+  first. Bare `{path}` stays ambiguous (`read_file`/`list_files`) and
+  is not inferred. The existing note prefix names what was inferred.
+- **Why.** D14: guards defer to what the model can see; the model has
+  shown the call, only the label is missing. Each inferred call is a
+  step not spent on a rejection and a park not taken.
+- **Measure.** Nameless-call rejections and `<not a tool>` parks on
+  the next Qwen long battery against build 24 (six parks); landing.
+
 ### 41. The coding skills say "patch what changed" where the model reads it
-- **Status.** Proposed. Evidence: `short_fixer_b23` (gemma), the
+- **Status.** Committed (Milestone 46). Measured next on the gemma and Qwen short batteries (build 25). Evidence: `short_fixer_b23` (gemma), the
   unchanged `task` resent on 115 of 308 steps and the whole plan on 40;
   `plan` is half of all patch characters. `qwen_json_short_b24`:
   `recent_summary` is 53% of patch characters. Median completion 220
@@ -384,7 +407,7 @@ moves the metric it was built for. Ordered within each tier.
   short batteries against builds 23 and 24.
 
 ### 39. Calls that name no tool are one streak, whatever the name
-- **Status.** Committed (Milestone 45). Measured on `qwen_json_short_b24`: 15 of 16, as build 23; the longest not-a-tool streak was one call, so the class park had nothing to catch; the guard's teeth are the scripted tests until a battery shows the shape again. Evidence: `qwen_json_short_b23/rename_across_files/seed1`,
+- **Status.** Committed (Milestone 45). Measured on `qwen_json_short_b24`: 15 of 16, as build 23; the longest not-a-tool streak was one call, so the class park had nothing to catch; the guard's teeth are the scripted tests until a battery shows the shape again. On `qwen_json_long_b24` it fired on six runs at 18 to 32 steps, where build 22 timed out at up to 126; the calls it parks are mostly `read_file` arguments with no name (item 42). Evidence: `qwen_json_short_b23/rename_across_files/seed1`,
   107 rejected calls in a row alternating an empty `name` and a file
   path in `name`; the repeated-error streak keys on the name, so the
   two alternated and the third-strike park never fired; the run timed

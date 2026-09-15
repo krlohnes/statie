@@ -1773,6 +1773,19 @@ either a default or a config knob:
   edit churn: 14 edits and 8 test runs, never green, parked on a
   question at 42 steps, an old shape.
 
+  Build 24, Qwen on the long tasks (`qwen_json_long_b24`, D27's check):
+  3 of 10 again, 236 s a run against 277 on build 22, with `think`
+  working (21 calls, 2 errors) and item 39's park in. Landed:
+  `design_fork`, `python_three_modules`, `trap_interest`, one seed
+  each. Six of the seven misses are the new park, `repeated tool
+  error: <not a tool>`, at 18 to 32 steps where build 22 ran the same
+  shape to 126-step timeouts. The shape itself is now visible: of 106
+  calls with no usable name in this battery, 72 sent an empty `name`
+  with `path`, `offset` and `limit`, which is a `read_file` call and
+  nothing else; the name inference (item 32) has no rule for it. On
+  the long tasks, at 13k-token prompts, Qwen drops the tool name and
+  keeps the arguments. Backlog item 42.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

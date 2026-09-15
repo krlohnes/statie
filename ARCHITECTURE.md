@@ -1885,3 +1885,27 @@ it was cached or not; the duration is the only signal of a cache hit
 the host gives, and without it a prompt-layout change cannot be
 measured.
 
+## Milestone 42: a cacheable prompt layout (BACKLOG.md item 36)
+
+The user block is joined as Agent State, working set, notes, Now,
+Augmentation, Harness View, Observation. The system block is unchanged.
+The parts that change every step (the harness view's step counter and
+per-step counters, the maintainer's notes, the observation) now follow
+the parts that change only when the model patches or reads. The
+working set renders its windows oldest first, with the recent-calls
+lines after the windows, so a step that adds a window appends to the
+prompt and an eviction truncates from the front. Selection of windows
+is unchanged; only the render order moved.
+
+Why: D25. Ollama caches the longest common token prefix between
+requests, and before this the prefix ended at the system block because
+the step counter sat right after the agent state.
+
+The measurement is `peval` (Milestone 41) per step on the gemma short
+battery, build 22 against build 21, with landing and steps unchanged.
+
+Tests: `core/tests/it/prompt.rs` (the section order, exact; a three-step
+session whose two consecutive user blocks share a byte prefix through
+the end of the working set), `core/tests/it/working_set.rs` (oldest
+first, recent calls after windows).
+

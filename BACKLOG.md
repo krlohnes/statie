@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 36. A cacheable prompt: stable sections first, volatile last, windows in arrival order
-- **Status.** Building. Evidence: D25 (statie's step is the cold
+- **Status.** Committed (Milestone 42). Measured next by `short_fixer_b22` against `short_fixer_b21`. Evidence: D25 (statie's step is the cold
   evaluation rate; OpenCode reads 97% of its prompt from the cache).
 - **What.** The user block's order becomes Agent State, working set,
   notes, Situational, Augmentation, Harness View, Observation: the

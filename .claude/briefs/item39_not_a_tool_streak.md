@@ -27,13 +27,12 @@ never reached 3, and the run timed out at 126 steps. The same shape (a path or n
    today (the `think` question quotes them); `shape` = "not a tool"; `count` = the class streak
    count. Document on the struct that for this class the streak spans differing names.
 3. The park shape string pushed to `non_progress_shapes` for this class is exactly
-   `repeated tool error: <not a tool>`. The observation prefix at count 2 reads, for this class,
-   exactly: "[harness] This is the third call in a row that named no tool (`{latest name}`
-   is not one); the next such call parks the session. Put one of the active tools in `name`."
-   with `{latest name}` the latest `name` verbatim (empty string shown as ``). Wait: count 2 is
-   the SECOND call; make the text: "[harness] This is the second call in a row that named no
-   tool (`{latest name}` is not one); a third parks the session. Put one of the active tools in
-   `name`." (exact).
+   `repeated tool error: <not a tool>`. The observation prefix at count 2 (the second such call
+   in a row) reads, for this class, exactly:
+   "[harness] This is the second call in a row that named no tool (`{latest name}` is not one);
+   a third parks the session. Put one of the active tools in `name`."
+   with `{latest name}` the latest `name` verbatim (an empty name renders as two backticks with
+   nothing between).
 4. Nothing else changes: the identical-call streak for real tool errors, the `think`
    substitution trigger, `CONTINUE_REPEAT_CAP`, and `infer_tool_name` are untouched.
 

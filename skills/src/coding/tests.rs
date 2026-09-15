@@ -5590,6 +5590,53 @@ fn infer_tool_name_empty_object_is_none() {
 }
 
 // ---------------------------------------------------------------------
+// Unit 42: `infer_tool_name`'s new `read_file` arm -- `path` with at least
+// one of `offset`/`limit`, and none of `content`/`new`/`pattern`. Bench
+// `qwen_json_long_b24`: 72 of 106 unnamed calls had exactly this shape.
+// ---------------------------------------------------------------------
+
+#[test]
+fn infer_tool_name_path_offset_and_limit_is_read_file() {
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a", "offset": 10, "limit": 50})),
+        Some("read_file")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_and_limit_only_is_read_file() {
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a", "limit": 20})),
+        Some("read_file")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_only_is_none() {
+    // A bare `{path}` (or `{}`) still returns `None` -- unit 42 only claims
+    // the offset/limit shape actually seen in the bench.
+    assert_eq!(infer_tool_name(&json!({"path": "a"})), None);
+}
+
+#[test]
+fn infer_tool_name_path_offset_new_and_old_is_still_edit_file() {
+    // The existing edit_file rule wins even with `offset` also present.
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a", "offset": 1, "new": "x", "old": "y"})),
+        Some("edit_file")
+    );
+}
+
+#[test]
+fn infer_tool_name_path_offset_and_content_is_still_write_file() {
+    // The existing write_file rule wins even with `offset` also present.
+    assert_eq!(
+        infer_tool_name(&json!({"path": "a", "offset": 1, "content": "x"})),
+        Some("write_file")
+    );
+}
+
+// ---------------------------------------------------------------------
 // Unit 32: `infer_empty_tool_name`'s wiring into `validate` -- exercised
 // through `PlanSkill`/`ImplementSkill`/`ReviewSkill` directly (the
 // `validate`-level substitution), complementing the end-to-end proof in

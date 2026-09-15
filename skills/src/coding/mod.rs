@@ -1182,11 +1182,19 @@ enum Reason {
 /// 3. `path` and `new` present, and exactly one of `old`/`after`/`before`/
 ///    `lines` -- `edit_file`.
 /// 4. `pattern` present -- `search`.
+/// 5. Unit 42: `path` present with at least one of `offset`/`limit`, and none
+///    of `content`/`new`/`pattern` -- `read_file`. Bench `qwen_json_long_b24`:
+///    of 106 tool calls with no usable name, 72 had an empty `name` with
+///    `path`/`offset`/`limit` -- exactly this shape, and the largest single
+///    class in the bench; six of ten runs parked on `repeated tool error:
+///    <not a tool>` because none of it was ever named.
 ///
 /// `None` when nothing above matches (e.g. `path` alone, `path`+`new` with
 /// two or zero anchors, or a `cmd`-shaped `shell`/`test` call -- those two
 /// tools' calls are never namable from `args` alone, since `cmd` doesn't
-/// distinguish them).
+/// distinguish them). A bare `{"path": ...}` with no `offset`/`limit` either
+/// is also `None` -- unit 42 only claims the `offset`/`limit` shape actually
+/// seen in the bench, not every one-key `path` call.
 pub fn infer_tool_name(args: &serde_json::Value) -> Option<&'static str> {
     let obj = args.as_object()?;
     if obj.contains_key("question") {
@@ -1211,6 +1219,14 @@ pub fn infer_tool_name(args: &serde_json::Value) -> Option<&'static str> {
     if obj.contains_key("pattern") {
         return Some("search");
     }
+    if obj.contains_key("path")
+        && (obj.contains_key("offset") || obj.contains_key("limit"))
+        && !obj.contains_key("content")
+        && !obj.contains_key("new")
+        && !obj.contains_key("pattern")
+    {
+        return Some("read_file");
+    }
     None
 }
 
@@ -1219,33 +1235,93 @@ pub fn infer_tool_name(args: &serde_json::Value) -> Option<&'static str> {
 pub const INFERRED_TOOL_NOTE_PREFIX: &str =
     "The tool call had no name; from its arguments the harness ran ";
 
-/// `plan`/`implement`/`review`-shared trigger (unit 32), run FIRST in each
-/// skill's `validate`, before `strip_harness_owned`: when `out`'s action is
-/// `Action::Tool { name, args }` with `name` empty (after trimming) and
-/// [`infer_tool_name`] recognises `args`' shape, the action's name is set to
-/// the inferred tool (`args` unchanged) and the note is returned. Does NOT
-/// check whether the inferred tool is active for this skill -- the existing
-/// inactive-tool rejection (`core/src/session.rs`, item 29) handles that
-/// itself, with the right note for that case (naming the skill that has the
-/// tool, when one does). A `name` that is already non-empty, or an empty
-/// name `infer_tool_name` can't guess from, is left alone.
+/// Unit 42: `true` when `name` looks like a path rather than a tool name --
+/// bench `qwen_json_long_b24` also saw 12 calls with a file path as `name`
+/// and `{path}`-shaped `args`, 3 with a path as `name` and
+/// `path`/`offset`/`limit` args, and 2 with a path as `name` and
+/// `old`/`new`/`path` args: the model put the path where the tool name goes
+/// and left the real shape in `args`. A path here is either `/`-containing
+/// (a relative or absolute path with a separator) or ending in `.` followed
+/// by 1 to 4 ASCII alphanumerics (a bare filename's extension, e.g.
+/// `lib.rs`, `mod.rs`, `Cargo.toml`).
+fn looks_like_path(name: &str) -> bool {
+    if name.contains('/') {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((_, ext)) => {
+            (1..=4).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// `plan`/`implement`/`review`-shared trigger (units 32 and 42), run FIRST
+/// in each skill's `validate`, before `strip_harness_owned`. `active` is the
+/// calling skill's own `self.tools()` -- the same list the prompt showed the
+/// model.
+///
+/// Two cases, checked in order:
+/// 1. Unit 32: `out`'s action is `Action::Tool { name, args }` with `name`
+///    empty (after trimming) and [`infer_tool_name`] recognises `args`'
+///    shape -- the action's name is set to the inferred tool (`args`
+///    unchanged) and the note is returned.
+/// 2. Unit 42: `name` is non-empty, is not one of `active` (so it is not a
+///    real tool choice for this skill), and [`looks_like_path`] -- the model
+///    put a path where the tool name goes. If `args` is an object without
+///    its own `path` key, `"path": name` is inserted first (so a bare
+///    `{path}` call gets the shape [`infer_tool_name`] needs); inference
+///    then runs on `args` as usual. If it returns a tool, the action's name
+///    becomes that tool (the original `name` is preserved in the note, not
+///    overwritten) and the note names both; if it returns `None`, the
+///    action -- including `name` -- is left exactly as it was, so the
+///    existing empty/inactive-tool rejection (`core/src/session.rs`, item
+///    29) still fires on the untouched path-shaped name.
+///
+/// Neither case checks whether the inferred tool itself is active for this
+/// skill -- the existing inactive-tool rejection (item 29) handles that,
+/// with the right note for that case (naming the skill that has the tool,
+/// when one does). A `name` that already names one of `active` is never
+/// touched by either case.
 fn infer_empty_tool_name(
+    active: &[String],
     _cur: &CommittedState<CodingWorkspace>,
     out: &mut statie_core::ParsedOutput<CodingWorkspace>,
 ) -> Option<String> {
     let statie_core::Action::Tool { name, args } = out.action() else {
         return None;
     };
-    if !name.trim().is_empty() {
+    if name.trim().is_empty() {
+        let inferred = infer_tool_name(args)?;
+        let args = args.clone();
+        out.set_action(statie_core::Action::Tool {
+            name: inferred.to_string(),
+            args,
+        });
+        return Some(format!("{INFERRED_TOOL_NOTE_PREFIX}`{inferred}`."));
+    }
+
+    if active.iter().any(|a| a == name) || !looks_like_path(name) {
         return None;
     }
-    let inferred = infer_tool_name(args)?;
-    let args = args.clone();
+    let original = name.clone();
+    let mut args = args.clone();
+    if let Some(obj) = args.as_object_mut()
+        && !obj.contains_key("path")
+    {
+        obj.insert(
+            "path".to_string(),
+            serde_json::Value::String(original.clone()),
+        );
+    }
+    let inferred = infer_tool_name(&args)?;
     out.set_action(statie_core::Action::Tool {
         name: inferred.to_string(),
         args,
     });
-    Some(format!("{INFERRED_TOOL_NOTE_PREFIX}`{inferred}`."))
+    Some(format!(
+        "{INFERRED_TOOL_NOTE_PREFIX}`{inferred}` (the name was `{original}`)."
+    ))
 }
 
 /// The question the harness asks `think` on the model's behalf when
@@ -4583,7 +4659,7 @@ impl Skill for PlanSkill {
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
-        let inferred_name_note = infer_empty_tool_name(cur, &mut out);
+        let inferred_name_note = infer_empty_tool_name(&self.tools(), cur, &mut out);
         let mut notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         notes.extend(inferred_name_note);
         let note = strip_malformed_next(&cur.agent, &mut out);
@@ -5072,7 +5148,7 @@ impl Skill for ImplementSkill {
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
-        let inferred_name_note = infer_empty_tool_name(cur, &mut out);
+        let inferred_name_note = infer_empty_tool_name(&self.tools(), cur, &mut out);
         let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let strip_note = strip_malformed_next(&cur.agent, &mut out);
         let shell_read_note = shell_read_substitution(&mut out);
@@ -5449,7 +5525,7 @@ impl Skill for ReviewSkill {
         cur: &CommittedState<Self::Workspace>,
         mut out: ParsedOutput<Self::Workspace>,
     ) -> Result<ValidatedStep<Self::Workspace>, PatchError> {
-        let inferred_name_note = infer_empty_tool_name(cur, &mut out);
+        let inferred_name_note = infer_empty_tool_name(&self.tools(), cur, &mut out);
         let owned_notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let note = strip_malformed_next(&cur.agent, &mut out);
         let shell_read_note = shell_read_substitution(&mut out);

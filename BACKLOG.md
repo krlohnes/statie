@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 42. A nameless call with `read_file`'s arguments is a `read_file` call
-- **Status.** Proposed. Evidence: `qwen_json_long_b24`, 106 tool calls
+- **Status.** Committed (Milestone 48). Measured next on the Qwen long battery. Evidence: `qwen_json_long_b24`, 106 tool calls
   with no usable name across ten runs; 72 had an empty `name` with
   `path`, `offset` and `limit`, 12 had a file path as the `name` with
   `path` in `args`, 2 had a path as the `name` with `old`/`new`/`path`.

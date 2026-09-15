@@ -117,6 +117,18 @@ fn nameless_tool_turn(args: Value) -> MockTurn {
     )
 }
 
+/// Unit 42: a turn sending a tool call whose `name` is a path (not empty,
+/// not a real tool name) and whose `args` are the given shape.
+fn path_named_tool_turn(name: &str, args: Value) -> MockTurn {
+    MockTurn::new(
+        json!({
+            "patch": {},
+            "action": {"type": "tool", "name": name, "args": args},
+        })
+        .to_string(),
+    )
+}
+
 /// A turn that asks the user something, used purely to drive one more step
 /// so the harness builds (and the mock model records) the next prompt --
 /// the only place a validation note (`ValidatedStep::notes`, step 10b in
@@ -407,5 +419,242 @@ async fn plan_infers_edit_file_then_gets_the_item_29_rejection_naming_implement(
         second.contains(expected),
         "expected the exact item 29 hand-off text in the second prompt:\n{second}\n\ntext:\n\
          {expected}"
+    );
+}
+
+// =======================================================================
+// Unit 42: a call whose `name` is a path, not empty and not one of the
+// skill's active tools, is renamed the same way an empty `name` is --
+// `infer_empty_tool_name`'s second case, wired the same first line of
+// `validate`.
+// =======================================================================
+
+// (a) `name: "src/lib.rs"`, `args: {"offset": 1, "limit": 40}` (no `path`
+// key) runs `read_file` on `src/lib.rs`: `path` is inserted from the
+// original `name` before inference, and the exact note names both.
+
+#[tokio::test]
+async fn implement_path_named_call_with_offset_limit_runs_read_file_on_that_path() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        (1..=60)
+            .map(|k| format!("line {k}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let turns = vec![
+        path_named_tool_turn("src/lib.rs", json!({"offset": 1, "limit": 40})),
+        ask_user_turn(),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome = log.append_record(rec).unwrap();
+    assert!(matches!(outcome, Outcome::Continue), "got {outcome:?}");
+
+    let (name, args) = last_action(&log);
+    assert_eq!(
+        name, "read_file",
+        "the path-named call must run as read_file"
+    );
+    assert_eq!(
+        args,
+        json!({"offset": 1, "limit": 40, "path": "src/lib.rs"})
+    );
+
+    let sys_entries = log.entries(Some(LogKind::System), 10_000);
+    let tool_error = sys_entries
+        .iter()
+        .any(|e| e.payload.get("event").and_then(Value::as_str) == Some("tool_error"));
+    assert!(
+        !tool_error,
+        "the inferred read_file must not be refused: {sys_entries:?}"
+    );
+    let tool_rejected = tool_rejected_payload(&log);
+    assert!(
+        tool_rejected.is_none(),
+        "read_file is active for implement, so no rejection: {tool_rejected:?}"
+    );
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    log.append_record(rec2).unwrap();
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 2, "expected two model calls");
+    let second = &prompts[1].user;
+    let expected_note =
+        format!("{INFERRED_TOOL_NOTE_PREFIX}`read_file` (the name was `src/lib.rs`).");
+    assert!(
+        second.contains(&expected_note),
+        "expected the exact INFERRED note in the second prompt:\n{second}\n\nnote:\n{expected_note}"
+    );
+}
+
+// (b) `name: "src/lib.rs"`, `args: {"path": "src/lib.rs", "old": "a", "new":
+// "b"}` (already has its own `path`) runs `edit_file`: `path` is left as
+// sent (not overwritten), and the exact note names both.
+
+#[tokio::test]
+async fn implement_path_named_call_with_its_own_path_key_runs_edit_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "a\n").unwrap();
+
+    let turns = vec![
+        path_named_tool_turn(
+            "src/lib.rs",
+            json!({"path": "src/lib.rs", "old": "a", "new": "b"}),
+        ),
+        ask_user_turn(),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome = log.append_record(rec).unwrap();
+    assert!(matches!(outcome, Outcome::Continue), "got {outcome:?}");
+
+    let (name, args) = last_action(&log);
+    assert_eq!(
+        name, "edit_file",
+        "the path-named call must run as edit_file"
+    );
+    assert_eq!(
+        args,
+        json!({"path": "src/lib.rs", "old": "a", "new": "b"}),
+        "args' own path key must be left as sent, not overwritten"
+    );
+
+    let on_disk = std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap();
+    assert_eq!(on_disk, "b\n", "edit_file must have applied");
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    log.append_record(rec2).unwrap();
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 2, "expected two model calls");
+    let second = &prompts[1].user;
+    let expected_note =
+        format!("{INFERRED_TOOL_NOTE_PREFIX}`edit_file` (the name was `src/lib.rs`).");
+    assert!(
+        second.contains(&expected_note),
+        "expected the exact INFERRED note in the second prompt:\n{second}\n\nnote:\n{expected_note}"
+    );
+}
+
+// (c) `name: "src/lib.rs"`, `args: {}` is rejected with today's exact
+// item-29 not-available text: inference finds nothing to guess from an
+// empty `args` object even after a `path` would have been inserted (there
+// is nothing else in `args` for any rule to match), so the action --
+// including `name` -- is left exactly as sent, and no INFERRED note is
+// attached.
+
+#[tokio::test]
+async fn implement_path_named_call_with_empty_args_gets_the_item_29_rejection_unchanged() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![path_named_tool_turn("src/lib.rs", json!({}))];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome = log.append_record(rec).unwrap();
+    assert!(matches!(outcome, Outcome::Continue), "got {outcome:?}");
+
+    let payload = tool_rejected_payload(&log).expect("expected a tool_rejected system log entry");
+    assert_eq!(
+        payload.get("name").and_then(Value::as_str),
+        Some("src/lib.rs")
+    );
+    assert_eq!(payload.get("skill_with_tool"), Some(&Value::Null));
+
+    let active_tools = ImplementSkill::new().tools();
+    let expected = format!(
+        "tool `src/lib.rs` is not available in skill `implement`; available tools: \
+         {active_tools:?}. There is no tool by that name; if `src/lib.rs` is a path, it belongs \
+         in `args`."
+    );
+    assert_eq!(
+        payload.get("reason").and_then(Value::as_str),
+        Some(expected.as_str())
+    );
+
+    let notes = note_texts(&log);
+    assert!(
+        notes.is_empty(),
+        "an unguessable path-named call must get no INFERRED note, got {notes:?}"
+    );
+}
+
+// (d) `name: "read_file"` with `{"path":"a","limit":5}` is untouched: an
+// active tool name is never rewritten, even though it also happens to look
+// like a plain word -- no note at all.
+
+#[tokio::test]
+async fn implement_active_tool_name_read_file_is_left_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("a"),
+        (1..=10)
+            .map(|k| format!("line {k}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let turns = vec![
+        path_named_tool_turn("read_file", json!({"path": "a", "limit": 5})),
+        ask_user_turn(),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome = log.append_record(rec).unwrap();
+    assert!(matches!(outcome, Outcome::Continue), "got {outcome:?}");
+
+    let (name, args) = last_action(&log);
+    assert_eq!(name, "read_file");
+    assert_eq!(args, json!({"path": "a", "limit": 5}));
+
+    let tool_rejected = tool_rejected_payload(&log);
+    assert!(
+        tool_rejected.is_none(),
+        "an active tool name must never be rejected: {tool_rejected:?}"
+    );
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    log.append_record(rec2).unwrap();
+
+    let notes = note_texts(&log);
+    assert!(
+        notes.is_empty(),
+        "an active tool name must never get an INFERRED note, got {notes:?}"
+    );
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 2, "expected two model calls");
+    let second = &prompts[1].user;
+    assert!(
+        !second.contains(INFERRED_TOOL_NOTE_PREFIX),
+        "an active tool name must never get an INFERRED note in the prompt:\n{second}"
     );
 }

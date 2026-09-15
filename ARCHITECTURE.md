@@ -2034,3 +2034,28 @@ Tests: `tools/tests/it/<tool>.rs` for each of the six (the description
 names every argument and contains the imported failure consts; the
 word cap; the tool's actual error equals the const-built text).
 
+## Milestone 48: a nameless call with `read_file`'s arguments is a `read_file` call (BACKLOG.md item 42)
+
+`infer_tool_name` (`skills/src/coding/mod.rs`) gains a last rule:
+`path` with `offset` or `limit`, and none of `content`, `new`,
+`pattern`, is `read_file`; a bare `{path}` stays uninferred. Its caller
+(`infer_empty_tool_name`, now given the skill's active tool list) also
+runs when the call's `name` is not an active tool and looks like a
+path (contains `/`, or ends in a dot and one to four alphanumerics):
+the name is inserted as `args.path` when `args` has none, inference
+runs, and a hit renames the action and notes
+`{INFERRED_TOOL_NOTE_PREFIX}`{tool}` (the name was `{original}`).`; a
+miss leaves the action for the existing rejection. Active tool names
+are never touched.
+
+Why: `qwen_json_long_b24`, 106 calls with no usable name, 72 an empty
+name with `path`/`offset`/`limit`, 12 a file path as the name; six
+runs parked on `<not a tool>` (item 39). D14: the model showed the
+call; only the label was missing.
+
+Tests: `skills/src/coding/tests.rs` (the new rule and the existing
+rules' precedence, exact), `skills/tests/it/infer_tool.rs` (a
+path-named call with `offset`/`limit` runs `read_file` with the exact
+note; with `old`/`new` runs `edit_file`; with empty args is rejected
+with today's text; a real `read_file` name is untouched).
+

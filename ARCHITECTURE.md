@@ -1895,7 +1895,7 @@ read. Build 22 against build 21 measured `peval` at 0.453 s against
 0.461 s a step: the prefix cache was already serving most of the prompt
 (D25 addendum), so the order had nothing to win, and per-step output
 grew. The user block is back to its build-21 order (Agent State,
-Harness View, working set, notes, Now, Augmentation, Observation) and
+notes, Harness View, Now, working set, Augmentation, Observation) and
 the working set renders newest first with the recent-calls lines
 before the windows, as `core/src/prompt.rs` and `core/src/working_set.rs`
 and their tests in `core/tests/it/` state.

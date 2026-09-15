@@ -1740,6 +1740,31 @@ either a default or a config knob:
   them without an edit. The maintainer stays on; the number is what a
   cheaper maintainer has to beat.
 
+  OpenCode with Qwen on the long tasks at equal room (`oc_qwen_long_16k`,
+  D27). The OpenCode config's `limit` block declares a 16k context
+  with 2k reserved for output, so OpenCode compacts its history near
+  14k instead of riding the host's 32k default; the event streams
+  confirm every prompt stayed under 16k (peaks 10.5k to 15.3k) and
+  compaction fired on the long runs (five and eight times on
+  `refactor_signature`):
+
+  | harness, qwen, long tasks | landed | mean secs a run |
+  |---|---|---|
+  | OpenCode, 32k | 10/10 | 159 |
+  | OpenCode, 16k limit | 6/10 | 53 |
+  | statie build 22, 16k | 3/10 | 277 |
+
+  At 16k OpenCode lost both `trap_interest` runs (one gave up after
+  five turns with no edit), one `multi_file_feature`, and one
+  `refactor_signature` (82 turns, 31 edits, eight compactions, never
+  green); it kept `refactor_signature` once, in 33 turns and 12 edits
+  with five compactions. A first attempt with 8k reserved for output
+  compacted at about 8k and landed nothing on two tasks (kept as
+  `oc_qwen_long_16k_out8k`), which is its own datum: the generic
+  loop's landing tracks its usable window. Room explains four of
+  OpenCode's ten at 32k; at equal room it is still three runs ahead
+  of statie and five times faster.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

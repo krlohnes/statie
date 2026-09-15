@@ -650,3 +650,38 @@ holds the resulting design; this file holds why.
   note invites the walk ("set its status to done in your patch");
   that is item 37, dispatched next.
 
+## D27. The long-task gap is measured at equal room, and half of it is the harness
+
+- **Decision.** Long-task comparisons against OpenCode are read at the
+  16k limit, not the host's 32k default. The remaining gap at equal
+  room, 6 of 10 against statie's 3 of 10 and 53 s against 277 s a run,
+  is the harness's to close: the window is no longer the explanation.
+  The next long-task work goes to what statie does inside 16k, not to
+  a bigger window.
+- **Evidence.** OpenCode's `limit` block (`bench/opencode.16k.template.json`,
+  context 16384, output 2048) makes it compact near 14k; the event
+  streams show peaks of 10.5k to 15.3k and compactions on the long
+  runs. Landing fell from 10 of 10 at 32k to 6 of 10, so room was worth
+  four runs to the generic loop. statie at 16k, with the four-window
+  working set and prompt peaks of 12.4k to 14.3k, landed 3 of 10 on
+  the same seeds (README, build 22), with `think` broken on every call
+  in that battery (item 38, since fixed) and the not-a-tool loop
+  unparked (item 39, since fixed).
+- **Why this is the right comparison.** "More with less" is statie's
+  premise (the prime directive: manage limited context via mutable
+  state). A baseline at twice the room tests nothing about it. A
+  generic loop that compacts at 14k is the honest opponent: same
+  budget, its own way of spending it.
+- **Confounds recorded.** OpenCode's compaction is a summary it writes
+  itself, which costs a model call, like the maintainer (D17
+  addendum); its per-turn output is a quarter of statie's; the
+  8k-output attempt shows its landing is sensitive to exactly where
+  the limit sits. statie's 3 of 10 predates items 38 and 39.
+- **Ruled out.** Raising statie's window to 32k to match the 10 of 10:
+  that abandons the premise to win the number. Reading 6 of 10 as
+  "OpenCode fails at 16k": it lands the two tasks statie lands and
+  three more.
+- **Check.** statie with Qwen on the long tasks, on a build with items
+  38 and 39, against 6 of 10 and 53 s. Landing at or above 6 closes
+  the gap on landing; time is D25's check.
+

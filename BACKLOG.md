@@ -342,6 +342,28 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 41. The coding skills say "patch what changed" where the model reads it
+- **Status.** Proposed. Evidence: `short_fixer_b23` (gemma), the
+  unchanged `task` resent on 115 of 308 steps and the whole plan on 40;
+  `plan` is half of all patch characters. `qwen_json_short_b24`:
+  `recent_summary` is 53% of patch characters. Median completion 220
+  tokens a step, generation 1.1 s of a 3.25 s step (D25 addendum). The
+  merge paragraph already says "send only the fields you want to
+  change"; the skill specs never do, and `plan`'s "Keep
+  `recent_summary` current" asks for a rewrite every step.
+- **What.** One shared paragraph in all four coding skills: patch only
+  what changed, never resend `task`, move a plan step by sending that
+  entry's `id` and status, rewrite `recent_summary` only when knowledge
+  changed and in two sentences, send an empty patch when nothing
+  changed. The plan skill's bullet becomes conditional.
+- **Why.** Two thirds of the step is generation and most of the patch
+  is state the merge would have kept. OpenCode's prompt says
+  "minimize output tokens" three ways and its turns are 49 tokens.
+  Whether shorter patches keep landing is the question.
+- **Measure.** Median completion tokens a step, mean secs a run, and
+  landing on the gemma and Qwen short batteries against builds 23
+  and 24.
+
 ### 40. Tool descriptions state their forms and failure texts up front
 - **Status.** Proposed. Evidence: OpenCode's `default.txt` prompt (what
   it sends to Ollama models; no Qwen or gemma tuning) and its 231-word

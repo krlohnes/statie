@@ -1804,6 +1804,12 @@ either a default or a config knob:
   with fewer runs landed. The Qwen battery on this build is next; the
   decision on the paragraph waits for it.
 
+  Build 25, Qwen json (item 41 in): 14 of 16 against 15 on build 24,
+  median 22.5 steps against 16, 135 s a run against 112; median
+  completion 116 tokens a step against 166, median generation
+  0.7 s against 1.01. Recorded at the pause; the decision on the
+  paragraph is taken on both batteries together when work resumes.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

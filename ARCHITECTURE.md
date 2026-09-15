@@ -1868,3 +1868,20 @@ setting for it, is a config file, which is the split agreed with the
 user for every per-model knob. The maintainer sweep of item 10 is now
 one invocation of this runner.
 
+## Milestone 41: prompt evaluation time per step (BACKLOG.md item 35)
+
+`Usage` carries `prompt_eval_secs` and `eval_secs`, filled by the Ollama
+backend from `prompt_eval_duration` and `eval_duration` (nanoseconds to
+seconds), `None` elsewhere, and serialised only when present, so the
+`patch` log entry's `usage` object gains the keys on Ollama and stays as
+it was on other backends. The bench computes the per-run mean over the
+steps that report it, prints `peval=<secs>` (or `-`) after `secs=` on
+the outcome line, and adds a `mean peval` column to the task table;
+`sweep_summary.py` and the OpenCode runner carry the column (`-` for
+OpenCode, whose events have no host timing).
+
+Why: D25. Ollama's `prompt_eval_count` reports the whole prompt whether
+it was cached or not; the duration is the only signal of a cache hit
+the host gives, and without it a prompt-layout change cannot be
+measured.
+

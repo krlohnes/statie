@@ -342,8 +342,26 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 36. A cacheable prompt: stable sections first, volatile last, windows in arrival order
+- **Status.** Building. Evidence: D25 (statie's step is the cold
+  evaluation rate; OpenCode reads 97% of its prompt from the cache).
+- **What.** The user block's order becomes Agent State, working set,
+  notes, Situational, Augmentation, Harness View, Observation: the
+  parts that change on every step (the step counter and the per-step
+  counters in the harness view, the maintainer's notes, the
+  observation) move behind the parts that change only when the model
+  patches or reads. The working set renders its windows oldest first,
+  so a new window appends and an eviction truncates from the front,
+  and its recent-calls list moves after the windows. Prompt text that
+  is the same between two steps stays byte-identical.
+- **Why.** Ollama caches the longest common token prefix between
+  requests. Today the prefix ends at the system block because the
+  harness view's step counter sits right after the agent state.
+- **Measure.** `peval` per step on the gemma short battery against
+  `short_fixer_b21`; landing and steps unchanged.
+
 ### 35. Every step records how much of its prompt was evaluated
-- **Status.** Building. Evidence: D25; the probe showed
+- **Status.** Committed (Milestone 41). Baseline next: `short_fixer_b21` on gemma. Evidence: D25; the probe showed
   `prompt_eval_count` reports the whole prompt whether cached or not,
   while `prompt_eval_duration` drops tenfold on a cache hit, so the
   duration is the only signal the host gives.

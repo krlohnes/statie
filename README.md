@@ -1646,6 +1646,18 @@ either a default or a config knob:
   emitted as text (`<function=grep>`) that ended the run at step 0,
   and a reasoning stall with no edit.
 
+  The five long tasks through OpenCode (build 20): gemma 8 of 10 at
+  52 s a run, Qwen 10 of 10 at 159 s. gemma's two
+  `refactor_signature` "passes" edited the protected test file and were
+  scored as misses, the same task statie has never landed with gemma.
+  Qwen landed `refactor_signature` on both seeds honestly, in 38 to 40
+  tool calls and 19 to 20 edits, at 117 s and 252 s. No harness has
+  landed that task with gemma; a generic loop with a 32k window lands
+  it with Qwen. statie with Qwen on the long tasks runs next (build
+  21). One caveat for the baseline: OpenCode's shell tool is not
+  confined to its working directory, and one Qwen run compiled a
+  scratch program in the repository root.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

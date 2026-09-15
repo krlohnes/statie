@@ -570,4 +570,12 @@ holds the resulting design; this file holds why.
 - **Check.** A build whose per-step time on gemma is under 1.5 s at
   the same prompt size, and whose landing is unchanged, closes this
   entry.
+- **Addendum (long tasks).** OpenCode with Qwen landed
+  `refactor_signature` on both seeds with the protected tests untouched
+  (38 to 40 tool calls, 19 to 20 edits, 117 s and 252 s); with gemma it
+  "passed" only by editing the tests, which the scorer rejects. D21's
+  "capability miss" was a statement about gemma. Whether the task is
+  out of statie's reach with Qwen is measured on build 21; if statie
+  misses it, the four-window layout is the limiter, which is this
+  entry's conclusion from the other side.
 

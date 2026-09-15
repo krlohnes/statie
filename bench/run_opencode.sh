@@ -7,7 +7,10 @@
 # OPENCODE_TEMPLATE=<path> picks the opencode.json template (default
 # bench/opencode.template.json); bench/opencode.16k.template.json declares a
 # 16k `limit.context` on both models so OpenCode compacts its history to the
-# window statie pins, instead of riding the host's 32k server default.
+# window statie pins, instead of riding the host's 32k server default. Its
+# `limit.output` is 2048: OpenCode compacts at context minus output, and a
+# first run with output 8192 compacted at about 8k of prompt (34 compactions
+# in one run, no edits landed), which is not the 16k test.
 #
 # Runs the opencode CLI (or a stub via OPENCODE_BIN, for testing -- the real
 # model host is down and must never be invoked by this script) over the same

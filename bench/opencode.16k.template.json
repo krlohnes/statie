@@ -13,7 +13,7 @@
           "tool_call": true,
           "limit": {
             "context": 16384,
-            "output": 8192
+            "output": 2048
           }
         },
         "qwen3-coder:latest": {
@@ -21,7 +21,7 @@
           "tool_call": true,
           "limit": {
             "context": 16384,
-            "output": 8192
+            "output": 2048
           }
         }
       }

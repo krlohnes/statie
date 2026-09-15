@@ -22,7 +22,7 @@ use serde_json::json;
 
 use statie_core::{Event, NullSink, Outcome, SessionLogExt, Skill};
 use statie_models::MockTurn;
-use statie_skills::{ImplementSkill, PlanSkill, ReviewSkill};
+use statie_skills::{ImplementSkill, PATCH_WHAT_CHANGED, PlanSkill, ReviewSkill, RouterSkill};
 
 /// An `edit_file` turn with the given `old`/`new` text against `path` --
 /// mirrors `error_think.rs`/`stall_think.rs`'s `edit_turn`.
@@ -244,6 +244,11 @@ const PLAN_INSTRUCTIONS_SNAPSHOT: &str = "You are the planner for a coding task.
      usages before reading whole files; use `list_files` and `read_file` \
      (with `offset`/`limit` for files longer than ~200 lines) until you \
      understand what needs to change. Do not write or run code yet.\n\n\
+     Patch only what changed this step. Never resend `task`. To move a plan step, send only \
+     that entry with its `id` and the changed field, e.g. {\"plan\": [{\"id\": 3, \"status\": \
+     \"done\"}]}; do not resend the other steps. Rewrite `recent_summary` only when what you \
+     know changed, in at most two sentences. A step whose state did not change sends an empty \
+     patch: {\"patch\": {}, \"action\": ...}.\n\n\
      What to put in the workspace:\n\
      - Record every file you judge relevant in `files`, each with a one-line \
        note explaining why it matters.\n\
@@ -252,7 +257,7 @@ const PLAN_INSTRUCTIONS_SNAPSHOT: &str = "You are the planner for a coding task.
        each step a unique `id`. If the repo has tests, make the first step \
        \"run `test` to record the baseline\" and the last step \"run `test` and \
        confirm it passes\".\n\
-     - Keep `recent_summary` current as you explore.\n\
+     - Update `recent_summary` when you learn something that changes the plan.\n\
      - `notes` is kept by the harness from your previous reasoning: read it \
        before deciding; you cannot patch it.\n\
      - If you commit to a next step by setting `next`, the harness holds you to \
@@ -271,6 +276,11 @@ const PLAN_INSTRUCTIONS_SNAPSHOT: &str = "You are the planner for a coding task.
 /// `ImplementSkill::new()`'s instructions, snapshotted verbatim before any
 /// bullet was moved to `procedure.rs`.
 const IMPLEMENT_INSTRUCTIONS_SNAPSHOT: &str = "You are implementing the plan for a coding task, one step at a time.\n\n\
+     Patch only what changed this step. Never resend `task`. To move a plan step, send only \
+     that entry with its `id` and the changed field, e.g. {\"plan\": [{\"id\": 3, \"status\": \
+     \"done\"}]}; do not resend the other steps. Rewrite `recent_summary` only when what you \
+     know changed, in at most two sentences. A step whose state did not change sends an empty \
+     patch: {\"patch\": {}, \"action\": ...}.\n\n\
      What to put in the workspace:\n\
      - Mark the step you are working `in_progress`, then `done` once it is \
        finished; use `skipped` only when a step turns out unnecessary.\n\
@@ -294,7 +304,8 @@ const IMPLEMENT_INSTRUCTIONS_SNAPSHOT: &str = "You are implementing the plan for
        `result:` line; do not mark a step `done` while `test` reports `fail` \
        unless the failure predates your change (check with `recall`, e.g. \
        query \"test output\" to see the last test run).\n\
-     - Keep `files` and `recent_summary` up to date as you go.\n\
+     - Keep `files` up to date as you go; update `recent_summary` when what you \
+       know changed.\n\
      - `notes` is kept by the harness from your previous reasoning: read it \
        before deciding; you cannot patch it.\n\
      - `think` asks a reasoning subagent that sees what you see; use it when a \
@@ -326,6 +337,11 @@ const REVIEW_INSTRUCTIONS_SNAPSHOT: &str = "You are reviewing the work done for 
      in this activation is not accepted. Before approving, run the tests without a \
      name filter (the crate's whole test target); a pass on one filtered test does \
      not cover regressions.\n\n\
+     Patch only what changed this step. Never resend `task`. To move a plan step, send only \
+     that entry with its `id` and the changed field, e.g. {\"plan\": [{\"id\": 3, \"status\": \
+     \"done\"}]}; do not resend the other steps. Rewrite `recent_summary` only when what you \
+     know changed, in at most two sentences. A step whose state did not change sends an empty \
+     patch: {\"patch\": {}, \"action\": ...}.\n\n\
      What to put in the workspace:\n\
      - Write concrete `findings` -- specific, actionable problems, not vague \
        impressions. Leave `findings` empty if the work is correct and complete.\n\
@@ -357,6 +373,61 @@ fn off_implement_spec_matches_pre_unit_26_snapshot() {
 fn off_review_spec_matches_pre_unit_26_snapshot() {
     let skill = ReviewSkill::new();
     assert_eq!(skill.spec().instructions(), REVIEW_INSTRUCTIONS_SNAPSHOT);
+}
+
+/// Unit 41 ("patch what changed"): all four coding skills' rendered
+/// instructions contain the shared `PATCH_WHAT_CHANGED` paragraph exactly
+/// once, verbatim (not paraphrased in the test -- the const is imported and
+/// compared byte for byte).
+#[test]
+fn all_four_coding_skills_contain_patch_what_changed_exactly_once() {
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    let router = RouterSkill::new().spec().instructions().to_string();
+    assert_eq!(
+        occurrences(&router, PATCH_WHAT_CHANGED),
+        1,
+        "expected PATCH_WHAT_CHANGED exactly once in router's instructions, got:\n{router}"
+    );
+
+    let plan = PlanSkill::new().spec().instructions().to_string();
+    assert_eq!(
+        occurrences(&plan, PATCH_WHAT_CHANGED),
+        1,
+        "expected PATCH_WHAT_CHANGED exactly once in plan's instructions, got:\n{plan}"
+    );
+
+    let implement = ImplementSkill::new().spec().instructions().to_string();
+    assert_eq!(
+        occurrences(&implement, PATCH_WHAT_CHANGED),
+        1,
+        "expected PATCH_WHAT_CHANGED exactly once in implement's instructions, got:\n{implement}"
+    );
+
+    let review = ReviewSkill::new().spec().instructions().to_string();
+    assert_eq!(
+        occurrences(&review, PATCH_WHAT_CHANGED),
+        1,
+        "expected PATCH_WHAT_CHANGED exactly once in review's instructions, got:\n{review}"
+    );
+}
+
+/// Unit 41: the plan skill's instructions contain the new conditional
+/// `recent_summary` bullet and not the old unconditional one (exact
+/// strings).
+#[test]
+fn plan_instructions_have_new_recent_summary_bullet_not_old() {
+    let plan = PlanSkill::new().spec().instructions().to_string();
+    assert!(
+        plan.contains("Update `recent_summary` when you learn something that changes the plan."),
+        "expected the new conditional recent_summary bullet in plan's instructions, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Keep `recent_summary` current as you explore."),
+        "the old unconditional recent_summary bullet must be gone from plan's instructions, got:\n{plan}"
+    );
 }
 
 /// Explicit `with_situational_rules(false)` must match the same snapshots

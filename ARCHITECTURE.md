@@ -1983,3 +1983,29 @@ different real tool errors still do not share a streak;
 `is_not_a_tool_rejection` on the three producer texts and two real
 error texts).
 
+## Milestone 46: the coding skills say "patch what changed" (BACKLOG.md item 41)
+
+`PATCH_WHAT_CHANGED` (`skills/src/coding/mod.rs`, exported) is one
+paragraph appended to the instructions of all four coding skills after
+their opening: patch only what changed this step, never resend `task`,
+move a plan step by sending that entry's `id` and the changed field,
+rewrite `recent_summary` only when knowledge changed and in at most two
+sentences, and send an empty patch when nothing changed. The plan
+skill's "Keep `recent_summary` current as you explore" became "Update
+`recent_summary` when you learn something that changes the plan", and
+implement's "Keep `files` and `recent_summary` up to date as you go"
+became conditional on `recent_summary` the same way. No harness
+behaviour changed; the merge already accepted every shape the
+paragraph names.
+
+Why: D25 addendum. Generation is 1.1 s of a 3.25 s step; on build 23
+the unchanged `task` was resent on 115 of 308 steps and the whole plan
+on 40, and `plan` was half of all patch characters. The merge strategy
+paragraph already said "send only the fields you want to change" where
+the model did not act on it.
+
+Tests: `skills/tests/it/situational.rs` (each of the four skills'
+instructions contains the paragraph exactly once; the plan bullet is
+the new one and not the old; the three full-instruction snapshots,
+exact).
+

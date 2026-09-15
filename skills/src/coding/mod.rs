@@ -4097,6 +4097,22 @@ fn delegate_paragraph(delegates: &[String]) -> String {
     )
 }
 
+/// Appended to all four coding skills' instructions, after `head` and
+/// before any tail (unit 41, "patch what changed"): the merge strategy
+/// paragraph (`patch/src/merge.rs`'s `describe()`) already tells the model
+/// only unset fields are kept and keyed arrays merge entry by entry, but the
+/// model does not act on it -- on `short_fixer_b23` (gemma) the unchanged
+/// task was resent on 115 of 308 steps, the whole plan on 40; plan is half
+/// the patch characters, and generation is 1.1 s of a 3.25 s step. This
+/// paragraph spells out the consequence in the skills' own voice: never
+/// resend `task`, patch one plan step by its `id`, rewrite `recent_summary`
+/// only when it changed, and send an empty patch on a no-op step.
+pub const PATCH_WHAT_CHANGED: &str = "Patch only what changed this step. Never resend `task`. \
+     To move a plan step, send only that entry with its `id` and the changed field, e.g. \
+     {\"plan\": [{\"id\": 3, \"status\": \"done\"}]}; do not resend the other steps. Rewrite \
+     `recent_summary` only when what you know changed, in at most two sentences. A step whose \
+     state did not change sends an empty patch: {\"patch\": {}, \"action\": ...}.";
+
 /// Tiny helper so each skill can hand out a stable `Arc<SkillSpec>` from
 /// `spec()` without recreating it on every call, while `new()` stays plain
 /// (no fallible construction).
@@ -4134,23 +4150,25 @@ impl Skill for RouterSkill {
     fn spec(&self) -> Arc<SkillSpec> {
         self.spec.get(
             "router",
-            "You are the router for a coding task. Your only job is to decide which \
-             skill runs next and then stop -- you do not explore files or write code.\n\n\
-             What to put in the workspace:\n\
-             - If `task` is empty, copy the user's request from the inbox into `task` \
-               verbatim (do not paraphrase or trim it).\n\
-             - Decide the next skill: if `plan` is empty, hand off to `plan`; if `plan` \
-               has any step that is not `done`/`skipped`, hand off to `implement`; if every \
-               step is `done` or `skipped` and `findings` is empty, hand off to `review`.\n\
-             - Set `next_skill` to that choice.\n\n\
-             When to hand off: always, in a single step. Ack every inbox item you read, \
-             then set action `done`. Do not leave the router activation without a \
-             `next_skill` set. The router cannot ask the user anything; if the task is \
-             unclear, hand off to `plan`, which can.\n\n\
-             History is searchable with the `recall` tool, but the router has no tools \
-             and should not need it. `recent_summary` is the only memory that survives \
-             across steps and across skill handoffs -- keep it current if you touch it."
-                .to_string(),
+            format!(
+                "You are the router for a coding task. Your only job is to decide which \
+                 skill runs next and then stop -- you do not explore files or write code.\n\n\
+                 {PATCH_WHAT_CHANGED}\n\n\
+                 What to put in the workspace:\n\
+                 - If `task` is empty, copy the user's request from the inbox into `task` \
+                   verbatim (do not paraphrase or trim it).\n\
+                 - Decide the next skill: if `plan` is empty, hand off to `plan`; if `plan` \
+                   has any step that is not `done`/`skipped`, hand off to `implement`; if every \
+                   step is `done` or `skipped` and `findings` is empty, hand off to `review`.\n\
+                 - Set `next_skill` to that choice.\n\n\
+                 When to hand off: always, in a single step. Ack every inbox item you read, \
+                 then set action `done`. Do not leave the router activation without a \
+                 `next_skill` set. The router cannot ask the user anything; if the task is \
+                 unclear, hand off to `plan`, which can.\n\n\
+                 History is searchable with the `recall` tool, but the router has no tools \
+                 and should not need it. `recent_summary` is the only memory that survives \
+                 across steps and across skill handoffs -- keep it current if you touch it."
+            ),
         )
     }
 
@@ -4348,10 +4366,12 @@ impl Skill for PlanSkill {
         // With the switch off, `head` + `tail` concatenate to exactly the
         // instructions string this skill has always had (byte-identical;
         // see `skills/tests/it/situational.rs`'s snapshot test).
-        let head = "You are the planner for a coding task. Use `search` to find definitions and \
+        let head = format!(
+            "You are the planner for a coding task. Use `search` to find definitions and \
              usages before reading whole files; use `list_files` and `read_file` \
              (with `offset`/`limit` for files longer than ~200 lines) until you \
              understand what needs to change. Do not write or run code yet.\n\n\
+             {PATCH_WHAT_CHANGED}\n\n\
              What to put in the workspace:\n\
              - Record every file you judge relevant in `files`, each with a one-line \
                note explaining why it matters.\n\
@@ -4360,11 +4380,12 @@ impl Skill for PlanSkill {
                each step a unique `id`. If the repo has tests, make the first step \
                \"run `test` to record the baseline\" and the last step \"run `test` and \
                confirm it passes\".\n\
-             - Keep `recent_summary` current as you explore.\n\
+             - Update `recent_summary` when you learn something that changes the plan.\n\
              - `notes` is kept by the harness from your previous reasoning: read it \
                before deciding; you cannot patch it.\n\
              - If you commit to a next step by setting `next`, the harness holds you to \
-               it -- change `next` (and say why in `recent_summary`) if the plan changes.\n";
+               it -- change `next` (and say why in `recent_summary`) if the plan changes.\n"
+        );
         let think_options_bullet = "- For a design fork with more than one reasonable approach, call \
              `think` with `mode: \"options\"` before writing the plan.\n";
         let tail = "\n\
@@ -4377,7 +4398,7 @@ impl Skill for PlanSkill {
              (the observation says so), call `filter_last_tool_call` with a regex instead \
              of re-running the command.";
         let mut instructions = String::new();
-        instructions.push_str(head);
+        instructions.push_str(&head);
         if !self.situational {
             instructions.push_str(think_options_bullet);
         }
@@ -4751,13 +4772,16 @@ impl Skill for ImplementSkill {
         // `think_bullet`/`try_fixes_bullet`/`tail` concatenate to exactly
         // the instructions string this skill has always had (byte-
         // identical; see `skills/tests/it/situational.rs`'s snapshot test).
-        let head = "You are implementing the plan for a coding task, one step at a time.\n\n\
+        let head = format!(
+            "You are implementing the plan for a coding task, one step at a time.\n\n\
+             {PATCH_WHAT_CHANGED}\n\n\
              What to put in the workspace:\n\
              - Mark the step you are working `in_progress`, then `done` once it is \
                finished; use `skipped` only when a step turns out unnecessary.\n\
              - Prefer `edit_file` for changes to existing files: give it a small \
                anchored `old` text copied exactly from a `read_file` result, including \
-               indentation. Use `write_file` only for new files or full rewrites. ";
+               indentation. Use `write_file` only for new files or full rewrites. "
+        );
         let edit_retry_clause = "If \
                `edit_file` reports the text was not found or ambiguous, re-read the \
                file and retry with a more specific anchor -- never fall back to \
@@ -4778,7 +4802,8 @@ impl Skill for ImplementSkill {
                `result:` line; do not mark a step `done` while `test` reports `fail` \
                unless the failure predates your change (check with `recall`, e.g. \
                query \"test output\" to see the last test run).\n";
-        let mid3 = "- Keep `files` and `recent_summary` up to date as you go.\n\
+        let mid3 = "- Keep `files` up to date as you go; update `recent_summary` when what you \
+               know changed.\n\
              - `notes` is kept by the harness from your previous reasoning: read it \
                before deciding; you cannot patch it.\n";
         let think_bullet = "- `think` asks a reasoning subagent that sees what you see; use it when a \
@@ -4799,7 +4824,7 @@ impl Skill for ImplementSkill {
              overflowed (the observation says so), call `filter_last_tool_call` with a \
              regex instead of re-running the command.";
         let mut instructions = String::new();
-        instructions.push_str(head);
+        instructions.push_str(&head);
         if !self.situational {
             instructions.push_str(edit_retry_clause);
         }
@@ -5241,6 +5266,7 @@ impl Skill for ReviewSkill {
              in this activation is not accepted. Before approving, run the tests without a \
              name filter (the crate's whole test target); a pass on one filtered test does \
              not cover regressions.\n\n\
+             {PATCH_WHAT_CHANGED}\n\n\
              What to put in the workspace:\n\
              - Write concrete `findings` -- specific, actionable problems, not vague \
                impressions. Leave `findings` empty if the work is correct and complete.\n\

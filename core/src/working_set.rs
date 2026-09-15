@@ -303,11 +303,12 @@ impl WorkingSet {
 }
 
 /// Fits the recent-calls lines and rendered windows (newest-first order,
-/// matching `windows`/`rendered_windows` above) to `budget`: drop the
-/// oldest window (whole) until the rest fits; once down to a single
-/// window, that window is head-truncated with a marker (rather than
-/// dropped) so it alone still fits; if no windows remain at all and it
-/// still overflows, cut recent-call lines oldest-first.
+/// matching `windows`/`rendered_windows` above -- render output is
+/// oldest-first, see `render`) to `budget`: drop the oldest window (whole)
+/// until the rest fits; once down to a single window, that window is
+/// head-truncated with a marker (rather than dropped) so it alone still
+/// fits; if no windows remain at all and it still overflows, cut
+/// recent-call lines oldest-first.
 fn fit_to_budget(
     recent_lines: Vec<String>,
     mut rendered_windows: Vec<(u64, String)>,
@@ -315,9 +316,15 @@ fn fit_to_budget(
     tokenizer: &dyn Tokenizer,
 ) -> Option<WorkingSet> {
     // Drop the oldest window (whole) while more than one remains and it
-    // still doesn't fit.
+    // still doesn't fit. `rendered_windows` stays newest-first throughout
+    // (so dropping the oldest is a `pop`); `render` is always given the
+    // bodies reversed to oldest-first, since that's the render order.
     while rendered_windows.len() > 1 {
-        let bodies: Vec<&str> = rendered_windows.iter().map(|(_, s)| s.as_str()).collect();
+        let bodies: Vec<&str> = rendered_windows
+            .iter()
+            .rev()
+            .map(|(_, s)| s.as_str())
+            .collect();
         let text = render(&recent_lines, &bodies);
         if tokenizer.count(&text) <= budget {
             return Some(WorkingSet::new(text, window_steps_of(&rendered_windows)));
@@ -327,7 +334,11 @@ fn fit_to_budget(
 
     // Zero or one window left. If it fits as-is (with the recent-call
     // lines), we're done.
-    let bodies: Vec<&str> = rendered_windows.iter().map(|(_, s)| s.as_str()).collect();
+    let bodies: Vec<&str> = rendered_windows
+        .iter()
+        .rev()
+        .map(|(_, s)| s.as_str())
+        .collect();
     let text = render(&recent_lines, &bodies);
     if !text.is_empty() && tokenizer.count(&text) <= budget {
         return Some(WorkingSet::new(text, window_steps_of(&rendered_windows)));
@@ -338,7 +349,11 @@ fn fit_to_budget(
     // oldest-first before giving up the window.
     let mut lines = recent_lines;
     loop {
-        let bodies: Vec<&str> = rendered_windows.iter().map(|(_, s)| s.as_str()).collect();
+        let bodies: Vec<&str> = rendered_windows
+            .iter()
+            .rev()
+            .map(|(_, s)| s.as_str())
+            .collect();
         let text = render(&lines, &bodies);
         if !text.is_empty() && tokenizer.count(&text) <= budget {
             return Some(WorkingSet::new(text, window_steps_of(&rendered_windows)));
@@ -393,21 +408,22 @@ fn truncate_window_to_budget(window: &str, budget: usize, tokenizer: &dyn Tokeni
     format!("{head}\n[... {omitted} chars omitted ...]")
 }
 
-/// Renders the section body: `recent calls:` header + lines, blank line,
-/// then each window newest-first (the caller keeps `windows` in that
-/// order). Empty when both are empty.
+/// Renders the section body: each window oldest-first (the caller passes
+/// `windows` in that order; selection above still picks/drops newest-first,
+/// only this render order differs), blank line, then the `recent calls:`
+/// header + lines. Empty when both are empty.
 fn render(recent_lines: &[String], windows: &[&str]) -> String {
     if recent_lines.is_empty() && windows.is_empty() {
         return String::new();
     }
     let mut parts: Vec<String> = Vec::new();
+    if !windows.is_empty() {
+        parts.push(windows.join("\n\n"));
+    }
     if !recent_lines.is_empty() {
         let mut block = String::from("recent calls:\n");
         block.push_str(&recent_lines.join("\n"));
         parts.push(block);
-    }
-    if !windows.is_empty() {
-        parts.push(windows.join("\n\n"));
     }
     parts.join("\n\n")
 }

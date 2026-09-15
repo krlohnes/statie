@@ -145,7 +145,7 @@ fn recent_call_line_capped_at_160_chars() {
 }
 
 #[test]
-fn windows_rendered_newest_first_and_exclude_this_steps_observation() {
+fn windows_rendered_oldest_first_and_exclude_this_steps_observation() {
     let log = MemoryLog::new();
     log.append(action(1, "read_file", json!({"path": "a.rs"})))
         .unwrap();
@@ -176,8 +176,8 @@ fn windows_rendered_newest_first_and_exclude_this_steps_observation() {
     let idx_b = text.find("b.rs").unwrap();
     let idx_a = text.find("a.rs").unwrap();
     assert!(
-        idx_b < idx_a,
-        "expected b.rs (step 2) before a.rs (step 1), newest first:\n{text}"
+        idx_a < idx_b,
+        "expected a.rs (step 1) before b.rs (step 2), oldest first:\n{text}"
     );
 }
 
@@ -397,7 +397,7 @@ fn only_newest_of_two_successful_edits_survives() {
 }
 
 #[test]
-fn edit_then_later_read_of_same_path_keeps_both_newest_first() {
+fn edit_then_later_read_of_same_path_keeps_both_oldest_first() {
     let log = MemoryLog::new();
     log.append(action(
         1,
@@ -434,8 +434,8 @@ fn edit_then_later_read_of_same_path_keeps_both_newest_first() {
     let idx_read = text.find("--- read_file a.rs").unwrap();
     let idx_edit = text.find("--- edit_file a.rs").unwrap();
     assert!(
-        idx_read < idx_edit,
-        "expected read (step 2) before edit (step 1), newest first:\n{text}"
+        idx_edit < idx_read,
+        "expected edit (step 1) before read (step 2), oldest first:\n{text}"
     );
     assert!(text.contains("re-read"), "{text}");
     assert!(text.contains("1: fn b() {}"), "{text}");

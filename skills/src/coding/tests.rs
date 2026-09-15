@@ -9,12 +9,12 @@ use statie_core::{
 use statie_patch::JsonMergePatch;
 
 use super::{
-    CodingWorkspace, Decision, FileNote, INFERRED_TOOL_NOTE_PREFIX, ImplementSkill, PlanSkill,
-    PlanStep, ReadFileArgs, ReviewSkill, RouterSkill, SeenFile, StepStatus, TestRecord,
-    coding_skills, coding_skills_with_delegates, common_after_tool, count_lines,
-    failing_test_names, finding_is_grounded, first_error_line, has_named_handoff, infer_tool_name,
-    merge_range, parse_edit_header, parse_finding_location, parse_revert_lines, seen_entry,
-    shell_read_as_read_file, write_file_confirmed_by_seen,
+    CodingWorkspace, Decision, FileNote, INFERRED_TOOL_NOTE_PREFIX, ImplementSkill,
+    OPEN_STEP_NOTE_FIRST, OPEN_STEP_NOTE_REPEAT, PlanSkill, PlanStep, ReadFileArgs, ReviewSkill,
+    RouterSkill, SeenFile, StepStatus, TestRecord, coding_skills, coding_skills_with_delegates,
+    common_after_tool, count_lines, failing_test_names, finding_is_grounded, first_error_line,
+    has_named_handoff, infer_tool_name, merge_range, parse_edit_header, parse_finding_location,
+    parse_revert_lines, seen_entry, shell_read_as_read_file, write_file_confirmed_by_seen,
 };
 
 fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
@@ -37,6 +37,7 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             try_fixes_available: false,
             last_try_fixes_step: None,
             consecutive_non_question_asks: 0,
+            consecutive_continues: 0,
             last_failure_summary: None,
             last_skip: None,
             last_tool_error: None,
@@ -673,7 +674,10 @@ fn implement_handoff_to_review_with_pending_step_and_failing_run_continues_inste
         statie_core::Action::Continue { note } => {
             assert!(note.contains("plan step 1 is still open"), "{note}");
             assert!(note.contains('a'), "{note}");
-            assert!(note.contains("set its status to done"), "{note}");
+            assert!(
+                note.contains("A step is finished by a tool call, not by marking it done"),
+                "{note}"
+            );
             assert!(note.contains("run `test`"), "{note}");
         }
         other => panic!("expected Action::Continue, got {other:?}"),
@@ -682,6 +686,238 @@ fn implement_handoff_to_review_with_pending_step_and_failing_run_continues_inste
         patch.next().next_skill,
         None,
         "next_skill must be stripped so the handoff does not land"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unit 37: `premature_done_note`'s first-refusal/repeat-refusal split on
+// `HarnessState::consecutive_continues`. Called directly (not through
+// `ImplementSkill::validate`'s full chain): `green_done_note` fires ahead
+// of `premature_done_note` whenever `green_step.is_some()` AND an open step
+// is present -- forcing every open step done and handing off -- so a
+// `green_step: Some(_)` scenario (acceptance (b)'s second case) can never
+// reach `premature_done_note` through the full chain. Calling the function
+// itself isolates exactly the unit this brief specifies.
+// ---------------------------------------------------------------------
+
+/// Parses `content` into a `ParsedOutput<CodingWorkspace>` the same way the
+/// session would, for a direct call into `premature_done_note` below.
+fn parsed_output(content: Value) -> ParsedOutput<CodingWorkspace> {
+    ParsedOutput::<CodingWorkspace>::parse::<JsonMergePatch<CodingWorkspace>>(raw(0, content))
+        .expect("should parse as valid StepOutput JSON")
+}
+
+/// Acceptance (a): first refusal (`consecutive_continues: 0`, the default
+/// `committed` gives). The note equals `OPEN_STEP_NOTE_FIRST` formatted
+/// with the open step, and the patch's plan status changes are applied in
+/// full (assert the merged plan statuses exactly): step 1 (sent as
+/// `status: done` in the patch) reads `Done`, step 2 (untouched, still
+/// `pending` in the committed state) reads `Pending`.
+#[test]
+fn premature_done_first_refusal_note_is_exact_and_patch_status_changes_land() {
+    let cur = committed(CodingWorkspace {
+        plan: vec![
+            PlanStep {
+                id: 1,
+                text: "first change".to_string(),
+                status: StepStatus::Pending,
+            },
+            PlanStep {
+                id: 2,
+                text: "second change".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+        ..Default::default()
+    });
+    assert_eq!(cur.harness.consecutive_continues, 0);
+    let mut out = parsed_output(json!({
+        "patch": {"plan": [{"id": 1, "status": "done"}], "next_skill": "review"},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let note = super::premature_done_note(&cur, &mut out).expect("first refusal should convert");
+
+    let expected_note =
+        OPEN_STEP_NOTE_FIRST
+            .replacen("{}", "2", 1)
+            .replacen("{}", "second change", 1);
+    assert_eq!(note, expected_note, "note text must match exactly");
+
+    // The patch's plan status change landed in full, merged with the
+    // committed workspace.
+    let merged = super::merged_workspace(&cur.agent, &out).expect("patch should merge cleanly");
+    assert_eq!(
+        merged
+            .plan
+            .iter()
+            .map(|s| (s.id, s.status))
+            .collect::<Vec<_>>(),
+        vec![(1, StepStatus::Done), (2, StepStatus::Pending)],
+        "the patch's plan status change must have landed in full: {:?}",
+        merged.plan
+    );
+    assert_eq!(
+        out.patch().0.get("next_skill"),
+        None,
+        "next_skill must be stripped so the handoff does not land"
+    );
+}
+
+/// Acceptance (b) first case: repeat refusal (`consecutive_continues: 1`)
+/// with a patch marking step 2 done. The merged plan still has step 2
+/// `Pending` (its status change was dropped, exact), and the note equals
+/// `OPEN_STEP_NOTE_REPEAT` with `{call}` = "`test`" (since
+/// `edits_since_test: 1` here).
+#[test]
+fn premature_done_repeat_refusal_drops_status_change_and_note_says_test_when_edits_pending() {
+    // Step 1 done, step 3 pending and untouched by the patch -- keeps
+    // `premature_done_note`'s top-level open-step gate satisfied both
+    // before AND after step 2's status change is dropped, so the test
+    // isolates step 2 being reverted rather than accidentally relying on
+    // it to be the only thing keeping the plan open.
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![
+            PlanStep {
+                id: 1,
+                text: "first change".to_string(),
+                status: StepStatus::Done,
+            },
+            PlanStep {
+                id: 2,
+                text: "second change".to_string(),
+                status: StepStatus::Pending,
+            },
+            PlanStep {
+                id: 3,
+                text: "third change".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+        ..Default::default()
+    });
+    cur.harness.consecutive_continues = 1;
+    cur.harness.edits_since_test = 1;
+    let mut out = parsed_output(json!({
+        "patch": {"plan": [{"id": 2, "status": "done"}]},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let note = super::premature_done_note(&cur, &mut out).expect("repeat refusal should convert");
+
+    let merged = super::merged_workspace(&cur.agent, &out).expect("dropped patch should merge");
+    assert_eq!(
+        merged
+            .plan
+            .iter()
+            .map(|s| (s.id, s.status))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, StepStatus::Done),
+            (2, StepStatus::Pending),
+            (3, StepStatus::Pending)
+        ],
+        "step 2's status change must have been dropped: {:?}",
+        merged.plan
+    );
+
+    let expected_note = OPEN_STEP_NOTE_REPEAT
+        .replacen("{}", "2", 1)
+        .replacen("{}", "second change", 1)
+        .replacen("{}", "`test`", 1);
+    assert_eq!(note, expected_note, "note text must match exactly");
+}
+
+/// Acceptance (b) second case: same repeat refusal, but
+/// `edits_since_test: 0` and `green_step: Some(3)` (nothing edited since a
+/// passing run) -- `{call}` becomes the `read_file`/`edit_file` form
+/// instead of `` `test` ``.
+#[test]
+fn premature_done_repeat_refusal_note_says_read_or_edit_when_nothing_edited_since_green() {
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 1,
+            text: "only step".to_string(),
+            status: StepStatus::Pending,
+        }],
+        ..Default::default()
+    });
+    cur.harness.consecutive_continues = 1;
+    cur.harness.edits_since_test = 0;
+    cur.harness.green_step = Some(3);
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let note = super::premature_done_note(&cur, &mut out).expect("repeat refusal should convert");
+
+    let expected_note = OPEN_STEP_NOTE_REPEAT
+        .replacen("{}", "1", 1)
+        .replacen("{}", "only step", 1)
+        .replacen(
+            "{}",
+            "`read_file` or `edit_file` on the file that step names",
+            1,
+        );
+    assert_eq!(note, expected_note, "note text must match exactly");
+}
+
+/// Acceptance (c): a repeat refusal whose patch has only a plan status
+/// change (a single entry, `{"id": 1, "status": "done"}`, with no other
+/// field) results in a patch with no `plan` key at all (assert the raw
+/// patch exactly): dropping `status` leaves nothing but `id`, a no-op, so
+/// the entry -- and then the now-empty `plan` array -- is removed.
+#[test]
+fn fill_template_keeps_braces_inside_a_value_out_of_later_placeholders() {
+    let got = super::fill_template("a {} b {} c {}", &["fn f() {}", "two", "three"]);
+    assert_eq!(got, "a fn f() {} b two c three");
+    let short = super::fill_template("x {} y {}", &["only"]);
+    assert_eq!(
+        short, "x only y ",
+        "a missing value drops the placeholder and its tail"
+    );
+}
+
+#[test]
+fn premature_done_repeat_refusal_status_only_entry_drops_plan_key_entirely() {
+    // Two committed steps: step 1 (the patch marks it done, and only that)
+    // and step 2 (untouched, stays open) -- so the pre-drop merge still has
+    // an open step (step 2) and `premature_done_note`'s top-level gate
+    // fires, but the raw patch's own `plan` array holds only the one entry
+    // this test cares about.
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![
+            PlanStep {
+                id: 1,
+                text: "first step".to_string(),
+                status: StepStatus::Pending,
+            },
+            PlanStep {
+                id: 2,
+                text: "second step".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+        ..Default::default()
+    });
+    cur.harness.consecutive_continues = 1;
+    let mut out = parsed_output(json!({
+        "patch": {"plan": [{"id": 1, "status": "done"}]},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let _note = super::premature_done_note(&cur, &mut out).expect("repeat refusal should convert");
+
+    assert_eq!(
+        out.patch().0.clone(),
+        json!({}),
+        "the plan key must be dropped entirely, leaving an empty raw patch: {:?}",
+        out.patch().0
     );
 }
 

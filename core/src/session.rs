@@ -1235,6 +1235,7 @@ impl<W> Session<W> {
                         try_fixes_available: self.fixer.is_some(),
                         last_try_fixes_step: None,
                         consecutive_non_question_asks: 0,
+                        consecutive_continues: 0,
                         last_failure_summary: None,
                         last_skip: None,
                         last_tool_error: None,
@@ -2331,6 +2332,17 @@ where
         // resets it.
         next_harness.consecutive_non_question_asks = if raw_non_question_ask {
             cur.harness.consecutive_non_question_asks.saturating_add(1)
+        } else {
+            0
+        };
+        // `HarnessState::consecutive_continues`: streak of the FINAL action
+        // being committed (this `action`, after `validate` -- and 7.8's
+        // read-paging rewrite, above -- have both had their say), unlike
+        // `consecutive_non_question_asks` above, which counts the raw
+        // pre-`validate` shape. A committed `Action::Continue` extends the
+        // previous streak; any other committed action resets it to 0.
+        next_harness.consecutive_continues = if matches!(action, Action::Continue { .. }) {
+            cur.harness.consecutive_continues.saturating_add(1)
         } else {
             0
         };

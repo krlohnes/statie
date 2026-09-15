@@ -2637,32 +2637,166 @@ fn has_named_handoff(
 ///    actually asked, so parking the session on it would just stall.
 ///
 /// Returns `None` when neither applies (the action is left alone).
+///
+/// Case (a) itself has two shapes, told apart by
+/// `HarnessState::consecutive_continues` (the streak of FINAL committed
+/// actions that were the harness-internal `Action::Continue`, i.e. how
+/// many times in a row this exact conversion -- or another guard's -- has
+/// already fired with no real tool call landing in between):
+///
+/// - First refusal (`consecutive_continues == 0`): [`OPEN_STEP_NOTE_FIRST`]
+///   (formatted via [`open_step_note`]). The patch is kept in full,
+///   including any plan status changes it carries.
+/// - Repeat refusal (`consecutive_continues >= 1`): bench short_fixer_b22
+///   trap_rounding: seven plan-walk runs across four batteries, one landed
+///   -- the first refusal's note offered "set its status to done" as a way
+///   to move on, and the model took it literally, resending `done` with
+///   just the status change and no tool call, three to twelve times
+///   running, until the non-progress cap parked it. On a repeat, the
+///   `status` field is dropped from every `plan` entry in the RAW patch
+///   whose `status` is `"done"` before the patch is applied (other fields
+///   of that entry, and every other patch field, are kept as sent; an
+///   entry left with a real change beyond `status` stays with that change
+///   applied). An entry left with nothing but `id` -- or nothing at all --
+///   after the drop is a no-op on merge, so it is removed from the patch
+///   outright rather than kept as dead weight; if every entry in `plan` is
+///   removed this way, the `plan` key itself is removed from the patch --
+///   the merge is then recomputed on the dropped patch to find the first
+///   still-open step, and [`OPEN_STEP_NOTE_REPEAT`] names it, demanding a
+///   real tool call next.
 fn premature_done_note(
-    cur: &CodingWorkspace,
+    cur: &CommittedState<CodingWorkspace>,
     out: &mut statie_core::ParsedOutput<CodingWorkspace>,
 ) -> Option<String> {
     if matches!(out.action(), statie_core::Action::Done) {
-        let merged = merged_workspace(cur, out)?;
+        let merged = merged_workspace(&cur.agent, out)?;
         if !merged.done
-            && let Some(open) = merged
+            && merged
                 .plan
                 .iter()
-                .find(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))
+                .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))
         {
-            let note = format!(
-                "plan step {} is still open: {}. If that step's work is already done, set its \
-                 status to done in your patch and run `test`; if not, make the change with \
-                 edit_file/write_file, then `test`. `done` is for a finished plan; your patch \
-                 was kept.",
-                open.id, open.text
-            );
             if let Some(obj) = out.patch_mut().0.as_object_mut() {
                 obj.remove("next_skill");
             }
+            if cur.harness.consecutive_continues == 0 {
+                let open = merged
+                    .plan
+                    .iter()
+                    .find(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))?;
+                return Some(open_step_note(OPEN_STEP_NOTE_FIRST, open.id, &open.text));
+            }
+
+            // Repeat refusal: drop `status: "done"` plan entries from the
+            // RAW patch, then recompute the merge on the dropped patch to
+            // find the first still-open step.
+            drop_done_plan_entries(out.patch_mut());
+            let dropped_merged = merged_workspace(&cur.agent, out)?;
+            let open = dropped_merged
+                .plan
+                .iter()
+                .find(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))?;
+            let call = if cur.harness.edits_since_test > 0 || cur.harness.green_step.is_none() {
+                "`test`"
+            } else {
+                "`read_file` or `edit_file` on the file that step names"
+            };
+            let note = fill_template(
+                OPEN_STEP_NOTE_REPEAT,
+                &[&open.id.to_string(), &open.text, call],
+            );
             return Some(note);
         }
     }
     ask_user_empty_note(out)
+}
+
+/// First-refusal note for `premature_done_note` case (a): a plan step is
+/// still open the FIRST time in this streak of committed
+/// `Action::Continue`s. Offers the model two ways forward -- do the work,
+/// or run `test` to show it is already done -- but does NOT invite marking
+/// the step done without running anything, since that invitation is
+/// exactly what walked the model in the live runs `consecutive_continues`
+/// (`core/src/version.rs`) exists to catch (see [`OPEN_STEP_NOTE_REPEAT`]).
+/// `{}` placeholders, in order: step id, step text. Format with
+/// [`open_step_note`] (D13: kept as a `pub const` so tests import the exact
+/// text instead of duplicating it).
+pub const OPEN_STEP_NOTE_FIRST: &str = "plan step {} is still open: {}. A step is finished by a \
+     tool call, not by marking it done; make the change with edit_file/write_file and run \
+     `test`, or if that step's work is already done, run `test` to show it. `done` is for a \
+     finished plan; your patch was kept.";
+
+/// Repeat-refusal note for `premature_done_note` case (a): the previous
+/// committed step was ALSO a harness `Action::Continue` (no tool call has
+/// run since), and the model sent `done` again anyway. Unlike
+/// [`OPEN_STEP_NOTE_FIRST`], this does not offer marking the step done at
+/// all -- the raw patch's `status: "done"` plan entries have already been
+/// dropped by the time this note is shown, and the note says so. `{}`
+/// placeholders, in order: step id, step text, `{call}` (see
+/// `premature_done_note`'s doc). D13: kept as a `pub const` so tests
+/// import the exact text instead of duplicating it.
+pub const OPEN_STEP_NOTE_REPEAT: &str = "plan step {} is still open: {}. No tool has run since \
+     your last `done`, and plan steps are not marked done without one; the status changes in \
+     this patch were dropped. Your next action must be a tool call: {}. `done` is for a \
+     finished plan.";
+
+/// Formats [`OPEN_STEP_NOTE_FIRST`] (the only template with just the two
+/// `{id}`/`{text}` placeholders) with the given open step's id and text.
+fn open_step_note(template: &str, id: u32, text: &str) -> String {
+    fill_template(template, &[&id.to_string(), text])
+}
+
+/// Fills each `{}` in `template` with the next value, left to right. The
+/// placeholders are located in the template before any value is inserted,
+/// so a value that itself contains `{}` (a plan step quoting `fn f() {}`)
+/// cannot capture a later placeholder, which chained `replacen` calls
+/// would let it do.
+fn fill_template(template: &str, values: &[&str]) -> String {
+    let mut parts = template.split("{}");
+    let mut out = String::from(parts.next().unwrap_or_default());
+    for (part, value) in parts.zip(values) {
+        out.push_str(value);
+        out.push_str(part);
+    }
+    out
+}
+
+/// Drops the `status` field from every `plan` entry in `patch`'s RAW JSON
+/// whose `status` is `"done"` -- the repeat-refusal shape of
+/// `premature_done_note`'s case (a). Only that field is touched: other
+/// fields of the entry (e.g. `text`) are kept, so an entry that also
+/// changed something besides `status` stays, with that other change
+/// intact. An entry left with nothing but `id` (or nothing at all) after
+/// the drop is a no-op on merge -- dead weight -- so it is removed from
+/// the array outright rather than kept; if every entry in `plan` is
+/// removed this way, the `plan` array (and so the `plan` key) becomes
+/// empty and is removed from the patch entirely. A patch with no `plan`
+/// key, or whose `plan` is not an array of objects, is left alone.
+fn drop_done_plan_entries(patch: &mut statie_core::RawPatch) {
+    let Some(obj) = patch.0.as_object_mut() else {
+        return;
+    };
+    let Some(plan) = obj.get_mut("plan") else {
+        return;
+    };
+    let Some(arr) = plan.as_array_mut() else {
+        return;
+    };
+    arr.retain_mut(|entry| {
+        let Some(entry_obj) = entry.as_object_mut() else {
+            return true;
+        };
+        if entry_obj.get("status").and_then(serde_json::Value::as_str) != Some("done") {
+            return true;
+        }
+        entry_obj.remove("status");
+        // A no-op entry left with nothing but `id` (or nothing at all) is
+        // dropped outright rather than kept as dead weight in the patch.
+        !(entry_obj.is_empty() || (entry_obj.len() == 1 && entry_obj.contains_key("id")))
+    });
+    if arr.is_empty() {
+        obj.remove("plan");
+    }
 }
 
 /// Live run 59: `implement` handed off to `review` right after its own
@@ -4996,7 +5130,7 @@ impl Skill for ImplementSkill {
             } else {
                 extra_note = Some(note);
             }
-        } else if let Some(note) = premature_done_note(&cur.agent, &mut out) {
+        } else if let Some(note) = premature_done_note(cur, &mut out) {
             out.set_action(statie_core::Action::Continue { note });
         }
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;

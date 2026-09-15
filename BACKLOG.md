@@ -342,8 +342,24 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 38. The thinker sends the model's configured `think` flag
+- **Status.** Proposed. Evidence: every Qwen battery (`qwen_json_short_b15`
+  to `b19`, `qwen_json_long_b22`): 14 to 82 `think` failures each, all
+  `400 "qwen3-coder:latest" does not support thinking`. No `think` has
+  ever run under Qwen; every guard that substitutes one (repeated
+  failure, repeated skip, stall, no-green) spent its step on an error.
+- **What.** `ModelThinker` passes the thinker model's configured
+  `OllamaConfig::think` instead of a literal `true` on every reasoning
+  call, and reads the reasoning from `content` when the flag is off.
+  The Qwen configs already set `"think": false`; nothing else changes.
+- **Why.** D24: decoding is per-model config. The knob existed; the
+  thinker did not read it. The Qwen numbers so far (11 to 13 of 16)
+  were measured with `think` broken, so they are a floor.
+- **Measure.** Zero `think` errors on the next Qwen battery; landing
+  against `qwen_json_short_b19` (13/16).
+
 ### 37. A plan step is marked done by work, not by a `done` that was just refused
-- **Status.** Proposed. Evidence: seven runs across `short_fixer_b16`,
+- **Status.** Committed (Milestone 43). Measured next on the gemma short battery (`short_fixer_b23`). Evidence: seven runs across `short_fixer_b16`,
   `b18`, `b21`, `b22` (two, one, one, three) in which the model
   answered "plan step N is still open" by marking N done and sending
   `done` again, three or more times in a row, until the non-progress

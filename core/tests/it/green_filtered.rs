@@ -485,6 +485,7 @@ fn harness_view_marks_filtered_pass() {
         try_fixes_available: false,
         last_try_fixes_step: None,
         consecutive_non_question_asks: 0,
+        consecutive_continues: 0,
         last_failure_summary: None,
         last_skip: None,
         last_tool_error: None,

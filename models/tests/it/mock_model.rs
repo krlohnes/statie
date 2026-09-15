@@ -59,6 +59,7 @@ fn build_prompt(version: Version) -> BoundedPrompt {
         try_fixes_available: false,
         last_try_fixes_step: None,
         consecutive_non_question_asks: 0,
+        consecutive_continues: 0,
         last_failure_summary: None,
         last_skip: None,
         last_tool_error: None,

@@ -180,6 +180,28 @@ pub struct HarnessState {
     /// existed still deserializes.
     #[serde(default)]
     pub consecutive_non_question_asks: u32,
+    /// How many consecutive committed steps, ending in this one, had the
+    /// harness-internal `Action::Continue` (`core/src/model.rs`) as their
+    /// FINAL action -- i.e. what actually committed, after `Skill::validate`
+    /// has run and possibly rewritten the model's raw action, not the raw
+    /// action itself (contrast `consecutive_non_question_asks`, which is
+    /// read BEFORE `validate`). Set at the same commit site
+    /// (`core/src/session.rs`'s `step`, right before committing
+    /// `next_harness`): the previous committed value plus one when the
+    /// FINAL action being committed is `Action::Continue`; any other action
+    /// resets it to `0`. Harness-owned: patches cannot touch it. Read by
+    /// `skills/src/coding/mod.rs`'s `premature_done_note` to tell a first
+    /// premature `done` from a repeat: bench short_fixer_b22 trap_rounding:
+    /// seven plan-walk runs across four batteries, one landed -- the first
+    /// refusal's note offered marking the step done as a way to move on,
+    /// and the model took it literally, sending `done` again with the
+    /// status change and no tool call, three to twelve times running, until
+    /// the non-progress cap parked it; a repeat refusal now drops the
+    /// status change from the patch and demands a real tool call instead.
+    /// `#[serde(default)]` so state persisted before this field existed
+    /// still deserializes.
+    #[serde(default)]
+    pub consecutive_continues: u32,
     /// The normalized failure summary (see `core/src/session.rs`'s
     /// `normalize_failure_summary`) of the most recent FAILING `test` call,
     /// capped at 600 characters. Set at the same `test` call site as

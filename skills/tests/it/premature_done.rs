@@ -32,7 +32,10 @@ use statie_core::{
     SandboxRoot, Schema, Session, SessionConfig, SessionLog, SessionLogExt, StepSink,
 };
 use statie_models::{MockModel, MockTurn};
-use statie_skills::{CodingWorkspace, ImplementSkill, PlanSkill, ReviewSkill, StepStatus};
+use statie_skills::{
+    CodingWorkspace, ImplementSkill, OPEN_STEP_NOTE_FIRST, OPEN_STEP_NOTE_REPEAT, PlanSkill,
+    ReviewSkill, StepStatus,
+};
 use statie_store::InMemoryStore;
 use statie_tools::{ToolConfig, default_tools};
 
@@ -260,8 +263,8 @@ async fn implement_done_with_open_step_continues_patch_lands_step2_still_open() 
     );
     assert!(note.contains("second change"), "{note}");
     assert!(
-        note.contains("set its status to done"),
-        "note should offer the bookkeeping path first: {note}"
+        note.contains("A step is finished by a tool call, not by marking it done"),
+        "note should require a tool call, not just a status change: {note}"
     );
     assert!(note.contains("run `test`"), "{note}");
 
@@ -1020,12 +1023,148 @@ fn premature_done_action_is_continue_variant() {
     // `skills/src/coding/tests.rs`'s
     // `implement_handoff_to_review_with_pending_step_continues_instead_of_handoff`
     // for the full patch-level assertions.
-    let note = "plan step 2 is still open: second change. If that step's work is already done, \
-                set its status to done in your patch and run `test`; if not, make the change \
-                with edit_file/write_file, then `test`. `done` is for a finished plan; your \
-                patch was kept.";
-    let action = Action::Continue {
-        note: note.to_string(),
-    };
+    let note = OPEN_STEP_NOTE_FIRST
+        .replacen("{}", "2", 1)
+        .replacen("{}", "second change", 1);
+    let action = Action::Continue { note };
     assert!(matches!(action, Action::Continue { .. }));
+}
+
+// ---------------------------------------------------------------------
+// Acceptance (d) (unit 37): a scripted three-step run -- `done` with an
+// open step (first refusal), `done` again marking that step done (repeat
+// refusal: the status change is dropped, the step stays open), `test` (a
+// real tool call) -- shows the third step landing as an ordinary tool call
+// and `HarnessState::consecutive_continues` reading 0 right after it.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn done_then_done_marking_done_then_test_resets_consecutive_continues_to_zero() {
+    let root = tempfile::tempdir().unwrap();
+
+    let turns = vec![
+        // Seed a two-step plan (both pending): step 1 is the one this test
+        // repeatedly tries to mark done; step 2 is never touched by any
+        // patch below, so the plan always has an open step and
+        // `premature_done_note`'s top-level gate stays satisfied whether
+        // or not step 1's own status change lands.
+        MockTurn::new(
+            json!({
+                "patch": {
+                    "plan": [
+                        {"id": 1, "text": "the first change", "status": "pending"},
+                        {"id": 2, "text": "the second change", "status": "pending"},
+                    ]
+                },
+                "action": {"type": "ask_user", "message": "confirm?"},
+            })
+            .to_string(),
+        ),
+        // A failing test establishes last_test_cmd with green_step staying
+        // None and edits_since_test at 0 -- the shape that keeps
+        // `premature_done_note` in priority over the test substitution.
+        test_turn("false"),
+        // Step 3: `done` with step 1 still open (first refusal:
+        // consecutive_continues was 0 after the tool-call step above).
+        MockTurn::new(json!({"patch": {}, "action": {"type": "done"}}).to_string()),
+        // Step 4: `done` again, this time marking step 1 done in the patch
+        // (repeat refusal: consecutive_continues is now 1, so the status
+        // change is dropped and step 1 stays open).
+        MockTurn::new(
+            json!({
+                "patch": {"plan": [{"id": 1, "status": "done"}]},
+                "action": {"type": "done"},
+            })
+            .to_string(),
+        ),
+        // Step 5: a real tool call -- breaks the Continue streak.
+        test_turn("true"),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    // Step 1: seed the plan.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome1 = log.append_record(rec1).unwrap();
+    assert!(matches!(outcome1, Outcome::Parked(Park::AskUser(_))));
+
+    // Step 2: the failing test.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec2).unwrap();
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.green_step, None, "the test call failed");
+    assert_eq!(state.harness.edits_since_test, 0);
+    assert_eq!(
+        state.harness.consecutive_continues, 0,
+        "a real tool call must not be a Continue"
+    );
+
+    // Step 3: first refusal -> Continue, consecutive_continues becomes 1.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(matches!(outcome3, Outcome::Continue), "got {outcome3:?}");
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.consecutive_continues, 1);
+    assert_eq!(
+        state.agent.plan.first().map(|s| s.status),
+        Some(StepStatus::Pending),
+        "the step must still be open after the first refusal"
+    );
+    let notes = continued_notes(&log);
+    let note = notes.last().expect("a `continued` System entry must exist");
+    let expected_note =
+        OPEN_STEP_NOTE_FIRST
+            .replacen("{}", "1", 1)
+            .replacen("{}", "the first change", 1);
+    assert_eq!(
+        note, &expected_note,
+        "step 3 must produce the exact first-refusal note"
+    );
+
+    // Step 4: repeat refusal -> Continue again, consecutive_continues
+    // becomes 2, and the status change is dropped (the step stays open).
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome4 = log.append_record(rec4).unwrap();
+    assert!(matches!(outcome4, Outcome::Continue), "got {outcome4:?}");
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(state.harness.consecutive_continues, 2);
+    assert_eq!(
+        state.agent.plan.first().map(|s| s.status),
+        Some(StepStatus::Pending),
+        "the repeat refusal must have dropped the status change: {:?}",
+        state.agent.plan
+    );
+    let notes = continued_notes(&log);
+    let note = notes.last().expect("a `continued` System entry must exist");
+    let expected_note = OPEN_STEP_NOTE_REPEAT
+        .replacen("{}", "1", 1)
+        .replacen("{}", "the first change", 1)
+        .replacen("{}", "`test`", 1);
+    assert_eq!(
+        note, &expected_note,
+        "step 4 must produce the exact repeat-refusal note"
+    );
+
+    // Step 5: a real tool call (`test`) -> not a Continue, so
+    // consecutive_continues resets to 0.
+    let rec5 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome5 = log.append_record(rec5).unwrap();
+    assert!(
+        matches!(outcome5, Outcome::Continue),
+        "got {outcome5:?}; the ordinary tool-call outcome is still `Continue` at the `Outcome` \
+         level, but the committed `Action` must be a real `Tool` call, not the harness-internal \
+         `Action::Continue`"
+    );
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.harness.tool_calls, 2,
+        "the `test` call must have executed for real (the earlier failing test plus this one)"
+    );
+    assert_eq!(
+        state.harness.consecutive_continues, 0,
+        "a real tool call must reset consecutive_continues to 0"
+    );
 }

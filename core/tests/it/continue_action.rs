@@ -21,8 +21,8 @@ use statie_core::{
     Action, ApplyFn, Budgets, Capabilities, CommittedState, Event, HarnessState, LogKind,
     LoggedPatch, Model, ModelError, NullSink, Outcome, Park, ParsedOutput, PatchError,
     PatchStrategy, RawOutput, SandboxRoot, Schema, Session, SessionConfig, SessionLog,
-    SessionLogExt, Skill, SkillSpec, StateStore, StepSink, StoreError, Usage, ValidatedStep,
-    Version, validate_default,
+    SessionLogExt, Skill, SkillSpec, StateStore, StepSink, StoreError, Tool, ToolCtx, ToolSet,
+    Usage, ValidatedStep, Version, validate_default,
 };
 
 // ---------------------------------------------------------------------
@@ -862,4 +862,139 @@ async fn patch_entry_usage_omits_timing_keys_when_not_reported() {
         usage.get("eval_secs").is_none(),
         "eval_secs key must be absent, not null: {usage}"
     );
+}
+
+// ---------------------------------------------------------------------
+// `HarnessState::consecutive_continues` (unit 37, `core/src/version.rs`):
+// the streak of consecutive committed steps whose FINAL action (after
+// `Skill::validate`) was the harness-internal `Action::Continue`. Set at
+// the same commit site as `consecutive_non_question_asks`
+// (`core/src/session.rs`'s `step`), but keyed on the post-`validate`
+// action rather than the model's raw one.
+// ---------------------------------------------------------------------
+
+/// A no-op `edit_file` tool, so a scripted `Action::Tool` step can actually
+/// commit (rather than erroring for want of a registered tool).
+struct NoopEditFile;
+
+#[async_trait]
+impl Tool for NoopEditFile {
+    fn name(&self) -> &str {
+        "edit_file"
+    }
+    fn description(&self) -> &str {
+        "edits a file"
+    }
+    fn args_schema(&self) -> Schema {
+        Schema::of::<Value>()
+    }
+    async fn call(
+        &self,
+        _args: Value,
+        _ctx: &ToolCtx,
+    ) -> Result<statie_core::ToolOutputFull, statie_core::ToolError> {
+        Ok(statie_core::ToolOutputFull::new("edited".to_string()))
+    }
+}
+
+/// A skill whose `validate` converts a `done` action into the
+/// harness-internal `Action::Continue` (the same shape `ContinueSkill`
+/// always produces above), but leaves any OTHER action -- in particular a
+/// real `Action::Tool` call -- untouched, so a scripted sequence of
+/// `done`/tool-call turns lands whatever mix of final actions a test wants
+/// to drive `consecutive_continues` with.
+struct ToggleSkill;
+
+impl Skill for ToggleSkill {
+    type Workspace = Workspace;
+    type Patch = MergePatch;
+
+    fn name(&self) -> &str {
+        "toggle"
+    }
+
+    fn spec(&self) -> Arc<SkillSpec> {
+        Arc::new(SkillSpec::new("toggle", "done converts to continue"))
+    }
+
+    fn initial_workspace(&self) -> Workspace {
+        Workspace::default()
+    }
+
+    fn tools(&self) -> Vec<String> {
+        vec!["edit_file".to_string()]
+    }
+
+    fn is_terminal(&self, s: &Workspace) -> bool {
+        s.done
+    }
+
+    fn validate(
+        &self,
+        cur: &CommittedState<Workspace>,
+        mut out: ParsedOutput<Workspace>,
+    ) -> Result<ValidatedStep<Workspace>, PatchError> {
+        if matches!(out.action(), Action::Done) {
+            out.set_action(Action::Continue {
+                note: "still open, keep going".to_string(),
+            });
+        }
+        validate_default::<Workspace, MergePatch>(self, cur, out)
+    }
+}
+
+async fn harness_state(active: &mut statie_core::Active<'_, ToggleSkill>) -> HarnessState {
+    let (state, _version) = active.session().state().await.unwrap();
+    state.harness
+}
+
+/// A scripted session whose committed actions are `Continue, Continue,
+/// tool, Continue` (`done`, `done`, `edit_file`, `done`): asserts
+/// `consecutive_continues` reads 1, 2, 0, 1 after each commit, exactly.
+#[tokio::test]
+async fn consecutive_continues_tracks_the_streak_of_committed_continue_actions() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), serde_json::json!({"type": "done"})),
+        step_output(serde_json::json!({}), serde_json::json!({"type": "done"})),
+        step_output(
+            serde_json::json!({}),
+            serde_json::json!({"type": "tool", "name": "edit_file", "args": {}}),
+        ),
+        step_output(serde_json::json!({}), serde_json::json!({"type": "done"})),
+    ]);
+
+    let mut tools = ToolSet::new();
+    tools.register(Arc::new(NoopEditFile));
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        tools,
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    );
+
+    let skill = Arc::new(ToggleSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    assert_eq!(
+        harness_state(&mut active).await.consecutive_continues,
+        0,
+        "a fresh session must read 0"
+    );
+
+    let expected = [1u32, 2, 0, 1];
+    for want in expected {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        let _ = SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+        let state = harness_state(&mut active).await;
+        assert_eq!(
+            state.consecutive_continues, want,
+            "consecutive_continues after this commit"
+        );
+    }
 }

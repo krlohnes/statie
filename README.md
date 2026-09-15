@@ -1676,6 +1676,24 @@ either a default or a config knob:
   host re-reads the prompt. D25 addendum; item 36's layout change is
   now expected to move `peval` by tenths of a second, not seconds.
 
+  Build 22 (item 36 in: stable sections first, windows oldest first),
+  gemma: 13 of 16, median 12.5 steps, 87 s a run. `peval` did not
+  move: mean 0.453 s against 0.461, median 0.48 s on both builds, 142
+  of 248 steps under half a second against 150 of 266. The layout had
+  nothing left to cache. What did move is output: median 299
+  completion tokens a step against 220, the `recent_summary` and
+  `plan` fields both longer, and the median generation 1.4 s against
+  1.1. The three misses: `trap_rounding` on both seeds and one
+  `add_struct_field`, all in one shape, a `done` on an open plan step
+  answered by a patch that marks the step done and another `done`,
+  walking the plan without a tool call until the non-progress cap
+  parks it. That walk is old (two runs on build 16, one each on 18
+  and 21, three here; one of the seven landed), and it is coached by
+  the rejection note itself, which says "set its status to done in
+  your patch and run `test`" (backlog item 37). Item 36 is reverted
+  (D26): null on its own measure, and the order with the 16 of 16
+  battery behind it is the one to keep.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

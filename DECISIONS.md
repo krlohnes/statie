@@ -596,3 +596,31 @@ holds the resulting design; this file holds why.
   decided here; item 36's measurement (build 22) comes first, and the
   maintainer's time cost joins D17's evidence when it is weighed again.
 
+## D26. A layout change with a null on its own measure is reverted
+
+- **Decision.** Item 36's prompt order (stable sections first, windows
+  oldest first) is reverted to the build-21 order. Layout changes are
+  kept only when the number they were made for moves; a reasoned
+  order with no measured effect has no claim over the order that
+  produced the best battery.
+- **Evidence (build 22 against build 21, gemma short tasks, same
+  seeds).** Mean `peval` 0.453 s against 0.461 s a step, median 0.48 s
+  on both, the share of steps under half a second the same. The cache
+  was already hitting (D25 addendum), so there was nothing for the
+  order to win. Per-step output rose from a median 220 to 299
+  completion tokens and generation from 1.1 s to 1.4 s; landing 13
+  against 16. Under D22 the landing delta is not evidence of an effect
+  at two seeds, and the output delta is one battery; neither is why
+  the change goes. It goes because its measure is null.
+- **Ruled out.** Keeping it on the argument that a stable prefix
+  cannot hurt: it changed what the model writes, and that is the cost
+  centre now (D25 addendum). Chasing the output delta with more seeds
+  before reverting: the change would then be justified by a number it
+  was not made for.
+- **Follow-on.** The three build-22 misses share a shape older than
+  the layout, a `done` on an open plan step answered by marking the
+  step done and sending `done` again, walked to the non-progress cap.
+  Seven such runs across four batteries, one landed. The rejection
+  note invites the walk ("set its status to done in your patch");
+  that is item 37, dispatched next.
+

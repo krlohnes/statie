@@ -342,8 +342,33 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 37. A plan step is marked done by work, not by a `done` that was just refused
+- **Status.** Proposed. Evidence: seven runs across `short_fixer_b16`,
+  `b18`, `b21`, `b22` (two, one, one, three) in which the model
+  answered "plan step N is still open" by marking N done and sending
+  `done` again, three or more times in a row, until the non-progress
+  cap parked the run; one of the seven landed. All three build-22
+  misses are this shape. The note coaches it: "If that step's work is
+  already done, set its status to done in your patch and run `test`".
+- **What.** In `implement`, a `done` refused for an open plan step
+  starts a streak; the streak ends at any tool call. On the second
+  consecutive refusal, plan status changes in that patch are dropped
+  (the rest of the patch is kept) and the note changes: the steps are
+  done by tools, no tool has run since the last refusal, the next
+  action must be a tool call, and it names the one the state calls
+  for (`test` when nothing green has run since the last edit,
+  otherwise `edit_file`/`read_file` on the open step's file). The
+  first refusal's note loses the "set its status to done" clause: it
+  says what is open and that `done` needs a tool call first.
+- **Why.** The walk spends six to twelve steps with no tool, and the
+  non-progress cap is the only thing that ends it. The refusal is
+  telling the model the one move that keeps it refused.
+- **Measure.** Plan-walk runs (three or more consecutive open-step
+  refusals) on the next gemma short battery, expected zero; landing
+  and steps against `short_fixer_b21`.
+
 ### 36. A cacheable prompt: stable sections first, volatile last, windows in arrival order
-- **Status.** Committed (Milestone 42). Measured next by `short_fixer_b22` against `short_fixer_b21`. Evidence: D25 (statie's step is the cold
+- **Status.** Reverted (D26). `short_fixer_b22` against `short_fixer_b21`: mean `peval` 0.453 s against 0.461 s, median 0.48 s on both, a null; per-step completion tokens rose 220 to 299 and landing was 13 against 16. The cache was already hitting (D25 addendum). Evidence at the time: D25 (statie's step is the cold
   evaluation rate; OpenCode reads 97% of its prompt from the cache).
 - **What.** The user block's order becomes Agent State, working set,
   notes, Situational, Augmentation, Harness View, Observation: the

@@ -1,30 +1,36 @@
-# Status, 2026-09-14 evening
+# Status, 2026-09-15 morning
 
 ## Where the code is
-Main is ahead of the last push (`c191e12`) by the items 28 to 32 work,
-the Qwen configs, D23 and D24, and builds 15 to 19. Tree clean apart
-from the item 33 backlog entry. Gate: 16 binaries, 12 to 19 minutes.
+Main is ahead of the last push (`c191e12`) by items 28 to 36, the Qwen
+and OpenCode bench tooling, D23 to D25, and builds 15 to 20. Tree
+clean. Gate: 16 binaries, 12 to 19 minutes.
 
-## What happened since the last status
-- A second model (qwen3-coder, 30B mixture-of-experts) was run as a
-  prompt lint (D23). It exposed five harness defects in a day, each
-  fixed and gated: a copyable example message (28), rejections that
-  did not say where the tool lives or count as repeats (29), a
-  permission question after the plan is written (30), an edit contract
-  that demands verbatim copying (31, line-addressed edits), nameless
-  tool calls the arguments identify (32).
-- Decoding format is a per-model config choice (D24): Qwen under
-  `format: schema` 0 of 16; under `json` 11, 12, 11, 13, 13 of 16
-  across builds 15 to 19. gemma on the same builds 13 to 15 of 16.
-- gemma discovered the `lines` edit form unprompted (nine edits on
-  build 18); Qwen used it once the anchor-miss error offered it.
+## The outside baseline (D25) changed the direction
+OpenCode with the same two models on the same tasks, scored the same
+way: gemma 16 of 16 short tasks at 21 s a run, Qwen 14 of 16 at 15 s;
+statie 13 to 15 and 13 at 100 to 211 s. Long tasks: OpenCode Qwen 10 of
+10 including `refactor_signature` honestly on both seeds; OpenCode
+gemma 8 of 10, its refactor "passes" rejected for editing the
+protected tests. A direct probe on Ollama showed a cached prompt
+evaluating in a tenth of its cold time. OpenCode reads 97% of each
+prompt from the cache; statie rewrites its prompt every step and pays
+the cold rate. The state design saves tokens and spends the cache.
+
+So the next harness work is the prompt's cacheable prefix:
+- Item 35 (committed): every step records Ollama's prompt-evaluation
+  time (`peval`), the only cache signal the host gives.
+- Item 36 (committed): stable sections first, volatile last, windows in
+  arrival order. Measured by `peval` on build 22 against build 21.
 
 ## Running now
-Nothing. The item 33 agent (knob sweep runner, bench scripts only) is
-building; no cargo, bench, or model call is in flight.
+Nothing can run: the Ollama host dropped at 09:17 and is still down.
+A chain waits for it and then runs, in order: build 21 (item 35
+binary, from a side worktree), build 22 (item 36 layout), the statie
+Qwen long tasks. About two hours once the host answers.
 
-## Next
-- Item 33 lands, then the first knob sweep on the Qwen json config:
-  `max_windows` 4 and 8, `budget.working_set` 6000 and 9000, `num_ctx`
-  16384 and 24576, eight short tasks, two seeds. About six batteries.
+## Open threads
 - Push is yours.
+- OpenCode's shell tool is not confined to its working directory; one
+  Qwen run compiled a scratch program in the repository root (removed).
+- `refactor_signature` is a gemma limit, not a task limit; whether
+  statie lands it with Qwen is in the chain above.

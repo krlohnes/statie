@@ -359,7 +359,7 @@ moves the metric it was built for. Ordered within each tier.
   against `qwen_json_short_b19` (13/16).
 
 ### 37. A plan step is marked done by work, not by a `done` that was just refused
-- **Status.** Committed (Milestone 43). Measured next on the gemma short battery (`short_fixer_b23`). Evidence: seven runs across `short_fixer_b16`,
+- **Status.** Committed (Milestone 43). Measured on `short_fixer_b23` (gemma): 16 of 16, zero plan-walk runs against three on build 22; four first refusals, three repeat refusals, each repeat followed by a tool call (`test`, `test`, `read_file`). Median steps 16 against 12.5 on build 21, carried by one `rename_across_files` run of 56 steps. Evidence: seven runs across `short_fixer_b16`,
   `b18`, `b21`, `b22` (two, one, one, three) in which the model
   answered "plan step N is still open" by marking N done and sending
   `done` again, three or more times in a row, until the non-progress

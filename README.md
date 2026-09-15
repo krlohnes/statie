@@ -1712,6 +1712,15 @@ either a default or a config knob:
   D21 question is answered from the other side: the task is not out of
   the model's reach, it is out of this layout's.
 
+  Build 23 (item 37 in: a refused `done` no longer marks plan steps
+  done), gemma: 16 of 16, the second full gemma battery, median 16
+  steps, 113 s a run. Zero plan-walk runs against three on build 22.
+  The open-step refusal fired seven times: four first refusals, three
+  repeats, and each repeat was followed by the tool call it named
+  (`test`, `test`, `read_file`). The step median moved on one run,
+  `rename_across_files` at 56 steps and 17 edits, which is D22 noise
+  at two seeds. `peval` 0.48 s a step, the same as builds 21 and 22.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

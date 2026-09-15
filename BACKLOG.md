@@ -342,6 +342,25 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 40. Tool descriptions state their forms and failure texts up front
+- **Status.** Proposed. Evidence: OpenCode's `default.txt` prompt (what
+  it sends to Ollama models; no Qwen or gemma tuning) and its 231-word
+  edit tool description state the exact-match rule and its failure
+  texts before the first call; statie's `edit_file` description is one
+  sentence and the rule arrives as a rejection after the miss. The
+  whitespace anchor miss is the shape that ends gemma runs (builds 16
+  to 22) and the nameless call the one that ends Qwen runs.
+- **What.** Each core tool's description names its argument forms,
+  states the one or two rules batteries show broken, and quotes the
+  exact text the tool returns when a call is wrong, built from the
+  same constants the errors use (D13). At most 130 words a tool.
+- **Why.** D23: examples must not be answers; failure texts are not
+  answers, they are the contract. A rule the model reads before the
+  call costs the cached prefix; the same rule as a rejection costs a
+  step every time.
+- **Measure.** `tool_err` per run and landing on the gemma and Qwen
+  short batteries against builds 23 and 24.
+
 ### 39. Calls that name no tool are one streak, whatever the name
 - **Status.** Committed (Milestone 45). Measured on `qwen_json_short_b24`: 15 of 16, as build 23; the longest not-a-tool streak was one call, so the class park had nothing to catch; the guard's teeth are the scripted tests until a battery shows the shape again. Evidence: `qwen_json_short_b23/rename_across_files/seed1`,
   107 rejected calls in a row alternating an empty `name` and a file

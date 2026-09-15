@@ -1,5 +1,18 @@
 //! `ModelThinker`: drives an `OllamaModel` backend for the `think`
-//! reasoning subagent call -- thinking on, no output schema.
+//! reasoning subagent call -- the model's configured `think` flag, no
+//! output schema.
+//!
+//! Every reasoning call used to send `think: true` unconditionally,
+//! ignoring `OllamaConfig::think`. Live evidence: every Qwen battery
+//! (`bench-runs/qwen_json_short_b15..b19`) logged 14 to 82 `think`
+//! failures each, all `400 {"error":"\"qwen3-coder:latest\" does not
+//! support thinking"}`, because the Qwen bench configs set `"think":
+//! false` on the model (Ollama rejects the flag for that model) but the
+//! thinker sent `true` anyway. `ModelThinker` now reads `self.model.think()`
+//! on every reasoning call, so a `think: false` model gets `think: false`
+//! on the wire and writes its reasoning as ordinary `content` instead of
+//! the `thinking` field -- see `extract_answer_from_content` and its
+//! callers below, which read whichever field actually carries the trace.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,7 +95,8 @@ pub(crate) fn build_think_prompt(input: &ThinkInput<'_>) -> String {
 }
 
 /// Drives an `OllamaModel` for the `think` reasoning subagent: calls
-/// `chat_free` with `think: true` and no schema, under a timeout, and
+/// `chat_free` with `think: self.model.think()` (the model's own configured
+/// flag, not a hard-coded value) and no schema, under a timeout, and
 /// extracts the conclusion after the last `ANSWER:` marker. With
 /// `.with_chunking(..)`, instead runs the Markovian-Thinker chunked loop
 /// (see `ChunkConfig`) so a long reasoning trace fits inside the model's own
@@ -110,9 +124,13 @@ impl ModelThinker {
 }
 
 /// Extracts the answer from a finished (non-empty-content) reply, folding in
-/// any inline `<thoughts>` block the same way the unchunked path always has.
+/// any inline `<thoughts>` block the same way the unchunked path always has,
+/// or -- when `think` is off -- the reasoning text that precedes the last
+/// `ANSWER:` marker: with `think: false` Ollama has nowhere else to put the
+/// model's reasoning, so it arrives as ordinary `content` ahead of the
+/// marker instead of in the `thinking` field (see the module doc comment).
 /// Returns `(answer, inline_reasoning_chars)`.
-fn extract_answer_from_content(content: &str) -> (String, usize) {
+fn extract_answer_from_content(content: &str, think: bool) -> (String, usize) {
     // Some backends deliver reasoning inline as a leading
     // `<thoughts>...</thoughts>` block instead of (or in addition to)
     // native thinking. Strip it before extracting the answer so the
@@ -122,19 +140,33 @@ fn extract_answer_from_content(content: &str) -> (String, usize) {
     // fall back to the reasoning text itself rather than an empty
     // string.
     let (inline_reasoning, stripped_content) = crate::thoughts::strip_thoughts(content);
-    let inline_reasoning_chars = inline_reasoning
-        .as_ref()
-        .map(|r| r.as_ref().chars().count())
-        .unwrap_or(0);
-    let answer_source: &str = if stripped_content.is_empty() {
-        match &inline_reasoning {
-            Some(r) if !r.as_ref().is_empty() => r.as_ref(),
-            _ => content,
-        }
-    } else {
-        &stripped_content
-    };
-    (extract_answer(answer_source), inline_reasoning_chars)
+    if let Some(inline_reasoning) = &inline_reasoning {
+        let inline_reasoning_chars = inline_reasoning.as_ref().chars().count();
+        let answer_source: &str = if stripped_content.is_empty() {
+            if !inline_reasoning.as_ref().is_empty() {
+                inline_reasoning.as_ref()
+            } else {
+                content
+            }
+        } else {
+            &stripped_content
+        };
+        return (extract_answer(answer_source), inline_reasoning_chars);
+    }
+
+    if !think {
+        // No explicit <thoughts> tags and thinking was off: whatever
+        // precedes the last ANSWER: marker is the reasoning trace, not
+        // part of the answer -- it is exactly the text extract_answer
+        // already discards when it finds the marker.
+        let reasoning_chars = match content.rfind("ANSWER:") {
+            Some(idx) => content[..idx].trim().chars().count(),
+            None => 0,
+        };
+        return (extract_answer(content), reasoning_chars);
+    }
+
+    (extract_answer(content), 0)
 }
 
 #[async_trait]
@@ -150,10 +182,11 @@ impl Thinker for ModelThinker {
             return self.think_chunked(&user, chunk_cfg, cancel).await;
         }
 
+        let think = self.model.think();
         let call = tokio::time::timeout(
             self.timeout,
             self.model
-                .chat_free(THINK_SYSTEM_PROMPT, &user, true, cancel),
+                .chat_free(THINK_SYSTEM_PROMPT, &user, think, cancel),
         )
         .await;
 
@@ -184,7 +217,7 @@ impl Thinker for ModelThinker {
             return Err(ThinkError::Empty);
         }
 
-        let (answer, inline_reasoning_chars) = extract_answer_from_content(content);
+        let (answer, inline_reasoning_chars) = extract_answer_from_content(content, think);
 
         Ok(ThinkOutput {
             answer,
@@ -213,6 +246,7 @@ impl ModelThinker {
         chunk_cfg: ChunkConfig,
         cancel: CancellationToken,
     ) -> Result<ThinkOutput, ThinkError> {
+        let think = self.model.think();
         let mut user = original_user.to_string();
         let mut total_reasoning_chars = 0usize;
 
@@ -223,7 +257,7 @@ impl ModelThinker {
                 self.model.chat_free_with(
                     THINK_SYSTEM_PROMPT,
                     &user,
-                    true,
+                    think,
                     extra_options,
                     cancel.clone(),
                 ),
@@ -237,8 +271,6 @@ impl ModelThinker {
             };
 
             let thinking_chars = reply.thinking.chars().count();
-            total_reasoning_chars += thinking_chars;
-
             tracing::debug!(
                 chunk = chunk_idx,
                 max_chunks = chunk_cfg.max_chunks,
@@ -247,9 +279,22 @@ impl ModelThinker {
                 "chunked thinker: chunk done"
             );
 
+            // With `think: true`, the model finished (and answered) as soon
+            // as `content` carries anything -- the reasoning itself is in
+            // `thinking`, never in `content`. With `think: false`, both the
+            // reasoning and (once the model is done) the `ANSWER:` marker
+            // arrive in `content`, so `content` is non-empty even mid-chunk;
+            // the marker itself is what distinguishes "answered" from "still
+            // reasoning" there.
             let content = reply.content.trim();
-            if !content.is_empty() {
-                let (answer, inline_reasoning_chars) = extract_answer_from_content(content);
+            let answered = if think {
+                !content.is_empty()
+            } else {
+                content.contains("ANSWER:")
+            };
+            if answered {
+                total_reasoning_chars += thinking_chars;
+                let (answer, inline_reasoning_chars) = extract_answer_from_content(content, think);
                 return Ok(ThinkOutput {
                     answer,
                     reasoning_chars: total_reasoning_chars + inline_reasoning_chars,
@@ -259,6 +304,11 @@ impl ModelThinker {
                     forced_answer: false,
                 });
             }
+
+            // Still reasoning, no answer yet this chunk: count this chunk's
+            // trace toward the running total now.
+            let trace_chars = reasoning_trace(&reply, think).chars().count();
+            total_reasoning_chars += trace_chars;
 
             let is_last_chunk = chunk_idx == chunk_cfg.max_chunks;
             if reply.done_reason.as_deref() != Some("length") || is_last_chunk {
@@ -273,6 +323,7 @@ impl ModelThinker {
                         .think_forced_answer(
                             original_user,
                             &reply,
+                            think,
                             chunk_cfg,
                             total_reasoning_chars,
                             cancel,
@@ -282,10 +333,11 @@ impl ModelThinker {
                 break;
             }
 
-            // Carry over: summarize this chunk's thinking (last
+            // Carry over: summarize this chunk's reasoning trace (last
             // `carry_over_chars` of it if longer), thinking off, then start
             // the next chunk from the ORIGINAL prompt plus that summary.
-            let thinking_tail = tail_chars(&reply.thinking, chunk_cfg.carry_over_chars);
+            let thinking_tail =
+                tail_chars(reasoning_trace(&reply, think), chunk_cfg.carry_over_chars);
             let carry_over_prompt = format!("{thinking_tail}\n\n{CARRY_OVER_INSTRUCTION}");
             let carry_over_call = tokio::time::timeout(
                 self.timeout,
@@ -332,13 +384,17 @@ impl ModelThinker {
         &self,
         original_user: &str,
         last_reply: &crate::ollama::FreeReply,
+        think: bool,
         chunk_cfg: ChunkConfig,
         total_reasoning_chars: usize,
         cancel: CancellationToken,
     ) -> Result<ThinkOutput, ThinkError> {
         // Carry over the final chunk's reasoning the same way the loop does
         // for every earlier chunk, so the forced call sees it too.
-        let thinking_tail = tail_chars(&last_reply.thinking, chunk_cfg.carry_over_chars);
+        let thinking_tail = tail_chars(
+            reasoning_trace(last_reply, think),
+            chunk_cfg.carry_over_chars,
+        );
         let carry_over_prompt = format!("{thinking_tail}\n\n{CARRY_OVER_INSTRUCTION}");
         let carry_over_call = tokio::time::timeout(
             self.timeout,
@@ -394,7 +450,7 @@ impl ModelThinker {
             )));
         }
 
-        let (answer, inline_reasoning_chars) = extract_answer_from_content(content);
+        let (answer, inline_reasoning_chars) = extract_answer_from_content(content, false);
         Ok(ThinkOutput {
             answer,
             reasoning_chars: total_reasoning_chars + inline_reasoning_chars,
@@ -403,6 +459,19 @@ impl ModelThinker {
             chunks: chunk_cfg.max_chunks + 1,
             forced_answer: true,
         })
+    }
+}
+
+/// The reasoning trace of a chunk reply: the `thinking` field when the chunk
+/// was called with `think: true`, or `content` when it was called with
+/// `think: false` -- with the flag off, Ollama has nowhere else to put the
+/// model's reasoning, so it arrives as ordinary content instead (see the
+/// module doc comment).
+fn reasoning_trace(reply: &crate::ollama::FreeReply, think: bool) -> &str {
+    if think {
+        &reply.thinking
+    } else {
+        &reply.content
     }
 }
 

@@ -1931,3 +1931,27 @@ over Continue, Continue, tool, Continue), `skills/src/coding/tests.rs`
 after the drop, exact), `skills/tests/it/premature_done.rs` (a scripted
 `done`, `done`-marking-done, `test` run; the streak is 0 after the tool).
 
+## Milestone 44: the thinker sends the model's configured `think` flag (BACKLOG.md item 38)
+
+`OllamaModel::think()` (`models/src/ollama.rs`) exposes the configured
+`OllamaConfig::think`. `ModelThinker` (`models/src/thinker.rs`) passes
+it on every reasoning call, the unchunked call and each chunk of the
+chunked loop, instead of a literal `true`; the carry-over summariser
+and the forced-answer call stay `false` as before. When the flag is
+off the reasoning arrives as ordinary `content`: `reasoning_trace`
+reads the trace from `content` instead of `thinking`, a chunk counts as
+answered when its content carries the `ANSWER:` marker rather than
+when it is non-empty, and `extract_answer_from_content` counts the text
+before the last marker as reasoning.
+
+Why: Ollama refuses the thinking flag for qwen3-coder with a 400, and
+every `think` in every Qwen battery failed on it (14 to 82 a battery)
+while the Qwen configs already said `"think": false`. D24: decoding is
+per-model config; the knob existed and the thinker did not read it.
+
+Tests: `models/tests/it/thinker.rs` (the request body's `think` value
+on the unchunked call, each chunk, the carry-over and the forced
+answer, exact for both settings; the answer and reasoning-character
+count read from `content` with the flag off, unchunked and over two
+chunks), `models/tests/it/ollama_model.rs` (`think()` for both settings).
+

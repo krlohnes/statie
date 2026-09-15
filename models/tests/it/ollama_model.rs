@@ -645,3 +645,21 @@ async fn cancellation_during_retry_delay_returns_promptly() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
 }
+
+/// `OllamaModel::think()` reports `OllamaConfig::think` exactly: `false` for
+/// a Qwen-style config (Ollama's `400 does not support thinking` on any
+/// `think: true` call), `true` for the default. `ModelThinker`
+/// (`statie-models::thinker`) reads this to send the model's own configured
+/// flag on every reasoning call instead of a hard-coded `true`.
+#[tokio::test]
+async fn think_returns_configured_value_for_both_settings() {
+    let mut cfg = cfg_for("127.0.0.1:0".parse().expect("addr"));
+    cfg.think = false;
+    let model = OllamaModel::new(cfg).expect("build model");
+    assert!(!model.think(), "think() should report the configured false");
+
+    let mut cfg = cfg_for("127.0.0.1:0".parse().expect("addr"));
+    cfg.think = true;
+    let model = OllamaModel::new(cfg).expect("build model");
+    assert!(model.think(), "think() should report the configured true");
+}

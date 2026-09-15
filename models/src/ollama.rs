@@ -155,6 +155,17 @@ impl OllamaModel {
         self.cfg.num_ctx
     }
 
+    /// Whether this model is configured to think (`OllamaConfig::think`).
+    /// Used by `ModelThinker` (`statie-models::thinker`) so its reasoning
+    /// calls send the model's own configured flag instead of a hard-coded
+    /// `true`: every Qwen battery sent `think: true` regardless of this
+    /// setting and got 14 to 82 `think` failures each, all `400 does not
+    /// support thinking`, because the Qwen configs set `think: false` on the
+    /// model precisely because Ollama rejects the flag for it.
+    pub fn think(&self) -> bool {
+        self.cfg.think
+    }
+
     fn chat_url(&self) -> String {
         format!("{}/api/chat", self.cfg.base_url.trim_end_matches('/'))
     }

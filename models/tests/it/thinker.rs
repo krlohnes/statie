@@ -31,6 +31,17 @@ fn cfg_for(addr: std::net::SocketAddr) -> OllamaConfig {
     }
 }
 
+/// Same as `cfg_for`, but with `think: false` -- the Qwen bench configs'
+/// shape (`bench-runs/qwen_json_short_b15..b19`): Ollama answers `400
+/// {"error":"\"qwen3-coder:latest\" does not support thinking"}` on any
+/// `think: true` call to this kind of model.
+fn cfg_for_no_think(addr: std::net::SocketAddr) -> OllamaConfig {
+    OllamaConfig {
+        think: false,
+        ..cfg_for(addr)
+    }
+}
+
 #[tokio::test]
 async fn chat_free_sends_think_true_and_no_format_key() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -775,4 +786,219 @@ async fn chunked_thinker_forces_answer_after_exhausting_chunks() {
         user_forced.contains("second summary"),
         "forced request user content must carry the second (final chunk's) carry-over text: {user_forced}"
     );
+}
+
+/// Unit 38: `ModelThinker` must send the model's own configured `think`
+/// flag, not a hard-coded `true`. Live evidence: every Qwen battery
+/// (`bench-runs/qwen_json_short_b15..b19`) logged 14 to 82 `think` failures
+/// each, all `400 {"error":"\"qwen3-coder:latest\" does not support
+/// thinking"}`, because the thinker sent `think: true` regardless of the
+/// Qwen configs' `think: false`. With `think: false` configured, the
+/// unchunked call's request body must carry `"think": false` exactly.
+#[tokio::test]
+async fn unchunked_think_sends_configured_false() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let body = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"content":"reasoning text\nANSWER:\nfix it"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#,
+            ],
+        )
+        .await;
+        body
+    });
+
+    let model = Arc::new(OllamaModel::new(cfg_for_no_think(addr)).expect("build model"));
+    let thinker = ModelThinker::new(model, Duration::from_secs(5));
+
+    let out = thinker
+        .think(
+            ThinkInput {
+                system: "sys",
+                user: "usr",
+                question: "what's wrong?",
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("think succeeds");
+    assert_eq!(out.answer, "fix it");
+
+    let body_text = server.await.expect("server task");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("valid json body");
+    assert_eq!(body["think"], serde_json::json!(false));
+}
+
+/// With `think: true` configured, the unchunked call's request body must
+/// still carry `"think": true` exactly (the existing behaviour, unchanged).
+#[tokio::test]
+async fn unchunked_think_sends_configured_true() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let body = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"thinking":"reasoning trace"},"done":false}"#,
+                r#"{"message":{"content":"ANSWER:\nfix it"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#,
+            ],
+        )
+        .await;
+        body
+    });
+
+    let model = Arc::new(OllamaModel::new(cfg_for(addr)).expect("build model"));
+    let thinker = ModelThinker::new(model, Duration::from_secs(5));
+
+    let out = thinker
+        .think(
+            ThinkInput {
+                system: "sys",
+                user: "usr",
+                question: "what's wrong?",
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("think succeeds");
+    assert_eq!(out.answer, "fix it");
+
+    let body_text = server.await.expect("server task");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("valid json body");
+    assert_eq!(body["think"], serde_json::json!(true));
+}
+
+/// With `think: false` configured, a reply whose reasoning and `ANSWER:
+/// <text>` both arrive in `content` (no `thinking` field at all) must still
+/// yield the exact answer text and the exact reasoning-character count: the
+/// text before the `ANSWER:` marker is the reasoning trace, since with
+/// thinking off the model has nowhere else to put it.
+#[tokio::test]
+async fn unchunked_think_false_reads_reasoning_from_content() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let reasoning = "First I check the tax computation. The rate is applied twice.";
+    let content_line = format!(
+        r#"{{"message":{{"content":"{reasoning}\nANSWER:\nfix tax.rs line 3"}},"done":false}}"#
+    );
+    let done_line = r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#.to_string();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let _ = read_request_body(&mut stream).await;
+        write_ndjson_response(&mut stream, &[&content_line, &done_line]).await;
+    });
+
+    let model = Arc::new(OllamaModel::new(cfg_for_no_think(addr)).expect("build model"));
+    let thinker = ModelThinker::new(model, Duration::from_secs(5));
+
+    let out = thinker
+        .think(
+            ThinkInput {
+                system: "sys",
+                user: "usr",
+                question: "what's wrong?",
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("think succeeds");
+
+    assert_eq!(out.answer, "fix tax.rs line 3");
+    assert_eq!(out.reasoning_chars, reasoning.chars().count());
+}
+
+/// The chunked loop's per-chunk requests must each carry the model's
+/// configured `think` flag exactly. With `think: false`, chunk 1's request
+/// body (still reasoning, no `ANSWER:` yet) must carry `"think": false`.
+#[tokio::test]
+async fn chunked_think_false_sends_configured_flag_on_each_chunk() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server = tokio::spawn(async move {
+        // Chunk 1: still reasoning, no ANSWER: marker yet, in content.
+        let (mut stream, _) = listener.accept().await.expect("accept 1");
+        let body1 = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"content":"chunk one reasoning trace"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"length"}"#,
+            ],
+        )
+        .await;
+
+        // Carry-over: always thinking off regardless of the model's config.
+        let (mut stream, _) = listener.accept().await.expect("accept carry-over");
+        let body_carry = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[r#"{"message":{"content":"SUMMARY_MARKER"},"done":true,"done_reason":"stop"}"#],
+        )
+        .await;
+
+        // Chunk 2: answers, reasoning + ANSWER: both in content.
+        let (mut stream, _) = listener.accept().await.expect("accept 2");
+        let body2 = read_request_body(&mut stream).await;
+        write_ndjson_response(
+            &mut stream,
+            &[
+                r#"{"message":{"content":"chunk two reasoning\nANSWER:\nfix tax.rs line 3"},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#,
+            ],
+        )
+        .await;
+
+        (body1, body_carry, body2)
+    });
+
+    let cfg = cfg_for_no_think(addr);
+    let model = Arc::new(OllamaModel::new(cfg).expect("build model"));
+    let thinker = ModelThinker::new(model, Duration::from_secs(5)).with_chunking(ChunkConfig {
+        chunk_tokens: 6000,
+        max_chunks: 4,
+        carry_over_chars: 1500,
+    });
+
+    let out = thinker
+        .think(
+            ThinkInput {
+                system: "sys",
+                user: "usr",
+                question: "what's wrong?",
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("think succeeds");
+
+    assert_eq!(out.answer, "fix tax.rs line 3");
+    assert_eq!(out.chunks, 2);
+    assert_eq!(
+        out.reasoning_chars,
+        "chunk one reasoning trace".chars().count() + "chunk two reasoning".chars().count()
+    );
+
+    let (body1_text, body_carry_text, body2_text) = server.await.expect("server task");
+
+    let body1: serde_json::Value = serde_json::from_str(&body1_text).expect("valid json");
+    assert_eq!(body1["think"], serde_json::json!(false));
+
+    let body_carry: serde_json::Value = serde_json::from_str(&body_carry_text).expect("valid json");
+    assert_eq!(body_carry["think"], serde_json::json!(false));
+
+    let body2: serde_json::Value = serde_json::from_str(&body2_text).expect("valid json");
+    assert_eq!(body2["think"], serde_json::json!(false));
 }

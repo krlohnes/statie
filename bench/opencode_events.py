@@ -59,10 +59,18 @@ def _numeric_tokens(value):
     if isinstance(value, dict):
         for key, sub in value.items():
             if key == "tokens" and isinstance(sub, dict):
+                # OpenCode reports `input` as the uncached part of the prompt
+                # and `cache.read` as the cached prefix; the prompt the model
+                # saw is their sum. That is what `srv_max` means in the
+                # statie batteries (the peak prompt), so sum them here.
+                cache = sub.get("cache") if isinstance(sub.get("cache"), dict) else {}
+                cached = cache.get("read", 0)
+                if not isinstance(cached, (int, float)) or isinstance(cached, bool):
+                    cached = 0
                 for inner_key in ("input", "input_tokens", "prompt_tokens"):
                     inner = sub.get(inner_key)
                     if isinstance(inner, (int, float)) and not isinstance(inner, bool):
-                        yield inner
+                        yield inner + cached
             elif key in ("input_tokens", "prompt_tokens", "input") and isinstance(
                 sub, (int, float)
             ) and not isinstance(sub, bool):

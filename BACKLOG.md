@@ -342,6 +342,39 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 43. The maintainer runs off the critical path; notes are one step stale
+- **Status.** Proposed, design only. Evidence: D17 addendum (the
+  maintainer's call is 1.3 s of a 3.25 s step and three runs of
+  landing on the gemma short battery); `short_fixer_b23`: 235
+  maintainer calls, 42 of them (18%) after a rejection, a refused
+  step, or a skipped read, where the observation carried nothing new.
+- **What.** The session loop starts the maintainer's call after
+  committing step N and does not await it; step N+1's prompt uses the
+  notes the maintainer produced for step N-1 (already committed); the
+  maintainer's result for step N is awaited and committed before step
+  N+2's prompt is built. The maintainer is not started at all after a
+  step whose committed action was a harness-internal `Continue`, a
+  `tool_rejected`, or a `skipped_redundant` read; the previous notes
+  stand. Cancellation and errors: a maintainer future still running
+  when the session parks or ends is awaited (bounded by its timeout)
+  so no state commit races the store; a maintainer error leaves the
+  previous notes, as today. The log records which step's notes each
+  prompt used.
+- **Why.** The maintainer's 1.3 s is on the critical path only because
+  its notes are read by the very next prompt. One step of staleness
+  costs the model its summary of the latest observation for one step,
+  which it can still see raw in the observation section. If landing
+  holds, the step drops toward 1.9 s, D25's check at 1.5 s comes
+  within reach, and the maintainer's three runs of landing are kept.
+- **Risks.** Two model calls in flight on the host at once (the
+  acting model and the maintainer): on a single GPU they serialize
+  or share, so the wall-clock gain may be less than 1.3 s; measure
+  `secs` a run, not the step decomposition. Notes that describe step
+  N-1 under an observation from step N can mislead; the notes header
+  should say which step they summarise.
+- **Measure.** gemma and Qwen short batteries against builds 23 and
+  24: `secs` a run, landing, steps. Kept only if landing holds on both.
+
 ### 42. A nameless call with `read_file`'s arguments is a `read_file` call
 - **Status.** Committed (Milestone 48). Measured next on the Qwen long battery. Evidence: `qwen_json_long_b24`, 106 tool calls
   with no usable name across ten runs; 72 had an empty `name` with

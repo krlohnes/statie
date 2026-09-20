@@ -1834,6 +1834,18 @@ either a default or a config knob:
   model shortened by a hundred characters each time. One run in five
   batteries, so noted, not an item.
 
+  Build 26, Qwen on the long tasks: 2 of 10 at 126 s a run, and five
+  of the eight misses are not the model's. Those runs ended with
+  "step failed: prompt section System over budget: 14005 to 14986 >
+  14000": item 40's descriptions added about 800 tokens to the system
+  block, the long tasks carry large `plan` and `files` state, and the
+  working set is sized to 6,000 before the other sections are known,
+  so the total overflowed and the step failed instead of evicting a
+  window. Backlog item 44 makes the prompt fit by eviction before it
+  fails. The other three misses: one park on `<not a tool>`, two
+  questions. Item 42's inference never fired: this battery's nameless
+  calls were bare `{path}` or empty, the two shapes it leaves alone.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

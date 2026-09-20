@@ -342,6 +342,26 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 44. The prompt fits by evicting from the working set before it fails
+- **Status.** Proposed. Evidence: `qwen_json_long_b26`, five of ten
+  runs ended in "step failed: prompt section System over budget:
+  14005 to 14986 > 14000" and parked on an error; item 40's longer
+  tool descriptions (about 800 tokens) plus the long tasks' large
+  `plan` and `files` state pushed the fixed sections past what a
+  6,000-token working set leaves under a 14,000 total. No earlier
+  battery hit it.
+- **What.** When the built prompt exceeds the total, the session
+  re-renders the working set with its budget reduced by the overage
+  and a 64-token margin, repeating down to zero windows; then
+  truncates the observation the same way; and fails only when the
+  fixed sections alone exceed the total. Each shrink is logged.
+- **Why.** The working set is the harness's own elastic state; a step
+  that fails on a budget the harness could have met by evicting is
+  the harness failing its one job. The prime directive is to manage
+  limited context, not to abort on it.
+- **Measure.** Zero over-budget step failures on the next Qwen long
+  battery; landing against build 24's 3 of 10 and D27's 6 of 10.
+
 ### 43. The maintainer runs off the critical path; notes are one step stale
 - **Status.** Committed (Milestone 49). Measured next on the gemma and Qwen short batteries (build 27) against builds 26. Evidence: D17 addendum (the
   maintainer's call is 1.3 s of a 3.25 s step and three runs of
@@ -421,7 +441,7 @@ moves the metric it was built for. Ordered within each tier.
   and 24.
 
 ### 40. Tool descriptions state their forms and failure texts up front
-- **Status.** Committed (Milestone 47). Measured on `short_fixer_b26` (gemma, with item 42): 15 of 16 at 76 s a run against 16 of 16 at 113 on build 23; five anchor misses in two runs, each recovered with a `think` and a corrected edit; prompt peak up about 800 tokens. `qwen_json_short_b26`: 15 of 16 as before at 104 s against 112, tool errors 31 against 14 spread across kinds. Landing unchanged on both models; time down on both; kept. Evidence: OpenCode's `default.txt` prompt (what
+- **Status.** Committed (Milestone 47). Measured on `short_fixer_b26` (gemma, with item 42): 15 of 16 at 76 s a run against 16 of 16 at 113 on build 23; five anchor misses in two runs, each recovered with a `think` and a corrected edit; prompt peak up about 800 tokens. `qwen_json_short_b26`: 15 of 16 as before at 104 s against 112, tool errors 31 against 14 spread across kinds. Landing unchanged on both models; time down on both; kept. On the Qwen long tasks the extra 800 tokens tipped five of ten runs into an over-budget step failure (item 44). Evidence: OpenCode's `default.txt` prompt (what
   it sends to Ollama models; no Qwen or gemma tuning) and its 231-word
   edit tool description state the exact-match rule and its failure
   texts before the first call; statie's `edit_file` description is one

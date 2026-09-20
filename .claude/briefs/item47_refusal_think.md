@@ -24,8 +24,7 @@ thinks`, the skip and stall thinks): D19, second strike a question, third a park
 2. In `implement`'s `validate`, after the existing note functions have decided on a harness
    `Continue { note }` (any of the refusals listed above) and when
    `cur.harness.consecutive_continues >= 1` (the previous committed action was already a
-   harness `Continue`) and the skill is configured with a thinker (`think` available the way
-   `implement_repeated_error_thinks` checks it), replace the action with `Action::Tool { name:
+   harness `Continue`), replace the action with `Action::Tool { name:
    "think", args: {"question": REFUSAL_QUESTION formatted} }` instead of the `Continue`, keep
    the patch as the refusal would have, and add a note `{REFUSAL_THINK_NOTE_PREFIX}` + the
    refusal note (a `pub const` prefix: "Second refusal in a row; the harness asked `think`: ").
@@ -35,7 +34,10 @@ thinks`, the skip and stall thinks): D19, second strike a question, third a park
    (`HarnessState.last_think_step` or equivalent) exactly.
 3. The plan skill's empty-plan refusal gets the same treatment in `plan`'s `validate`, with the
    same constants.
-4. No change when there is no thinker configured (the refusal stands as today).
+4. The substitution is thinker-agnostic, exactly like `implement_repeated_error_thinks` and
+   its siblings: `Skill::validate` cannot see session config, and `Session::execute_think`
+   already answers an unconfigured `think` with its own "not configured ... decide from what
+   you have" fallback. Do not gate on `listed`.
 
 ## Acceptance
 - `skills/tests/it/` (the module testing item 37, find by `OPEN_STEP_NOTE_REPEAT`): (a) an
@@ -44,14 +46,17 @@ thinks`, the skip and stall thinks): D19, second strike a question, third a park
   (assert the question string exactly) and the note carries the prefix + the refusal note
   exactly; then a third `done` → the refusal note again, not another `think` (once per
   streak); (b) the same for `done` after a failing test with nothing edited (the
-  no-green Continue fallback) and for two empty `ask_user`s; (c) without a thinker, two
-  refusals in a row produce two refusal notes and no `think`; (d) a tool call between two
+  no-green Continue fallback) and for two empty `ask_user`s; (c) a tool call between two
   refusals resets: the second refusal is a plain note.
 - `skills/src/coding/tests.rs`: unit tests for the formatted question on one refusal text
   (exact).
-- Every existing test asserting the second refusal's note (item 37's repeat tests) is updated
-  only where a thinker is configured in its fixture; where the fixture has no thinker the
-  assertions stay. Report each change.
+- Every existing test asserting the second refusal's note (item 37's repeat tests in
+  `skills/tests/it/premature_done.rs` and `skills/src/coding/tests.rs`) is updated to the new
+  exact truth: the second consecutive refusal is now the `think` substitution with its note;
+  a test that wants the repeat NOTE itself must put a tool call between the refusals or use
+  the third strike. Report each change with old and new assertions. Use the `MockThinker`
+  fixture pattern from `skills/tests/it/error_think.rs` where a scripted thinker answer is
+  needed.
 - Existing green: `cargo test -p statie-skills --test it`, `cargo test -p statie-skills --lib`,
   `cargo test -p statie --bin statie`; `cargo clippy -p statie-skills --all-targets -- -D warnings`.
 

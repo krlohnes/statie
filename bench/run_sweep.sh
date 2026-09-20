@@ -4,6 +4,9 @@
 #   bench/run_sweep.sh <label> <base_config.json> --set <dotted.key>=<v1>,<v2>[,...] \
 #     [--set ...] [--task NAME ...] [--seeds N] [--dry-run]
 #
+# STATIE_BIN=<path> picks the statie binary (default target/debug/statie), so a
+# sweep can run from a copy while the workspace gate rebuilds the default.
+#
 # Derives one config per combination in the cartesian product of every --set
 # (in the order given), refuses (prints a reason, skips) any combination
 # whose budget.working_set > budget.total or budget.total > model.num_ctx,
@@ -174,7 +177,7 @@ PY
     continue
   fi
 
-  cmd=(target/debug/statie bench --config "$derived" --out "bench-runs/$label/$combo_name" --keep --seeds "$seeds" "${tasks[@]}")
+  cmd=("${STATIE_BIN:-target/debug/statie}" bench --config "$derived" --out "bench-runs/$label/$combo_name" --keep --seeds "$seeds" "${tasks[@]}")
 
   if [ "$dry_run" -eq 1 ]; then
     echo "would run: ${cmd[*]} > bench-runs/$label/$combo_name.out 2>&1"

@@ -1903,6 +1903,8 @@ either a default or a config knob:
   builds 27 and 28's changes. The overshoot itself has all but gone
   since the maintainer moved off the critical path (51, then 4, then
   0), which is unexplained. On landing, statie
+  with Qwen is now two runs ahead of OpenCode's 14 of 16 on the short
+  tasks, at under four times its wall clock.
 
   Build 30 (items 43 to 46: the maintainer off the critical path and
   not skipped, eviction, the notes cut): gemma 13 of 16 at 77 s a run,
@@ -1916,8 +1918,7 @@ either a default or a config knob:
   one refusal late. Two items follow: the second refusal in a row
   becomes a `think` (item 47), and the overlap becomes a per-model
   knob, off for gemma and on for Qwen (item 48, D24).
-  with Qwen is now two runs ahead of OpenCode's 14 of 16 on the short
-  tasks, at under four times its wall clock.
+
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

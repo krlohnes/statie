@@ -1846,6 +1846,17 @@ either a default or a config knob:
   questions. Item 42's inference never fired: this battery's nameless
   calls were bare `{path}` or empty, the two shapes it leaves alone.
 
+  Item 33's 8-window rows at 16k (`qwen_sweep_16k_w8`, Qwen short, on
+  the build 26 binary): eight windows at a 6,000-token working set
+  landed 15 of 16 at 88 s a run; eight at 9,000 landed 15 of 16 at
+  154 s; the four-window, 6,000 row is build 26's own battery, 15 of
+  16 at 104 s. Prompt peaks were 11.6k to 11.7k on all three: under a
+  14,000 total the working set cannot grow into the extra budget, so
+  the 9,000 row bought nothing but time. On the short tasks at 16k the
+  window count and the working-set budget do not move landing; the
+  default stays four windows at 6,000 (D22). The two 24k rows are not
+  run: D27 put the long-task work inside 16k.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

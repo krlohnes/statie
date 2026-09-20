@@ -574,9 +574,7 @@ moves the metric it was built for. Ordered within each tier.
   the server defaults to. Recorded from `/api/ps` at run time.
 
 ### 33. A knob sweep runner: the model is a config field, the knobs are the experiment
-- **Status.** Committed (Milestone 40). First sweep running: `qwen_sweep_16k` and `qwen_sweep_24k` (see Measure; the window pairs `num_ctx` with `budget.total`, so it is two base configs rather than a third knob). Agreed with the user: no per-model defaults in
-  code; a recommendation is a config file; the sweep varies the knobs
-  on whatever base config it is given.
+- **Status.** Measured at 16k on Qwen short: 4 windows/6,000 → 14 of 16 (build 19) and 15 of 16 (build 26); 4/9,000 → 15 of 16 (build 19); 8/6,000 → 15 of 16 at 88 s; 8/9,000 → 15 of 16 at 154 s (build 26). Peaks 11.6k to 11.7k on every row. Landing does not move with either knob on the short tasks; the default stays 4/6,000. The 24k rows are not run (D27). The runner and summary are committed (Milestone 40).
 - **What.** `bench/run_sweep.sh <label> <base_config> --set a.b=v1,v2
   [--set ...] [--task ...] [--seeds N] [--dry-run]` derives one config
   per combination (cartesian product) under `bench-runs/<label>/configs/`,

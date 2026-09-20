@@ -378,7 +378,7 @@ moves the metric it was built for. Ordered within each tier.
   Qwen short battery, expected zero; landing and steps against build 26.
 
 ### 44. The prompt fits by evicting from the working set before it fails
-- **Status.** Committed (Milestone 50). Measured next on the Qwen long battery (build 28). Evidence: `qwen_json_long_b26`, five of ten
+- **Status.** Committed (Milestone 50). Measured on `qwen_json_long_b28`: zero over-budget failures, 509 evictions, 6 of 10 against 2 of 10 on build 26; D27's landing check met. Evidence: `qwen_json_long_b26`, five of ten
   runs ended in "step failed: prompt section System over budget:
   14005 to 14986 > 14000" and parked on an error; item 40's longer
   tool descriptions (about 800 tokens) plus the long tasks' large

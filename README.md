@@ -1879,6 +1879,19 @@ either a default or a config knob:
   off-critical-path call gave it a third of its wall clock back. D29:
   the call stays off the critical path; the skip rule goes (item 46).
 
+  Build 28, Qwen on the long tasks (items 43 and 44 in): 6 of 10 at
+  261 s a run, against 2 of 10 on build 26 and 3 of 10 on builds 22
+  and 24. Zero over-budget step failures; the working set was evicted
+  down 509 times across the ten runs, with prompt peaks of 11.9k to
+  14.7k. Landed: `design_fork` both seeds, `python_three_modules`
+  both, `multi_file_feature` once (statie's first, in 82 steps and 12
+  edits), `trap_interest` once. `refactor_signature` missed both, one
+  at nine steps, both parked on `<not a tool>`. This meets D27's
+  landing check: OpenCode with the same model at the same 16k limit
+  landed 6 of 10. It does not meet the time check: 261 s a run against
+  OpenCode's 53, five times slower, with the two long landings at 395 s
+  and 568 s.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

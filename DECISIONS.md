@@ -684,6 +684,13 @@ holds the resulting design; this file holds why.
 - **Check.** statie with Qwen on the long tasks, on a build with items
   38 and 39, against 6 of 10 and 53 s. Landing at or above 6 closes
   the gap on landing; time is D25's check.
+- **Addendum (build 28).** Landing closed: 6 of 10 with items 43 and
+  44 (the maintainer off the critical path; the prompt fitting by
+  eviction), against 2 of 10 on build 26 and 3 of 10 on builds 22 and
+  24. The five runs build 26 lost to the over-budget failure are the
+  difference; the eviction fired 509 times. Time is not closed: 261 s
+  a run against 53. `refactor_signature` is still 0 of 2 for statie
+  with any model.
 
 ## D28. "Patch what changed" is reverted; output is not cut by instruction
 

@@ -145,9 +145,8 @@ struct AppliedTrustedPatch {
     keys: Vec<String>,
 }
 
-/// Unit 43 (D17 addendum: the maintainer's call is 1.3 s of a 3.25 s step;
-/// `short_fixer_b23`: 42 of 235 maintainer calls followed a rejection, a
-/// refused step, or a skipped read): the maintainer call spawned right
+/// Unit 43 (D17 addendum: the maintainer's call is 1.3 s of a 3.25 s step):
+/// the maintainer call spawned right
 /// after the step it was given (`Active::spawn_maintainer`) runs off the
 /// critical path. Held on `Session` between the step that spawned it and
 /// the step that awaits it (`Active::drain_pending_maintainer`) -- never
@@ -2795,44 +2794,16 @@ where
             outcome,
             Outcome::Continue | Outcome::Parked(Park::AskUser(_)) | Outcome::Parked(Park::Yield)
         );
-        // short_fixer_b23: 42 of 235 maintainer calls followed a harness
-        // `Continue`, a `tool_rejected`, or a `skipped_redundant` read --
-        // none of those put anything new in the observation for the
-        // maintainer to distil, so the call is skipped outright rather than
-        // spawned and later found to have nothing to say. The previous
-        // notes stand (nothing is committed for this step), and a
-        // `maintainer_skipped` entry names which of the three shapes fired,
-        // in the same priority order `is_non_progress`/`tool_error_entry`
-        // above already establish (`Continue` first, since it's checked via
-        // `action_for_maintainer` rather than an entry search).
-        let skip_reason = if matches!(action_for_maintainer, Action::Continue { .. }) {
-            Some("continue")
-        } else if entries.iter().any(|e| {
-            e.kind == LogKind::System
-                && e.payload.get("event").and_then(Value::as_str) == Some("tool_rejected")
-        }) {
-            Some("rejected")
-        } else if tool_skipped {
-            Some("skipped_read")
-        } else {
-            None
-        };
-        if run_maintainer && let Some(reason) = skip_reason {
-            entries.push(system_entry(
-                next_harness.step,
-                "maintainer_skipped",
-                serde_json::json!({"reason": reason}),
-            ));
-            // Only the SPAWN is withheld (spec item 2: "the maintainer is
-            // not started" -- nothing about this step's own reasoning is
-            // worth summarising, so there is nothing to spawn). Any task
-            // already in flight from an earlier eligible step is still
-            // drained here, exactly as it would be on a normal eligible
-            // step -- otherwise a skip in between would push that task's
-            // notes more than one step stale, and a run of consecutive
-            // skips could leave it pending indefinitely.
-            self.drain_pending_maintainer(sink).await;
-        } else if run_maintainer {
+        // D29: build 27 showed the skip rule that used to live here (unit
+        // 43's `short_fixer_b23`: withholding the spawn after a harness
+        // `Continue`, a `tool_rejected`, or a `skipped_redundant` read)
+        // starving the notes during gemma's refusal walks -- long runs of
+        // exactly the steps the skip targeted. Unit 46 removes it: every
+        // eligible step (`run_maintainer` true) drains whatever call is
+        // pending and spawns the new one, regardless of the step's action
+        // or entries. The overlap itself (at most one call in flight, the
+        // drain-then-spawn ordering) is unchanged from unit 43.
+        if run_maintainer {
             // Unit 43: this step's own committed state (the snapshot
             // `spawn_maintainer` needs -- `next_harness.step`, `cur.agent`,
             // `commitment`, `active_tools`) MUST be read before the drain

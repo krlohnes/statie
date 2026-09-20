@@ -4355,29 +4355,40 @@ async fn a_third_identical_shell_attempt_still_yields_the_loop_guard_note() {
     assert_eq!(skipped_count, 3, "expected three skipped repeats");
 }
 
-/// Unit 43 spec item 2: a `skipped_redundant` step (7.7/7.8's "do NOT run
-/// the tool" path -- the observation carries nothing new) no longer starts
-/// a maintainer call of its own; it logs `maintainer_skipped` with reason
-/// `"skipped_read"` instead, and the previous notes stand. Any maintainer
-/// call already in flight from an earlier step is still drained on a skip
-/// (unit 43: only the SPAWN is withheld), so the first turn's own call
-/// (spawned after it commits for real) is awaited and committed during the
-/// second (skipped) turn's own `step()` call -- this test was originally
-/// named `the_maintainer_still_runs_after_a_skipped_step` under the old,
-/// synchronous, always-runs-after-every-committed-step behaviour; it now
-/// asserts the opposite for the skip itself.
+/// Unit 46 (D29): a `skipped_redundant` step (7.7/7.8's "do NOT run the
+/// tool" path -- the observation carries nothing new) is no longer treated
+/// specially -- unit 43's skip rule that withheld the spawn for exactly
+/// this shape (logging a now-deleted skip event with reason `"skipped_read"`
+/// instead) is gone, since build 27 showed it starving the notes during
+/// gemma's refusal walks. The maintainer now runs for the skipped step too,
+/// the same as it did before item 43 (hence this test's restored,
+/// pre-item-43 name): the first turn's own call (spawned after it commits
+/// for real) is drained at the start of the skipped turn's own `step()`
+/// call, and the skipped turn spawns its own call in turn. A third,
+/// unrelated turn forces that second call's own drain (the same
+/// one-step-stale pattern `maintainer_called_once_after_committed_tool_
+/// step_with_expected_inputs` in `core/tests/it/maintainer.rs` uses) --
+/// two calls total by then, as before item 43.
 #[tokio::test]
-async fn the_maintainer_is_skipped_but_drains_after_a_skipped_step() {
+async fn the_maintainer_still_runs_after_a_skipped_step() {
     let root = tempfile::tempdir().unwrap();
 
-    let maintainer = Arc::new(statie_core::MockMaintainer::new(vec![Ok(
-        statie_core::MaintainOutput {
+    let maintainer = Arc::new(statie_core::MockMaintainer::new(vec![
+        Ok(statie_core::MaintainOutput {
             notes: "ran the tests once".to_string(),
             next: None,
-        },
-    )]));
+        }),
+        Ok(statie_core::MaintainOutput {
+            notes: "ran the tests once, again".to_string(),
+            next: None,
+        }),
+    ]));
 
-    let turns = vec![coding_shell_call("echo hi"), coding_shell_call("echo hi")];
+    let turns = vec![
+        coding_shell_call("echo hi"),
+        coding_shell_call("echo hi"),
+        coding_shell_call("echo bye"),
+    ];
     let model = Arc::new(MockModel::new(turns));
     let cfg = common::config(&root);
     let (session, log) = common::make_file_tools_session(Arc::clone(&model), cfg);
@@ -4397,22 +4408,19 @@ async fn the_maintainer_is_skipped_but_drains_after_a_skipped_step() {
         "the skipped step still commits, got {outcome2:?}"
     );
 
-    let skipped_entry = log
-        .entries(Some(LogKind::System), 10_000)
-        .into_iter()
-        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_skipped"))
-        .expect("expected a maintainer_skipped system entry for the skipped step");
-    assert_eq!(
-        skipped_entry.payload.get("reason").and_then(Value::as_str),
-        Some("skipped_read"),
-        "reason must be exactly \"skipped_read\": {skipped_entry:?}"
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(
+        matches!(outcome3, Outcome::Continue),
+        "the third, unrelated turn still commits, got {outcome3:?}"
     );
 
     let calls = maintainer.calls();
     assert_eq!(
         calls.len(),
-        1,
-        "the maintainer must not be called for the skipped step itself, only for the \
-         first (real) turn, whose call is drained during the skipped turn's own step()"
+        2,
+        "the maintainer must be called for both the first (real) turn, drained during the \
+         skipped turn's own step(), and for the skipped turn itself, drained during the \
+         third turn's own step() -- as before item 43"
     );
 }

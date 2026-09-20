@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 46. The maintainer is not skipped after a refusal
-- **Status.** Proposed. Evidence: D29; build 27's three gemma losses
+- **Status.** Committed (Milestone 52). Measured next on build 30, gemma and Qwen short. Evidence: D29; build 27's three gemma losses
   are refusal walks in which the maintainer was skipped after every
   refusal (41 `continue` skips), where builds through 26 wrote notes
   after each one and landed those runs.

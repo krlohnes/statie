@@ -2078,9 +2078,10 @@ most one step stale. A step whose committed action was a harness
 `Continue`, or whose entries carry `tool_rejected` or
 `skipped_redundant`, does not spawn a maintainer: a `maintainer_skipped`
 event with `reason` `continue`, `rejected`, or `skipped_read` is logged
-and the previous notes stand. `HarnessState.notes_step` records the
-step whose maintainer produced the current notes, and the prompt's
-notes heading ends ` (as of step {n})`.
+and the previous notes stand. (The skip rule was removed by Milestone
+52, D29.) `HarnessState.notes_step` records the step whose maintainer
+produced the current notes, and the prompt's notes heading ends
+` (as of step {n})`.
 
 Why: D17 addendum. The maintainer's call was 1.3 s of a 3.25 s step,
 on the critical path only because the very next prompt read its
@@ -2143,4 +2144,23 @@ Tests: `core/tests/it/maintainer.rs` (a 430-token result with a
 sentence end at 200 commits exactly that sentence with `from: 430,
 to: 200` and no error; one with no sentence end commits the 400-token
 prefix), unit tests on `cut_notes_to_budget` (exact strings and counts).
+
+## Milestone 52: the maintainer is not skipped (BACKLOG.md item 46)
+
+Milestone 49's skip rule and its `maintainer_skipped` event are gone:
+whenever the step's outcome is one the maintainer ran on through build
+26 (`Continue`, a park on `ask_user` or `yield`), the session drains
+any pending maintainer and spawns the new one, whatever the step's
+action or entries. The off-critical-path call, the drain before every
+terminal return, `notes_step`, and the heading are unchanged.
+
+Why: D29. Build 27 lost three gemma runs, all refusal walks in which
+the maintainer had been skipped after every refusal; through build 26
+it wrote notes after each one and those runs landed. Qwen, which
+rarely refuses, kept 15 of 16 and gained a third of its wall clock
+from the overlap alone.
+
+Tests: `core/tests/it/maintainer.rs` (the maintainer is called after
+a harness `Continue` step), `skills/tests/it/recovery.rs` (it still
+runs after a skipped read).
 

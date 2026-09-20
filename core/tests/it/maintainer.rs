@@ -1795,14 +1795,14 @@ async fn mock_maintainer_script_exhausted_returns_backend_error() {
 }
 
 // ---------------------------------------------------------------------
-// Unit 43 spec item 2: the maintainer is not started after a step whose
-// committed action was `Action::Continue` -- a `maintainer_skipped` entry
-// names the reason instead, and the maintainer records zero calls for that
-// step. `ContinuingMaintainedSkill` mirrors `continue_action.rs`'s own
-// `ContinueSkill` (its `validate` override always converts the model's
-// action to the harness-internal `Action::Continue`), grafted onto
-// `MaintainedSkill`'s `notes`/`commitment` wiring so a maintainer can be
-// attached at all.
+// Unit 46 (D29): the maintainer IS started after a step whose committed
+// action was `Action::Continue` -- unit 43's skip rule that withheld the
+// spawn for exactly this shape is gone, since build 27 showed it starving
+// the notes during gemma's refusal walks. `ContinuingMaintainedSkill`
+// mirrors `continue_action.rs`'s own `ContinueSkill` (its `validate`
+// override always converts the model's action to the harness-internal
+// `Action::Continue`), grafted onto `MaintainedSkill`'s `notes`/
+// `commitment` wiring so a maintainer can be attached at all.
 // ---------------------------------------------------------------------
 
 struct ContinuingMaintainedSkill;
@@ -1818,7 +1818,7 @@ impl Skill for ContinuingMaintainedSkill {
     fn spec(&self) -> Arc<SkillSpec> {
         Arc::new(SkillSpec::new(
             "continuing-maintained",
-            "a skill that always continues, for the maintainer skip-rule tests",
+            "a skill that always continues, for the maintainer continue-step tests",
         ))
     }
 
@@ -1863,12 +1863,16 @@ impl Skill for ContinuingMaintainedSkill {
 }
 
 #[tokio::test]
-async fn maintainer_skipped_and_not_called_after_a_harness_continue_step() {
+async fn maintainer_called_after_a_harness_continue_step() {
     let root = tempfile::tempdir().unwrap();
     let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
 
     // `ContinuingMaintainedSkill::validate` always overrides the action to
-    // `Action::Continue` regardless of what the model sends here.
+    // `Action::Continue` regardless of what the model sends here. Two turns:
+    // unit 43's spawn/drain split means the first turn's spawned maintainer
+    // call is only awaited and committed at the end of the second turn's
+    // own `step()` call (same pattern as `drain_step` elsewhere in this
+    // file) -- so a second Continue turn is needed to observe the call.
     let model = RecordingModel::new(vec![
         serde_json::json!({
             "patch": {"value": 1},
@@ -1876,12 +1880,24 @@ async fn maintainer_skipped_and_not_called_after_a_harness_continue_step() {
             "ack_inbox": []
         })
         .to_string(),
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
-    let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
-        notes: "should never be produced".to_string(),
-        next: None,
-    })]));
+    let maintainer = Arc::new(MockMaintainer::new(vec![
+        Ok(MaintainOutput {
+            notes: "notes from the continue step".to_string(),
+            next: None,
+        }),
+        Ok(MaintainOutput {
+            notes: "notes from the second continue step".to_string(),
+            next: None,
+        }),
+    ]));
 
     let mut session = Session::new(
         Box::new(TestStore::<Workspace>::new()),
@@ -1900,20 +1916,20 @@ async fn maintainer_skipped_and_not_called_after_a_harness_continue_step() {
     let outcome = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
     assert!(matches!(outcome, Outcome::Continue));
 
-    let entries = log.entries(None, 100);
-    let skipped_entry = entries
-        .iter()
-        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_skipped"))
-        .expect("expected a maintainer_skipped system entry");
+    let calls_before = maintainer.calls().len();
     assert_eq!(
-        skipped_entry.payload.get("reason").and_then(Value::as_str),
-        Some("continue"),
-        "reason should name the continue shape: {skipped_entry:?}"
+        calls_before, 0,
+        "no maintainer call has been drained yet after only one step"
     );
+
+    let rec2 = drain_step(&mut active).await;
+    let outcome2 = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+    assert!(matches!(outcome2, Outcome::Continue));
+
     assert_eq!(
         maintainer.calls().len(),
-        0,
-        "the maintainer must not be called for a step whose action was Continue"
+        calls_before + 1,
+        "the maintainer must be called (drained) after a harness Continue step"
     );
 }
 

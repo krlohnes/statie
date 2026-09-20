@@ -1944,22 +1944,20 @@ where
         // from the log every step (C2: derived, never persisted), so it
         // always reflects what's actually in the log, not the working set
         // computed on some earlier step.
-        let working_set = WorkingSet::from_log(
+        // Item 19: `self.session.last_window_steps` (consulted by the
+        // redundant-read guard, 7.8 below, to tell an evicted window from
+        // one still visible to the model) is set once the working set
+        // actually rendered into the prompt is known -- after the item 44
+        // eviction loop below, which may re-render this at a smaller
+        // budget than `cur.harness.budgets.working_set` if the full-budget
+        // rendering didn't fit the prompt.
+        let mut working_set = WorkingSet::from_log(
             self.session.log.as_ref(),
             self.session.tokenizer.as_ref(),
             cur.harness.budgets.working_set,
             &self.session.working_set,
             step_at_start,
         );
-        // Item 19: remember which windows this step's working set actually
-        // rendered, so the redundant-read guard (7.8, below) can tell an
-        // evicted window from one still visible to the model. Consulted,
-        // not rebuilt, by the guard -- rebuilding from the log there would
-        // reflect a step that hasn't happened yet.
-        self.session.last_window_steps = working_set
-            .as_ref()
-            .map(|ws| ws.window_steps().clone())
-            .unwrap_or_default();
 
         let notes = self.skill.notes(&cur.agent).map(Notes::new);
         // Unit 26 (situational rules): localised, per-step guidance derived
@@ -1975,22 +1973,6 @@ where
         // set below) already includes this section's contribution to the
         // total.
         let situational = self.skill.situational(&cur);
-        let mut builder = PromptBuilder::new(
-            self.session.tokenizer.as_ref(),
-            cur.harness.budgets,
-            version,
-        )
-        .system(&system_prompt)
-        .spec(&self.spec)
-        .tools(&tool_list)
-        .agent(&agent_state)
-        .notes(notes.as_ref(), cur.harness.notes_step)
-        .harness(&harness_view)
-        .situational(situational.as_deref())
-        .working_set(working_set.as_ref());
-        if let Some(aug) = &augmentation {
-            builder = builder.augmentation(aug);
-        }
         // Clamp defensively before handing the observation to the builder:
         // `truncate` already bounds fresh tool output, but harness-authored
         // messages (`rejection`, `tool_aborted`, ...) are never truncated at
@@ -1998,16 +1980,123 @@ where
         // stderr, or an unknown-tool name) could otherwise exceed the
         // section budget and fail the step. The builder's per-section check
         // stays strict as the real invariant; this is what keeps it true.
-        let pending_obs = self.session.pending_observation.take().map(|obs| {
+        let mut pending_obs = self.session.pending_observation.take().map(|obs| {
             obs.clamp(
                 cur.harness.budgets.observation,
                 self.session.tokenizer.as_ref(),
             )
         });
-        if let Some(obs) = &pending_obs {
-            builder = builder.observation(obs);
+
+        // Assembles the full prompt from the fixed sections captured above
+        // plus the two elastic ones (`ws`/`obs`), so the eviction loop below
+        // can rebuild with a smaller working set or a truncated observation
+        // without repeating the fixed-section wiring.
+        let assemble = |ws: Option<&WorkingSet>, obs: Option<&Observation>| {
+            let mut builder = PromptBuilder::new(
+                self.session.tokenizer.as_ref(),
+                cur.harness.budgets,
+                version,
+            )
+            .system(&system_prompt)
+            .spec(&self.spec)
+            .tools(&tool_list)
+            .agent(&agent_state)
+            .notes(notes.as_ref(), cur.harness.notes_step)
+            .harness(&harness_view)
+            .situational(situational.as_deref())
+            .working_set(ws);
+            if let Some(aug) = &augmentation {
+                builder = builder.augmentation(aug);
+            }
+            if let Some(obs) = obs {
+                builder = builder.observation(obs);
+            }
+            builder.build()
+        };
+
+        // Item 44: the harness owns the working set (the one elastic
+        // section) and must never fail a step on a budget it can meet by
+        // evicting from it. `build()` failing over budget doesn't
+        // necessarily mean the fixed sections are too big -- it can mean
+        // the working set (sized before the other sections were known) was
+        // rendered larger than the room actually left for it.
+        //
+        // Live evidence: qwen_json_long_b26, five of ten runs ended with
+        // `step failed: prompt section System over budget: 14005..14986 >
+        // 14000` after item 40 added ~800 tokens of tool descriptions to
+        // the system block, and the session parked on an error it could
+        // have met by shrinking the one elastic section. Retry with a
+        // smaller working-set budget (spec item 1), then -- once the
+        // working set is at zero -- a truncated observation (spec item 2),
+        // before giving up and returning the error as a real configuration
+        // failure (spec item 3: the fixed sections alone exceed `total`).
+        let mut ws_budget = cur.harness.budgets.working_set;
+        let mut result = assemble(working_set.as_ref(), pending_obs.as_ref());
+        while let Err(err) = &result {
+            // Only a working set that was actually rendered (spec item 1:
+            // "rendered with a non-zero budget") can be shrunk further --
+            // `None` means the section is disabled (`WorkingSetConfig`
+            // with both counts zero) or the log had nothing to show, and
+            // re-rendering at a smaller budget would still produce `None`.
+            if working_set.is_none() || ws_budget == 0 {
+                break;
+            }
+            let overage = err.tokens - err.limit;
+            let new_budget = ws_budget.saturating_sub(overage + 64);
+            entries.push(system_entry(
+                step_at_start,
+                "working_set_shrunk",
+                serde_json::json!({
+                    "from": ws_budget,
+                    "to": new_budget,
+                    "overage": overage,
+                }),
+            ));
+            ws_budget = new_budget;
+            working_set = WorkingSet::from_log(
+                self.session.log.as_ref(),
+                self.session.tokenizer.as_ref(),
+                ws_budget,
+                &self.session.working_set,
+                step_at_start,
+            );
+            result = assemble(working_set.as_ref(), pending_obs.as_ref());
         }
-        let prompt = builder.build()?;
+        // Working set is at zero (or was never rendered) and the prompt
+        // still overflows: truncate the observation section once (spec
+        // item 2 -- unlike the working set, this is a single shrink, not a
+        // repeat-while-overflowing loop), reusing `Observation::clamp`'s
+        // `truncate_with_report`-style handling rather than duplicating it.
+        if let Err(err) = &result
+            && let Some(obs) = &pending_obs
+        {
+            {
+                let obs_tokens = self.session.tokenizer.count(&obs.render());
+                let overage = err.tokens - err.limit;
+                let new_budget = obs_tokens.saturating_sub(overage + 64);
+                if new_budget < obs_tokens {
+                    entries.push(system_entry(
+                        step_at_start,
+                        "observation_shrunk",
+                        serde_json::json!({
+                            "from": obs_tokens,
+                            "to": new_budget,
+                            "overage": overage,
+                        }),
+                    ));
+                    pending_obs = Some(
+                        obs.clone()
+                            .clamp(new_budget, self.session.tokenizer.as_ref()),
+                    );
+                    result = assemble(working_set.as_ref(), pending_obs.as_ref());
+                }
+            }
+        }
+        self.session.last_window_steps = working_set
+            .as_ref()
+            .map(|ws| ws.window_steps().clone())
+            .unwrap_or_default();
+        let prompt = result?;
         self.session.last_prompt_tokens = Some(prompt.tokens());
         self.session.last_prompt = Some((prompt.system().to_string(), prompt.user().to_string()));
 

@@ -2095,3 +2095,30 @@ returns only after an in-flight maintainer's notes are committed),
 `core/tests/it/prompt.rs` (the heading with a step, exact),
 `skills/tests/it/recovery.rs` (a skipped read skips the maintainer).
 
+## Milestone 50: the prompt fits by eviction before it fails (BACKLOG.md item 44)
+
+In `core/src/session.rs`, prompt assembly is a closure over the fixed
+sections that can be rebuilt with a different working set or
+observation. When `PromptBuilder::build` returns `OverBudget`, the
+session re-renders the working set with its budget cut by the overage
+plus a 64-token margin and rebuilds, repeating while it overflows and
+the budget is above zero, logging `{"event": "working_set_shrunk",
+"from", "to", "overage"}` per shrink. If it still overflows, the
+observation is clamped once by the same rule (`observation_shrunk`).
+Only then does the error propagate, which now means the fixed
+sections alone exceed the total. `last_window_steps` is taken from the
+working set that was actually rendered.
+
+Why: `qwen_json_long_b26`, five of ten runs ended with "step failed:
+prompt section System over budget: 14005 to 14986 > 14000" after item
+40 added about 800 tokens of tool descriptions; the working set was
+sized to 6,000 before the other sections were known and the step
+failed instead of evicting a window.
+
+Tests: `core/tests/it/prompt.rs` (a session whose full working set
+overflows the total builds a prompt at or under the total with exactly
+one `working_set_shrunk` entry carrying the measured overage; fixed
+sections alone over the total still fail with the exact error naming
+the largest section; an overflowing observation with no working set
+is clamped with one `observation_shrunk` entry).
+

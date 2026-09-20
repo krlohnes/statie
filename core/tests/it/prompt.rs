@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -12,7 +13,8 @@ use statie_core::{
     MaintainOutput, Maintainer, MemoryLog, MockMaintainer, Model, ModelError, NullSink, OverBudget,
     Pinned, PromptBuilder, Promptable, RawOutput, SandboxRoot, Schema, Session, SessionConfig,
     SessionLog, SessionLogExt, Skill, SkillSpec, StateStore, StepOutput, StepSink, StoreError,
-    SystemPrompt, ToolSet, Version, WorkingSet, WorkingSetConfig, restrict_action_types,
+    SystemPrompt, Tokenizer, Tool, ToolCtx, ToolError, ToolOutputFull, ToolSet, Version,
+    WorkingSet, WorkingSetConfig, restrict_action_types,
 };
 
 fn budgets() -> Budgets {
@@ -806,5 +808,430 @@ async fn notes_heading_carries_the_maintainer_step_once_committed() {
         "step 2's prompt is built before any maintainer result has been \
          drained, so its notes heading must carry no step suffix:\n{}",
         prompts[1]
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unit 44: the prompt fits by evicting from the working set (or, failing
+// that, truncating the observation) before it fails.
+//
+// Live evidence (item 44 brief): qwen_json_long_b26, five of ten runs ended
+// with "step failed: prompt section System over budget: 14005..14986 >
+// 14000" after item 40 added ~800 tokens of tool descriptions to the
+// system block. The working set is the one elastic section, sized before
+// the other sections are known, so when the fixed sections grow the total
+// can overflow on a budget the harness could still meet by evicting from
+// its own elastic section. These tests drive a real `Session` (fixture
+// copied in spirit from `core/tests/it/evicted_reread.rs`, since core has
+// no test-only shared crate) through scripted `read_file` calls that fill
+// the working set with real windows, with budgets dialed so a later step's
+// prompt exceeds `total` -- via the working set (a), the fixed sections
+// alone (b), or the observation (c) -- and checks how `PromptBuilder::
+// build()` failing over budget is (or isn't) recovered from.
+// ---------------------------------------------------------------------
+
+struct EvictionReadFile {
+    files: HashMap<String, String>,
+}
+
+impl EvictionReadFile {
+    fn new(files: &[(&str, &str)]) -> Self {
+        EvictionReadFile {
+            files: files
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.to_string()))
+                .collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for EvictionReadFile {
+    fn name(&self) -> &str {
+        "read_file"
+    }
+    fn description(&self) -> &str {
+        "reads a whole small file"
+    }
+    fn args_schema(&self) -> Schema {
+        Schema::of::<Value>()
+    }
+    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutputFull, ToolError> {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
+        let body = self.files.get(path).cloned().unwrap_or_default();
+        Ok(ToolOutputFull::new(body))
+    }
+}
+
+fn eviction_tool_set(files: &[(&str, &str)]) -> ToolSet {
+    let mut tools = ToolSet::new();
+    tools.register(Arc::new(EvictionReadFile::new(files)));
+    tools
+}
+
+fn read_action(path: &str) -> Value {
+    serde_json::json!({"type": "tool", "name": "read_file", "args": {"path": path}})
+}
+
+fn eviction_step_output(patch: Value, action: Value) -> String {
+    serde_json::json!({"patch": patch, "action": action, "ack_inbox": []}).to_string()
+}
+
+/// A skill whose spec instructions text is caller-supplied, so a test can
+/// dial the fixed Spec section's token count precisely.
+struct EvictionSkill {
+    instructions: String,
+}
+
+impl Skill for EvictionSkill {
+    type Workspace = Workspace;
+    type Patch = MergePatch;
+
+    fn name(&self) -> &str {
+        "eviction"
+    }
+
+    fn spec(&self) -> Arc<SkillSpec> {
+        Arc::new(SkillSpec::new("eviction", self.instructions.clone()))
+    }
+
+    fn initial_workspace(&self) -> Workspace {
+        Workspace::default()
+    }
+
+    fn tools(&self) -> Vec<String> {
+        vec!["read_file".to_string()]
+    }
+
+    fn is_terminal(&self, s: &Workspace) -> bool {
+        s.done
+    }
+
+    fn commitment(&self, ws: &Workspace) -> Option<Commitment> {
+        ws.next.clone()
+    }
+}
+
+fn eviction_session_config(root: &tempfile::TempDir, budgets: Budgets) -> SessionConfig {
+    SessionConfig {
+        budgets,
+        retries: 3,
+        root: SandboxRoot::new(root.path()).unwrap(),
+    }
+}
+
+fn shrink_entries<'a>(rec: &'a statie_core::StepRecord, event: &str) -> Vec<&'a LogEntry> {
+    rec.entries()
+        .iter()
+        .filter(|e| {
+            e.kind == LogKind::System
+                && e.payload.get("event").and_then(Value::as_str) == Some(event)
+        })
+        .collect()
+}
+
+/// (a) Fixed sections plus a full working set exceed `total`; the eviction
+/// loop shrinks the working set until the prompt fits, logging exactly one
+/// `working_set_shrunk` entry whose numbers are asserted exactly, and the
+/// prompt actually sent to the model is at or under `total`.
+#[tokio::test]
+async fn working_set_shrunk_lets_an_otherwise_over_budget_step_build() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
+    let tok = HeuristicTokenizer;
+
+    // A single large file, read at step 1; a second, tiny file read at
+    // step 2 (its own tool output becomes step 2's prompt observation, not
+    // a window -- the working set excludes the single newest tool output).
+    // Step 3's prompt is the one under test: its pending observation is
+    // step 2's tiny `b.txt` output (well within the small observation
+    // budget below), and its working set is built from the log's
+    // now-not-newest `a.txt` output -- a real ~1000-token window, rendered
+    // just under the working_set budget below so it survives unclamped
+    // there. Only the working set's own size drives step 3 over `total`.
+    let body = "x".repeat(4000); // 1000 tokens at chars/4 (ceil).
+    let files: &[(&str, &str)] = &[("a.txt", &body), ("b.txt", "hi"), ("c.txt", "yo")];
+
+    let model = RecordingModel::new(vec![
+        eviction_step_output(serde_json::json!({}), read_action("a.txt")), // step 1
+        eviction_step_output(serde_json::json!({}), read_action("b.txt")), // step 2
+        eviction_step_output(serde_json::json!({}), read_action("c.txt")), // step 3
+    ]);
+
+    // Fixed sections (System/Spec/Tools/AgentState/HarnessView -- no
+    // Notes/Situational/Augmentation configured) small enough to fit
+    // comfortably under `total` on their own; the observation budget (100
+    // tokens) keeps step 2's a.txt-derived observation small (a.txt is
+    // truncated to fit it) so step 2 never needs any shrink; the working
+    // set (rendered at its full 1050-token budget on step 3, once a.txt's
+    // window is no longer the newest output) is what pushes step 3's
+    // prompt over `total`.
+    let instructions = "small instructions".to_string();
+    let budgets = Budgets {
+        total: 700,
+        observation: 100,
+        augmentation: 500,
+        notes: 400,
+        working_set: 1050,
+    };
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        eviction_tool_set(files),
+        Box::new(HeuristicTokenizer),
+        eviction_session_config(&root, budgets),
+    )
+    .with_working_set(WorkingSetConfig {
+        max_windows: 4,
+        recent_calls: 0,
+    });
+
+    let skill = Arc::new(EvictionSkill { instructions });
+    let mut active = session.activate(skill).await.unwrap();
+
+    // Step 1: read a.txt (large). Its output is step 2's pending
+    // observation, not yet a working-set window.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(shrink_entries(&rec1, "working_set_shrunk").is_empty());
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+
+    // Step 2: read b.txt (tiny). Its own prompt observation is a.txt's
+    // output, clamped on the way in to the 100-token observation budget
+    // (well within `total`), and no working set exists yet -- a.txt is
+    // still the single newest tool output, excluded from windows -- so
+    // this step must build cleanly with no shrink of either kind.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(shrink_entries(&rec2, "working_set_shrunk").is_empty());
+    assert!(shrink_entries(&rec2, "observation_shrunk").is_empty());
+    SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+
+    // Step 3: read c.txt. Its prompt's pending observation is b.txt's tiny
+    // output, and its working set now renders a.txt's ~1000-token window
+    // (b.txt is the newest output, excluded) at up to the full 1050-token
+    // working_set budget -- fixed sections plus that window exceed `total`
+    // (700); the step must still build a prompt rather than failing, with
+    // the working set evicted down to fit.
+    let rec3 = active
+        .step(Event::Tick, &mut NullSink)
+        .await
+        .expect("step must succeed by evicting the working set, not fail OverBudget");
+
+    let entries = shrink_entries(&rec3, "working_set_shrunk");
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one working_set_shrunk entry: {:?}",
+        rec3.entries()
+    );
+    let from = entries[0]
+        .payload
+        .get("from")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let to = entries[0]
+        .payload
+        .get("to")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let overage = entries[0]
+        .payload
+        .get("overage")
+        .and_then(Value::as_u64)
+        .unwrap();
+    assert_eq!(
+        from, 1050,
+        "expected the shrink to start from the configured working_set budget"
+    );
+    assert_eq!(
+        to,
+        from.saturating_sub(overage + 64),
+        "`to` must equal the spec's exact formula: budget.saturating_sub(overage + 64)"
+    );
+    assert!(overage > 0, "expected a nonzero measured overage");
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 3);
+    let final_tokens = tok.count(&prompts[2]);
+    assert!(
+        final_tokens <= budgets.total,
+        "expected the rebuilt prompt to fit within total ({}), got {}",
+        budgets.total,
+        final_tokens
+    );
+}
+
+/// (b) Fixed sections alone (no working set, no observation) exceed
+/// `total`: eviction has nothing to evict, and the step must still fail
+/// with the exact `OverBudget` error text naming the largest section.
+#[tokio::test]
+async fn fixed_sections_alone_over_budget_still_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
+
+    let model = RecordingModel::new(vec![eviction_step_output(
+        serde_json::json!({}),
+        read_action("a.txt"),
+    )]);
+
+    // No working set at all (max_windows/recent_calls both zero) and no
+    // pending observation on step 1 (nothing has run yet): the fixed
+    // sections, inflated by a very long spec instructions string, exceed
+    // `total` on their own.
+    let instructions = "y".repeat(20_000); // 5000 tokens.
+    let budgets = Budgets {
+        total: 100,
+        observation: 2000,
+        augmentation: 500,
+        notes: 400,
+        working_set: 2000,
+    };
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        eviction_tool_set(&[]),
+        Box::new(HeuristicTokenizer),
+        eviction_session_config(&root, budgets),
+    )
+    .with_working_set(WorkingSetConfig {
+        max_windows: 0,
+        recent_calls: 0,
+    });
+
+    let skill = Arc::new(EvictionSkill { instructions });
+    let mut active = session.activate(skill).await.unwrap();
+
+    let result = active.step(Event::Tick, &mut NullSink).await;
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("fixed sections alone over budget must still fail"),
+    };
+
+    match err {
+        statie_core::SessionError::OverBudget(OverBudget {
+            section,
+            tokens,
+            limit,
+        }) => {
+            assert_eq!(
+                section,
+                statie_core::Section::Spec,
+                "expected the Spec section (the largest -- it carries the inflated skill \
+                 instructions text) to be named"
+            );
+            assert_eq!(limit, 100);
+            assert!(tokens > limit);
+        }
+        other => panic!("expected SessionError::OverBudget, got {other:?}"),
+    }
+}
+
+/// (c) The working set is already empty/zero (`max_windows: 0`) and the
+/// observation alone overflows: it is truncated with exactly one
+/// `observation_shrunk` entry, and the resulting prompt fits.
+#[tokio::test]
+async fn observation_shrunk_lets_an_otherwise_over_budget_step_build() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
+    let tok = HeuristicTokenizer;
+
+    // A large file: its read output becomes step 2's pending observation
+    // (clamped to the 2000-token observation budget on the way in), large
+    // enough on its own to blow the small `total` even with no working set
+    // and small fixed sections.
+    let body = "x".repeat(6000); // 1500 tokens at chars/4 (ceil).
+    let files: &[(&str, &str)] = &[("a.txt", &body)];
+
+    let model = RecordingModel::new(vec![
+        eviction_step_output(serde_json::json!({}), read_action("a.txt")), // step 1
+        eviction_step_output(serde_json::json!({}), read_action("a.txt")), // step 2
+    ]);
+
+    let instructions = "small instructions".to_string();
+    let budgets = Budgets {
+        total: 700,
+        observation: 2000,
+        augmentation: 500,
+        notes: 400,
+        working_set: 2000,
+    };
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        eviction_tool_set(files),
+        Box::new(HeuristicTokenizer),
+        eviction_session_config(&root, budgets),
+    )
+    // No working set at all: `max_windows: 0` with `recent_calls: 0`
+    // makes `WorkingSet::from_log` return `None` unconditionally, so the
+    // eviction loop's working-set stage has nothing to shrink and step 2
+    // goes straight to the observation stage.
+    .with_working_set(WorkingSetConfig {
+        max_windows: 0,
+        recent_calls: 0,
+    });
+
+    let skill = Arc::new(EvictionSkill { instructions });
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+
+    let rec2 = active
+        .step(Event::Tick, &mut NullSink)
+        .await
+        .expect("step must succeed by truncating the observation, not fail OverBudget");
+
+    assert!(
+        shrink_entries(&rec2, "working_set_shrunk").is_empty(),
+        "no working set was ever rendered, so no working_set_shrunk entry is expected: {:?}",
+        rec2.entries()
+    );
+    let entries = shrink_entries(&rec2, "observation_shrunk");
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one observation_shrunk entry: {:?}",
+        rec2.entries()
+    );
+    let from = entries[0]
+        .payload
+        .get("from")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let to = entries[0]
+        .payload
+        .get("to")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let overage = entries[0]
+        .payload
+        .get("overage")
+        .and_then(Value::as_u64)
+        .unwrap();
+    assert_eq!(
+        from, 1500,
+        "expected the shrink to start from the observation's clamped (2000-budget) token count"
+    );
+    assert_eq!(
+        to,
+        from.saturating_sub(overage + 64),
+        "`to` must equal the spec's exact formula: budget.saturating_sub(overage + 64)"
+    );
+    assert!(overage > 0, "expected a nonzero measured overage");
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 2);
+    let final_tokens = tok.count(&prompts[1]);
+    assert!(
+        final_tokens <= budgets.total,
+        "expected the rebuilt prompt to fit within total ({}), got {}",
+        budgets.total,
+        final_tokens
     );
 }

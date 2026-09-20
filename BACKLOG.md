@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 44. The prompt fits by evicting from the working set before it fails
-- **Status.** Proposed. Evidence: `qwen_json_long_b26`, five of ten
+- **Status.** Committed (Milestone 50). Measured next on the Qwen long battery (build 28). Evidence: `qwen_json_long_b26`, five of ten
   runs ended in "step failed: prompt section System over budget:
   14005 to 14986 > 14000" and parked on an error; item 40's longer
   tool descriptions (about 800 tokens) plus the long tasks' large

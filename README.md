@@ -1811,6 +1811,17 @@ either a default or a config knob:
   paragraph is taken on both batteries together when work resumes.
   Taken: reverted, D28. Both models wrote less and landed less.
 
+  Build 26, gemma (items 40 and 42 in, item 41 reverted): 15 of 16,
+  median 15 steps, 76 s a run, the fastest gemma battery so far against
+  113 s on build 23 and 84 on build 21. The longer tool descriptions
+  cost about 800 tokens of prompt peak (7.8k against 7.0k) and nothing
+  in `peval`. Anchor misses did not vanish: five across two runs, each
+  followed by a `think` and a corrected edit, and both runs landed.
+  The miss is new and cheap: in `plan`, the model answered "the plan
+  is empty, write it first" with `done` three times and parked at
+  step 4 with no edit; the empty-plan refusal has no repeat rule the
+  way item 37 gave the open-step one.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

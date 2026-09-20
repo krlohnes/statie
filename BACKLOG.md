@@ -342,6 +342,46 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 50. A plan step that only reads a file already in the working set cannot be finished
+- **Status.** Proposed. Evidence: build 32 gemma `trap_rounding` seed
+  2, parked at the mixed-shape cap after six alternations of a
+  redundant `read_file src/tax.rs` (skipped, 7.8) and `done` on the
+  open step "examine `src/tax.rs`" (refused, item 37). The file was
+  already in the working set, so the only tool call the step names is
+  refused, and marking the step done is refused too. Each shape
+  resets the other's streak, so neither the redundant-read `think`
+  nor item 47's refusal `think` fires; only the cap does.
+- **What.** When the open step's own file is in the working set and
+  the model's `done` (or a redundant read of it) arrives, the harness
+  marks that step done instead of refusing: a read-only step whose
+  file is present has nothing left to do. Alternatively the skipped
+  read counts as the step's tool call. Either way the refusal note
+  stops describing an action the harness will not accept.
+- **Why.** The walk is a contradiction the harness set up itself.
+- **Measure.** gemma short: `trap_rounding` both seeds landing;
+  alternating walks at zero.
+
+### 49. Cap the implement-review round trip
+- **Status.** Proposed. Evidence: build 32 gemma `rename_across_files`
+  seed 2, 188 steps, 148 activations: review handed back findings
+  (a duplicated doc-comment line) 75 times; implement handed straight
+  back to review each time with an empty `files` patch and no tool
+  call. Nothing bounds this: implement's `done` is valid once the plan
+  is done and tests are green, implement's spec never mentions
+  `findings`, and review's send-back is the intended path. Builds 23,
+  27 and 30 had runs with one extra round; this one had 75.
+- **What.** Two rules. (1) In implement, `done` with `next_skill:
+  review` while `findings` is non-empty and no edit has been made
+  since activation is refused with the findings quoted: fix them,
+  or `ask_user` why they are wrong. (2) A cap on review-to-implement
+  handoffs per run (three, config knob) after which review must
+  approve or park with the findings as the question. The first stops
+  the loop where it starts; the second is the backstop.
+- **Why.** A run that has landed but loops for 150 steps is a time
+  loss of twenty runs' worth; on a slower task it is the cap.
+- **Measure.** activations per run at most 6 on every battery; the
+  same landing.
+
 ### 48. The maintainer's overlap is a per-model config knob
 - **Status.** Committed (Milestone 53), measured on build 31: gemma short 16 of 16 at 67 s a run with zero parks, against 13 of 16 at 77 s overlapped (build 30) and 15 of 16 at 76 s synchronous (build 26). D30: gemma's config waits for the notes, Qwen's runs ahead of them. Evidence: gemma short landed 16 and 15 on the
   synchronous builds 23 and 26, then 12 and 13 on the overlapped
@@ -360,7 +400,7 @@ moves the metric it was built for. Ordered within each tier.
   to 16 of 16; Qwen short unchanged.
 
 ### 47. The second consecutive refusal becomes a `think`; the walk ends there
-- **Status.** Committed (Milestone 54), thinker-agnostic: the substitution does not gate on a configured thinker (an unconfigured `think` answers "decide from what you have", like every other trigger), and a committed `think` is neutral for the three refusal counters so the third strike still parks. Measured next on build 32, gemma short (overlap off), Qwen short and long. Evidence: runs with three or more consecutive
+- **Status.** Committed (Milestone 54); build 32 short: gemma 15 of 16, Qwen 14 of 16, neither separable from builds 30 and 31 (one gemma run ping-ponged implement and review for 188 steps, item 49; the miss is an alternating walk, item 50); the trigger fired four times, twice followed by a productive call. Second gemma battery pending. Thinker-agnostic: the substitution does not gate on a configured thinker (an unconfigured `think` answers "decide from what you have", like every other trigger), and a committed `think` is neutral for the three refusal counters so the third strike still parks. Measured next on build 32, gemma short (overlap off), Qwen short and long. Evidence: runs with three or more consecutive
   `done`/`ask_user`/`continue` actions: gemma 1, 2, 3, 5, 5 on builds
   23, 25, 26, 27, 30; three of build 30's four gemma misses and one of
   its two Qwen misses are such walks to the non-progress cap, six

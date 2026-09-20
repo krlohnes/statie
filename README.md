@@ -1932,6 +1932,25 @@ either a default or a config knob:
   with the notes' timing too and is still unexplained. Qwen was not
   rerun: nothing in build 31 changes its path.
 
+  Build 32, short tasks (item 47: the second refusal in a row becomes
+  a `think`): gemma 15 of 16, Qwen 14 of 16. Neither number is item
+  47's. gemma's battery took 454 steps against 237 because one
+  `rename_across_files` run bounced between `implement` and `review`
+  75 times (188 steps, landed): review found a duplicated doc comment
+  and handed back with findings, implement handed straight back with
+  no edit, and nothing caps the round trip (item 49; runs with more
+  than one review reached 6 activations on builds 23, 27, 30, never
+  more). gemma's one miss is `trap_rounding`, a walk of alternating
+  shapes, a redundant `read_file` skipped then `done` on the open
+  step "examine `src/tax.rs`" refused, six times to the mixed-shape
+  cap; each shape resets the other's streak so neither second-strike
+  trigger fires (item 50). The refusal think fired four times; the
+  next action was a productive tool call in two. Qwen's two misses
+  are build 30's two, `new_module` seed 1 and `rename_across_files`
+  seed 1, at the same step counts. A second gemma battery on this
+  build follows Qwen long, since 15 and 16 on one battery each do not
+  separate.
+
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

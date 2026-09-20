@@ -284,8 +284,12 @@ fn harness_overflow_marker(
     )
 }
 
-#[allow(dead_code)]
-fn largest_prefix_within(chars: &[char], budget: usize, tok: &dyn Tokenizer) -> usize {
+/// Binary search for the largest char-prefix of `chars` whose token count
+/// (per `tok`) is `<= budget`. `pub(crate)` (rather than private) so
+/// `maintainer::cut_notes_to_budget` can reuse the same token-boundary cut
+/// this module already uses for observation truncation, instead of
+/// re-implementing it.
+pub(crate) fn largest_prefix_within(chars: &[char], budget: usize, tok: &dyn Tokenizer) -> usize {
     let mut lo = 0usize;
     let mut hi = chars.len();
     while lo < hi {

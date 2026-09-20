@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 45. Notes over budget are cut to the budget, not dropped
-- **Status.** Proposed. Evidence: the maintainer's notes come back
+- **Status.** Committed (Milestone 51). Measured next on the Qwen short battery (build 29). Evidence: the maintainer's notes come back
   over their 400-token budget and the whole call is discarded
   (`maintainer_error: notes over budget`, previous notes stand):
   `qwen_json_short_b26` 51 of 310 calls (16%),

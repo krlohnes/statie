@@ -1242,12 +1242,25 @@ async fn maintainer_proposed_next_not_applied_when_worker_already_set_one() {
 }
 
 // ---------------------------------------------------------------------
-// 4. Over-budget notes: `maintainer_error` logged with "over budget",
-//    previous notes kept.
+// 4. Over-budget notes (unit 45): cut to the budget instead of discarded.
+//    Live bench evidence: qwen_json_short_b26 discarded 51 of 310
+//    maintainer calls for notes over budget; qwen_json_long_b24, 170 of
+//    368; most overshoots were 3 to 60 tokens over 400. 4a/4b below pin the
+//    exact cut text for a sentence-end cut and a token-boundary cut;
+//    both use `HeuristicTokenizer` (ceil(chars/4)) and `budget = 400`, so
+//    "notes of exactly budget + 30 tokens" is 1720 chars (430 tokens).
 // ---------------------------------------------------------------------
 
+/// 4a. A sentence end (`.`) inside the budget, past the half-budget mark:
+/// the committed notes are cut there exactly, not at the raw token
+/// boundary. `head` is 800 chars ending in `.` (200 tokens -- exactly half
+/// of the 400-token budget, so it qualifies as "leaves at least half the
+/// budget"); `tail` pads the total to 1720 chars (430 tokens, i.e.
+/// `budget + 30`). The raw token boundary sits at 1600 chars (400 tokens);
+/// the last `.` at or before that boundary is the one ending `head`, so
+/// the expected cut is `head` verbatim.
 #[tokio::test]
-async fn over_budget_notes_logs_maintainer_error_and_keeps_previous_notes() {
+async fn over_budget_notes_are_cut_at_the_last_sentence_end_in_budget() {
     let root = tempfile::tempdir().unwrap();
     let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
 
@@ -1267,9 +1280,13 @@ async fn over_budget_notes_logs_maintainer_error_and_keeps_previous_notes() {
         .to_string(),
     ]);
 
-    // Notes budget of 1 token: any nonempty text overflows it.
+    let head = format!("{}.", "A".repeat(799));
+    assert_eq!(head.len(), 800);
+    let notes = format!("{head}{}", "B".repeat(1720 - head.len()));
+    assert_eq!(notes.len(), 1720);
+
     let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
-        notes: "x".repeat(2000),
+        notes: notes.clone(),
         next: None,
     })]));
 
@@ -1279,7 +1296,7 @@ async fn over_budget_notes_logs_maintainer_error_and_keeps_previous_notes() {
         model as Arc<dyn Model>,
         ToolSet::new(),
         Box::new(statie_core::HeuristicTokenizer),
-        session_config(&root, 1),
+        session_config(&root, 400),
     )
     .with_maintainer(Arc::clone(&maintainer) as Arc<dyn statie_core::Maintainer>);
 
@@ -1294,27 +1311,129 @@ async fn over_budget_notes_logs_maintainer_error_and_keeps_previous_notes() {
     let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
-    assert_eq!(state.agent.notes, "", "previous (empty) notes must be kept");
+    assert_eq!(
+        state.agent.notes, head,
+        "notes must be cut exactly at the sentence end, not the raw token boundary"
+    );
 
     let entries = log.entries(None, 100);
-    let err_entry = entries
+    let cut_entry = entries
         .iter()
-        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_error"))
-        .expect("expected a maintainer_error system entry");
-    let reason = err_entry
-        .payload
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    assert!(
-        reason.contains("over budget"),
-        "reason should mention over budget: {reason}"
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_notes_cut"))
+        .expect("expected a maintainer_notes_cut system entry");
+    assert_eq!(
+        cut_entry.payload.get("from").and_then(Value::as_u64),
+        Some(430)
     );
+    assert_eq!(
+        cut_entry.payload.get("to").and_then(Value::as_u64),
+        Some(200)
+    );
+
     assert!(
         !entries
             .iter()
-            .any(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer")),
-        "no successful maintainer entry should be logged"
+            .any(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_error")),
+        "a cut must not log maintainer_error"
+    );
+    let maintainer_event = entries
+        .iter()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer"))
+        .expect("a cut result must be logged as the maintainer event, same as an in-budget result");
+    assert_eq!(
+        maintainer_event
+            .payload
+            .get("notes_tokens")
+            .and_then(Value::as_u64),
+        Some(200),
+        "the maintainer event's notes_tokens must be the post-cut count"
+    );
+    assert_eq!(
+        maintainer_event
+            .payload
+            .get("next_set")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+/// 4b. No sentence end anywhere in the notes: the cut falls back to the
+/// plain token boundary the tokenizer gives (`largest_prefix_within`),
+/// which is 1600 chars (400 tokens) for a 1720-char, all-`C` input.
+#[tokio::test]
+async fn over_budget_notes_with_no_sentence_end_are_cut_at_the_token_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let model = RecordingModel::new(vec![
+        serde_json::json!({
+            "patch": {"value": 1},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+    ]);
+
+    let notes = "C".repeat(1720);
+    let expected_cut = "C".repeat(1600);
+
+    let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
+        notes: notes.clone(),
+        next: None,
+    })]));
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 400),
+    )
+    .with_maintainer(Arc::clone(&maintainer) as Arc<dyn statie_core::Maintainer>);
+
+    let skill = Arc::new(MaintainedSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+    assert!(matches!(outcome, Outcome::Continue));
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.agent.notes, expected_cut,
+        "with no sentence end, the cut must fall back to the raw token boundary"
+    );
+
+    let entries = log.entries(None, 100);
+    let cut_entry = entries
+        .iter()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_notes_cut"))
+        .expect("expected a maintainer_notes_cut system entry");
+    assert_eq!(
+        cut_entry.payload.get("from").and_then(Value::as_u64),
+        Some(430)
+    );
+    assert_eq!(
+        cut_entry.payload.get("to").and_then(Value::as_u64),
+        Some(400)
+    );
+
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_error")),
+        "a cut must not log maintainer_error"
     );
 }
 

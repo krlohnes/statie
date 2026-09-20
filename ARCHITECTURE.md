@@ -2122,3 +2122,25 @@ sections alone over the total still fail with the exact error naming
 the largest section; an overflowing observation with no working set
 is clamped with one `observation_shrunk` entry).
 
+## Milestone 51: notes over budget are cut, not dropped (BACKLOG.md item 45)
+
+`cut_notes_to_budget` (`core/src/maintainer.rs`, exported) cuts notes
+that exceed the notes budget to the last sentence end (`.`, `!`, `?`,
+newline) inside the budget that keeps at least half of it, else to the
+tokenizer's boundary (`largest_prefix_within`, shared with the
+observation clamp). `drain_pending_maintainer` (`core/src/session.rs`)
+applies it in place of the discard: a `maintainer_notes_cut` entry
+with `from` and `to` token counts is logged and the cut notes are
+committed through the same path as an in-budget result, `next`
+included. No `maintainer_error` and no `maintainer_failed` for a cut.
+
+Why: Qwen's maintainer overshot 400 tokens on 16% of its calls on
+`qwen_json_short_b26` and 46% on `qwen_json_long_b24`, mostly by 3 to
+60 tokens, and each overshoot threw the call away (1.4 s of the step)
+and left the notes one more step stale.
+
+Tests: `core/tests/it/maintainer.rs` (a 430-token result with a
+sentence end at 200 commits exactly that sentence with `from: 430,
+to: 200` and no error; one with no sentence end commits the 400-token
+prefix), unit tests on `cut_notes_to_budget` (exact strings and counts).
+

@@ -5556,17 +5556,28 @@ where
         };
         let mut out = out;
 
-        let notes_tokens = self.session.tokenizer.count(&out.notes);
-        if notes_tokens > budget {
-            let reason = format!("notes over budget: {notes_tokens} > {budget}");
+        // Unit 45: live bench evidence -- qwen_json_short_b26: 51 of 310
+        // maintainer calls discarded for notes over budget; qwen_json_long_b24:
+        // 170 of 368; most overshoots 3 to 60 tokens over 400. Discarding the
+        // whole result over a few tokens threw away a good-enough summary
+        // (and any `next` it carried) along with it, so cut instead of
+        // dropping: `cut_notes_to_budget` returns the text unchanged when
+        // it already fits, so `notes_tokens` below is always the
+        // post-cut (in-budget) count.
+        let notes_tokens_before = self.session.tokenizer.count(&out.notes);
+        let (cut_notes, notes_tokens) = crate::maintainer::cut_notes_to_budget(
+            &out.notes,
+            budget,
+            self.session.tokenizer.as_ref(),
+        );
+        if notes_tokens_before > budget {
             let _ = self.session.log.append(system_entry(
                 step,
-                "maintainer_error",
-                serde_json::json!({"reason": reason}),
+                "maintainer_notes_cut",
+                serde_json::json!({"from": notes_tokens_before, "to": notes_tokens}),
             ));
-            sink.maintainer_failed(&reason);
-            return;
         }
+        out.notes = cut_notes;
 
         let (cur, _version) = match self.session.state().await {
             Ok(s) => s,

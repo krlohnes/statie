@@ -88,7 +88,7 @@ pub use log::{
 pub use loop_types::{Event, Executable, Outcome, Park};
 pub use maintainer::{
     MaintainCall, MaintainError, MaintainInput, MaintainOutput, Maintainer, MaintainerReply,
-    MockMaintainer, build_maintainer_prompt, maintainer_output_schema,
+    MockMaintainer, build_maintainer_prompt, cut_notes_to_budget, maintainer_output_schema,
 };
 pub use model::{
     Action, Capabilities, Model, NullSink, RawOutput, Schema, StepOutput, StepSink, Usage,

@@ -246,6 +246,61 @@ pub fn maintainer_output_schema() -> Schema {
     Schema::of::<MaintainerReply>()
 }
 
+/// Cuts `notes` to at most `budget` tokens (unit 45: live bench evidence --
+/// qwen_json_short_b26: 51 of 310 maintainer calls discarded for notes over
+/// budget; qwen_json_long_b24: 170 of 368; most overshoots 3 to 60 tokens
+/// over 400 -- discarding the whole result for a few tokens over budget
+/// threw away a good-enough summary along with any `next` it carried).
+/// Returns `notes` unchanged (with its token count) when it already fits.
+///
+/// Otherwise: find the token boundary the tokenizer gives (the largest
+/// prefix of `notes` that counts `<= budget` tokens, via the same
+/// `largest_prefix_within` binary search `Observation::truncate` uses for
+/// oversized tool output), then look for the last sentence end (`.`, `!`,
+/// `?`, or `\n`) at or before that boundary. That sentence end is used
+/// instead when it leaves at least half the budget (i.e. the text up to
+/// and including it counts at least `budget / 2` tokens); otherwise the
+/// plain token boundary is used. Appends nothing -- the caller logs a
+/// `maintainer_notes_cut` entry with the before/after token counts and
+/// continues with the cut text exactly as an in-budget result.
+pub fn cut_notes_to_budget(
+    notes: &str,
+    budget: usize,
+    tokenizer: &dyn Tokenizer,
+) -> (String, usize) {
+    let total_tokens = tokenizer.count(notes);
+    if total_tokens <= budget {
+        return (notes.to_string(), total_tokens);
+    }
+
+    let chars: Vec<char> = notes.chars().collect();
+    let boundary_len = crate::promptable::largest_prefix_within(&chars, budget, tokenizer);
+
+    // Look for the last sentence-end char at or before `boundary_len`
+    // (0-based char index just past it, i.e. chars[..boundary_len]).
+    let half_budget = budget / 2;
+    let sentence_end = chars[..boundary_len]
+        .iter()
+        .rposition(|c| matches!(c, '.' | '!' | '?' | '\n'));
+
+    let cut_len = match sentence_end {
+        Some(idx) => {
+            let candidate_len = idx + 1;
+            let candidate: String = chars[..candidate_len].iter().collect();
+            if tokenizer.count(&candidate) >= half_budget {
+                candidate_len
+            } else {
+                boundary_len
+            }
+        }
+        None => boundary_len,
+    };
+
+    let cut: String = chars[..cut_len].iter().collect();
+    let cut_tokens = tokenizer.count(&cut);
+    (cut, cut_tokens)
+}
+
 /// Truncates `text` to at most `budget_tokens` tokens via head+tail
 /// truncation, replacing the cut middle with a `[... N chars omitted
 /// ...]` marker, where `N` is the number of *characters* removed. Returns
@@ -694,5 +749,56 @@ mod tests {
 
         let no_notes = serde_json::json!({"next": null});
         assert!(!validator.is_valid(&no_notes), "{no_notes}");
+    }
+
+    // -------------------------------------------------------------------
+    // `cut_notes_to_budget` (unit 45): three exact inputs, one per branch.
+    // `HeuristicTokenizer` counts `ceil(chars / 4)`.
+    // -------------------------------------------------------------------
+
+    /// Within budget: returned unchanged, token count is the input's own.
+    #[test]
+    fn cut_notes_to_budget_within_budget_is_unchanged() {
+        let tok = HeuristicTokenizer;
+        let notes = "short notes, well within budget.";
+        let (cut, tokens) = cut_notes_to_budget(notes, 400, &tok);
+        assert_eq!(cut, notes);
+        assert_eq!(tokens, 8);
+    }
+
+    /// Over budget with a sentence end past the half-budget mark: cut
+    /// there exactly, not at the raw token boundary. `head` is 800 chars
+    /// ending in `.` (200 tokens, exactly half of the 400-token budget);
+    /// `tail` pads the total to 1720 chars (430 tokens). The raw token
+    /// boundary is 1600 chars (400 tokens); the last `.` at or before it
+    /// is the one ending `head`.
+    #[test]
+    fn cut_notes_to_budget_prefers_the_last_sentence_end_in_budget() {
+        let tok = HeuristicTokenizer;
+        let head = format!("{}.", "A".repeat(799));
+        assert_eq!(head.len(), 800);
+        let notes = format!("{head}{}", "B".repeat(1720 - head.len()));
+        assert_eq!(notes.len(), 1720);
+
+        let (cut, tokens) = cut_notes_to_budget(&notes, 400, &tok);
+        assert_eq!(cut, head);
+        assert_eq!(tokens, 200);
+    }
+
+    /// Over budget with a sentence end that falls before the half-budget
+    /// mark: the candidate cut at that sentence end (3 tokens) would leave
+    /// less than half the 20-token budget (10 tokens), so the cut falls
+    /// back to the raw token boundary (80 chars, 20 tokens) instead.
+    #[test]
+    fn cut_notes_to_budget_falls_back_to_token_boundary_when_sentence_end_too_early() {
+        let tok = HeuristicTokenizer;
+        let notes = format!("{}.{}", "X".repeat(9), "Y".repeat(110));
+        assert_eq!(notes.len(), 120);
+        assert_eq!(tok.count(&notes), 30);
+
+        let (cut, tokens) = cut_notes_to_budget(&notes, 20, &tok);
+        let expected: String = notes.chars().take(80).collect();
+        assert_eq!(cut, expected);
+        assert_eq!(tokens, 20);
     }
 }

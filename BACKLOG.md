@@ -342,6 +342,40 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 48. The maintainer's overlap is a per-model config knob
+- **Status.** Proposed. Evidence: gemma short landed 16 and 15 on the
+  synchronous builds 23 and 26, then 12 and 13 on the overlapped
+  builds 27 and 30; Qwen landed 15, 16, 14 on the overlapped builds at
+  a third less wall clock. gemma's losses are refusal walks in which
+  guidance one step late lets the walk reach the cap (five walk runs
+  on each of builds 27 and 30 against one on build 23).
+- **What.** `maintainer.overlap` (default true) in the config; false
+  drains the maintainer right after spawning it, the synchronous
+  behaviour through the same code path. The gemma bench configs set it
+  false; the Qwen configs keep it true.
+- **Why.** D24: the knob is the configurable bit; recommended defaults
+  are config files. The overlap is worth a third of Qwen's time and
+  costs gemma two to four runs; one code default cannot serve both.
+- **Measure.** gemma short on build 31 with overlap off, expected 15
+  to 16 of 16; Qwen short unchanged.
+
+### 47. The second consecutive refusal becomes a `think`; the walk ends there
+- **Status.** Proposed. Evidence: runs with three or more consecutive
+  `done`/`ask_user`/`continue` actions: gemma 1, 2, 3, 5, 5 on builds
+  23, 25, 26, 27, 30; three of build 30's four gemma misses and one of
+  its two Qwen misses are such walks to the non-progress cap, six
+  refused steps each. Item 37's repeat note did not stop them.
+- **What.** When a refusal would be the second harness `Continue` in
+  a row (`consecutive_continues >= 1`) and a thinker is configured,
+  `implement` and `plan` substitute a `think` whose question quotes the
+  refusal and asks for the one tool call that moves the step, once
+  per streak; the third strike reaches the existing cap. D19.
+- **Why.** The harness already turns repeated errors, skips and
+  stalls into a question on the second strike; refusals were the one
+  loop it only kept describing. A walk costs six steps and the run.
+- **Measure.** Walk runs on the next gemma and Qwen short batteries,
+  expected at most one; landing.
+
 ### 46. The maintainer is not skipped after a refusal
 - **Status.** Committed (Milestone 52). Measured next on build 30, gemma and Qwen short. Evidence: D29; build 27's three gemma losses
   are refusal walks in which the maintainer was skipped after every

@@ -1892,6 +1892,17 @@ either a default or a config knob:
   OpenCode's 53, five times slower, with the two long landings at 395 s
   and 568 s.
 
+  Build 29, Qwen json (item 45 in: notes over budget cut, not
+  dropped; with items 43 and 44): 16 of 16, the first full Qwen
+  battery, median 15 steps, 55 s a run against 66 on build 27, 104 on
+  build 26 and 138 on build 23. No maintainer call was discarded
+  (0 cuts, 0 drops, against 51 drops on build 26 and 4 on build 27).
+  Five Qwen short batteries before this one landed 15 of 16; the
+  run that landed here and not before is `rename_across_files`, the
+  task whose notes carry the most across files. On landing, statie
+  with Qwen is now two runs ahead of OpenCode's 14 of 16 on the short
+  tasks, at under four times its wall clock.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

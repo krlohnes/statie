@@ -358,7 +358,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Build 30, gemma and Qwen short, against builds 26 and 27.
 
 ### 45. Notes over budget are cut to the budget, not dropped
-- **Status.** Committed (Milestone 51). Measured next on the Qwen short battery (build 29). Evidence: the maintainer's notes come back
+- **Status.** Committed (Milestone 51). Measured on `qwen_json_short_b29`: 16 of 16, the first full Qwen battery, 55 s a run against 66; 0 cuts, zero drops. Evidence: the maintainer's notes come back
   over their 400-token budget and the whole call is discarded
   (`maintainer_error: notes over budget`, previous notes stand):
   `qwen_json_short_b26` 51 of 310 calls (16%),

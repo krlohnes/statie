@@ -1920,6 +1920,18 @@ either a default or a config knob:
   becomes a `think` (item 47), and the overlap becomes a per-model
   knob, off for gemma and on for Qwen (item 48, D24).
 
+  Build 31, gemma (item 48: `maintainer.overlap` false in gemma's
+  config, the Qwen configs unchanged): 16 of 16 at 67 s a run, zero
+  parks, 237 steps in the battery against 263 on build 30 and 280 on
+  build 26. The first gemma battery with no refusal walk since build
+  23, and faster than the synchronous build 26 (76 s) that the knob
+  reproduces: items 44 to 46 landed in between. D30 makes the
+  per-model split the default: gemma waits for its notes, Qwen runs
+  ahead of them. The maintainer overshot its budget 11 times (8 in
+  one `trap_rounding` run) after 0 on build 30, so that count moves
+  with the notes' timing too and is still unexplained. Qwen was not
+  rerun: nothing in build 31 changes its path.
+
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

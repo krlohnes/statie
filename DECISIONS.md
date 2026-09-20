@@ -752,3 +752,29 @@ holds the resulting design; this file holds why.
   with a step gap under build 26's 3.85 s; Qwen short at 15 of 16 with
   its build-27 time.
 
+## D30. The maintainer's overlap is set per model: off for gemma, on for Qwen
+- **Decision.** `maintainer.overlap` (item 48) is a config knob with
+  the code default `true`. The gemma bench config sets it false; the
+  Qwen configs keep the overlap. The recommended settings ship as
+  config files, not as model-name branches in code (D24).
+- **Evidence.** gemma short: 16 and 15 of 16 synchronous (builds 23,
+  26), 12 and 13 overlapped (27, 30), 16 of 16 with the knob off
+  (31) at 67 s a run, the fastest gemma battery and the first since
+  build 23 with no refusal walk. Qwen short: 15 of 16 at 66 s
+  overlapped against 104 synchronous (build 27 against 26), 16 of 16
+  on builds 29 and 30. gemma loses runs to refusal walks in which the
+  maintainer's guidance lands one refusal late; Qwen rarely refuses
+  and takes a third of its wall clock from the overlap.
+- **Why a knob and not a rule.** The two models want opposite
+  settings for the same mechanism, and the difference is a property
+  of how each model behaves under refusal, not of the task. That is
+  a per-model setting by D24. A heuristic (overlap until the first
+  refusal, say) would be a second mechanism to measure; the knob
+  reproduces both measured behaviours through one path.
+- **Ruled out.** Overlap on for gemma with item 47's `think` as the
+  cure for walks: item 47 is still worth having for the walks that
+  survive with the notes on time, but it is not measured yet, and the
+  knob's result stands on its own.
+- **Check.** Item 47 on build 32, gemma with the knob off: at or above
+  16 of 16 with no time lost; Qwen short and long unchanged or better.
+

@@ -1,10 +1,10 @@
-# Status, 2026-09-20, evening
+# Status, 2026-09-20, morning (resumed)
 
 ## Where the code is
-Main is ahead of the last push (`c191e12`) by items 28 to 35 and 37 to
-44, the Qwen and OpenCode bench tooling, D23 to D28, and builds 15 to
-26. Items 36 and 41 were committed and reverted (D26, D28). Tree
-clean. Gate: 16 binaries, 12 to 19 minutes.
+Main is ahead of the last push (`c191e12`) by items 28 to 35, 37 to
+40, and 42 to 46 and 48, the Qwen and OpenCode bench tooling, D23 to
+D30, and builds 15 to 31. Items 36 and 41 were committed and reverted
+(D26, D28). Tree clean. Gate: 16 binaries, 12 to 19 minutes.
 
 ## Committed since the pause
 - Item 41 reverted (D28): both models wrote less and landed less.
@@ -19,22 +19,27 @@ clean. Gate: 16 binaries, 12 to 19 minutes.
 - Item 45 (Milestone 51): notes over budget are cut, not dropped.
   Build 29, Qwen short: 16 of 16 at 55 s, the first full Qwen
   battery; the cut never fired, so the sixteenth run is not its doing.
-- Item 46 (Milestone 52): the skip rule removed. Build 30 measures it
-  on both models.
+- Item 46 (Milestone 52): the skip rule removed. Build 30: gemma 13 of
+  16, Qwen 14 of 16; gemma's losses are refusal walks with the notes
+  one step late.
+- Item 48 (Milestone 53): `maintainer.overlap` is a per-model knob.
+  Build 31, gemma with it off: 16 of 16 at 67 s a run, zero parks.
+  D30: off for gemma, on for Qwen.
 - Item 33's 8-window rows at 16k: landing unmoved; default stays
   4 windows at 6,000; 24k rows not run.
 
 ## Where statie stands against OpenCode
-- Short tasks, 16k: gemma 15 to 16 of 16 (OpenCode 16); Qwen 16 of 16
-  (OpenCode 14). Time: gemma 66 to 76 s a run against 21; Qwen 55 s
+- Short tasks, 16k: gemma 16 of 16 (OpenCode 16); Qwen 16 of 16
+  (OpenCode 14). Time: gemma 67 s a run against 21; Qwen 55 to 62 s
   against 15.
 - Long tasks, Qwen, 16k: 6 of 10 (OpenCode 6 of 10 at a 16k limit,
   10 of 10 at 32k). Time: 261 s against 53. `refactor_signature` is
   unlanded by statie with any model.
 
 ## Running now
-Build 30: gemma and Qwen short on items 43 to 46 (the maintainer off
-the critical path, not skipped; eviction; the notes cut).
+Item 47 (the second refusal in a row becomes a `think`) is with an
+agent; build 32 measures it on gemma short, Qwen short and Qwen long.
+The host is idle.
 
 ## Open threads
 - Push is yours.

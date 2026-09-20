@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 48. The maintainer's overlap is a per-model config knob
-- **Status.** Committed (Milestone 53); `arm_harness_max.json` sets it false, the Qwen configs leave it true. Measured next on build 31, gemma short. Evidence: gemma short landed 16 and 15 on the
+- **Status.** Committed (Milestone 53), measured on build 31: gemma short 16 of 16 at 67 s a run with zero parks, against 13 of 16 at 77 s overlapped (build 30) and 15 of 16 at 76 s synchronous (build 26). D30: gemma's config waits for the notes, Qwen's runs ahead of them. Evidence: gemma short landed 16 and 15 on the
   synchronous builds 23 and 26, then 12 and 13 on the overlapped
   builds 27 and 30; Qwen landed 15, 16, 14 on the overlapped builds at
   a third less wall clock. gemma's losses are refusal walks in which

@@ -17,9 +17,9 @@ use statie_core::MockMaintainer;
 use statie_core::{
     Action, ApplyFn, Budgets, Capabilities, Commitment, CommittedState, Event, HarnessState,
     LogKind, LoggedPatch, MaintainError, MaintainOutput, Maintainer, Model, ModelError, NullSink,
-    Outcome, Park, PatchError, PatchStrategy, RawOutput, SandboxRoot, Schema, Session,
-    SessionConfig, SessionLog, SessionLogExt, Skill, SkillSpec, StateStore, StepSink, StoreError,
-    ToolSet, Version,
+    Outcome, Park, ParsedOutput, PatchError, PatchStrategy, RawOutput, SandboxRoot, Schema,
+    Session, SessionConfig, SessionLog, SessionLogExt, Skill, SkillSpec, StateStore, StepSink,
+    StoreError, ToolSet, ValidatedStep, Version, validate_default,
 };
 
 // ---------------------------------------------------------------------
@@ -353,6 +353,22 @@ fn bump_tool_call() -> Value {
     serde_json::json!({"type": "tool", "name": "bump", "args": {}})
 }
 
+/// Unit 43: the maintainer call spawned for a step is only awaited and
+/// committed at the END of the FOLLOWING step's own `step()` call (spec
+/// item 1 -- "at most one maintainer call in flight; every prompt sees
+/// notes at most one step stale"). Every test in this file that asserts on
+/// a maintainer call's committed effects (the `maintainer`/`maintainer_error`
+/// log entries, the committed `notes`/`next`, `StepSink::maintainer_done`/
+/// `maintainer_failed`) therefore needs a second, otherwise-uninteresting
+/// step to force that drain -- this helper runs one (a plain `bump` turn,
+/// scripted on `model` as the NEXT turn) and returns its `StepRecord`.
+async fn drain_step<K>(active: &mut statie_core::Active<'_, K>) -> statie_core::StepRecord
+where
+    K: statie_core::Skill<Workspace = Workspace> + ?Sized,
+{
+    active.step(Event::Tick, &mut NullSink).await.unwrap()
+}
+
 fn commitment_json(tool: &str, path: Option<&str>, what: &str) -> Value {
     serde_json::json!({"tool": tool, "path": path, "what": what})
 }
@@ -368,15 +384,30 @@ async fn maintainer_called_once_after_committed_tool_step_with_expected_inputs()
     let root = tempfile::tempdir().unwrap();
     let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
 
-    let model = ReasoningModel::new(vec![(
-        "decided to bump the counter because X".to_string(),
-        serde_json::json!({
-            "patch": {"value": 1},
-            "action": bump_tool_call(),
-            "ack_inbox": []
-        })
-        .to_string(),
-    )]);
+    let model = ReasoningModel::new(vec![
+        (
+            "decided to bump the counter because X".to_string(),
+            serde_json::json!({
+                "patch": {"value": 1},
+                "action": bump_tool_call(),
+                "ack_inbox": []
+            })
+            .to_string(),
+        ),
+        // Unit 43: the maintainer call step 1 spawns is only awaited and
+        // committed at the end of THIS (step 2's) `step()` call -- a plain
+        // second bump turn, whose own effects this test doesn't otherwise
+        // care about, forces that drain.
+        (
+            String::new(),
+            serde_json::json!({
+                "patch": {"value": 2},
+                "action": bump_tool_call(),
+                "ack_inbox": []
+            })
+            .to_string(),
+        ),
+    ]);
 
     let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
         notes: "bumped value to 1".to_string(),
@@ -399,6 +430,9 @@ async fn maintainer_called_once_after_committed_tool_step_with_expected_inputs()
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
     assert!(matches!(outcome, Outcome::Continue));
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
 
     let calls = maintainer.calls();
     assert_eq!(calls.len(), 1, "expected exactly one maintainer call");
@@ -447,15 +481,27 @@ async fn maintainer_entry_records_reasoning_chars_when_reasoning_given() {
     let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
 
     let reasoning_text = "decided to bump the counter because X";
-    let model = ReasoningModel::new(vec![(
-        reasoning_text.to_string(),
-        serde_json::json!({
-            "patch": {"value": 1},
-            "action": bump_tool_call(),
-            "ack_inbox": []
-        })
-        .to_string(),
-    )]);
+    let model = ReasoningModel::new(vec![
+        (
+            reasoning_text.to_string(),
+            serde_json::json!({
+                "patch": {"value": 1},
+                "action": bump_tool_call(),
+                "ack_inbox": []
+            })
+            .to_string(),
+        ),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        (
+            String::new(),
+            serde_json::json!({
+                "patch": {"value": 2},
+                "action": bump_tool_call(),
+                "ack_inbox": []
+            })
+            .to_string(),
+        ),
+    ]);
 
     let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
         notes: "bumped value to 1".to_string(),
@@ -478,9 +524,14 @@ async fn maintainer_entry_records_reasoning_chars_when_reasoning_given() {
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
 
+    let rec2 = drain_step(&mut active).await;
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+
+    // The spawned call only actually runs once `drain_step` above has
+    // awaited it, so `calls()` is only meaningful from this point on (unit
+    // 43: `spawn_maintainer` never awaits the task it starts).
     let calls = maintainer.calls();
-    let call = &calls[0];
-    let expected_observation_chars = call.observation.len();
+    let expected_observation_chars = calls[0].observation.len();
 
     let entries = log.entries(None, 100);
     let maintainer_event = entries
@@ -517,6 +568,13 @@ async fn maintainer_entry_records_zero_reasoning_chars_when_reasoning_absent() {
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
@@ -540,6 +598,12 @@ async fn maintainer_entry_records_zero_reasoning_chars_when_reasoning_absent() {
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
 
+    let rec2 = drain_step(&mut active).await;
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+
+    // The spawned call only actually runs once `drain_step` above has
+    // awaited it, so `calls()` is only meaningful from this point on (unit
+    // 43: `spawn_maintainer` never awaits the task it starts).
     let calls = maintainer.calls();
     assert_eq!(calls[0].reasoning, None, "this model gives no reasoning");
 
@@ -559,8 +623,11 @@ async fn maintainer_entry_records_zero_reasoning_chars_when_reasoning_absent() {
 }
 
 // ---------------------------------------------------------------------
-// 2. The maintainer's notes appear in the next prompt under the "notes
-//    (kept by the harness ...)" header.
+// 2. The maintainer's notes appear in the notes header, one step stale
+//    (unit 43, spec item 1): the maintainer spawned right after step 1
+//    commits is only awaited and committed at the end of step 2's own
+//    `step()` call, so step 2's own prompt (already built before that
+//    point) never carries it -- only step 3's does.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -571,6 +638,12 @@ async fn maintainer_notes_appear_in_next_prompt_under_notes_header() {
     let model = RecordingModel::new(vec![
         serde_json::json!({
             "patch": {"value": 1},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+        serde_json::json!({
+            "patch": {"value": 2},
             "action": bump_tool_call(),
             "ack_inbox": []
         })
@@ -604,21 +677,35 @@ async fn maintainer_notes_appear_in_next_prompt_under_notes_header() {
     let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec1).unwrap();
 
-    // Second step: the prompt the model now receives should carry the
-    // maintainer's notes from the previous step.
+    // Step 2: its own prompt (already recorded by the time this call
+    // returns) is built BEFORE this call's end-of-step drain runs, so it
+    // must carry no notes header at all yet.
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec2).unwrap();
 
+    // Step 3: its prompt is built after step 2's own `step()` call drained
+    // and committed step 1's maintainer result -- this is the first prompt
+    // that can carry the notes header.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec3).unwrap();
+
     let prompts = model.prompts();
-    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts.len(), 3);
     let second_prompt = &prompts[1];
     assert!(
-        second_prompt.contains("notes (kept by the harness from your previous reasoning)"),
-        "expected a notes header in the second prompt:\n{second_prompt}"
+        !second_prompt.contains("notes (kept by the harness from your previous reasoning)"),
+        "step 2's prompt is built before any maintainer result has been \
+         drained, so it must carry no notes header at all:\n{second_prompt}"
+    );
+    let third_prompt = &prompts[2];
+    assert!(
+        third_prompt
+            .contains("notes (kept by the harness from your previous reasoning) (as of step 1)"),
+        "expected a notes header naming step 1 in the third prompt:\n{third_prompt}"
     );
     assert!(
-        second_prompt.contains("kept: the edit target was line 42"),
-        "expected the maintainer's notes text in the second prompt:\n{second_prompt}"
+        third_prompt.contains("kept: the edit target was line 42"),
+        "expected the maintainer's notes text in the third prompt:\n{third_prompt}"
     );
 }
 
@@ -635,6 +722,13 @@ async fn maintainer_proposed_next_applied_when_workspace_commitment_is_null() {
     let model = RecordingModel::new(vec![
         serde_json::json!({
             "patch": {"value": 1},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
             "action": bump_tool_call(),
             "ack_inbox": []
         })
@@ -666,6 +760,9 @@ async fn maintainer_proposed_next_applied_when_workspace_commitment_is_null() {
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec).unwrap();
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = log.append_record(rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(state.agent.next, Some(proposed));
@@ -702,6 +799,13 @@ async fn maintainer_proposed_next_with_inactive_tool_is_dropped_but_notes_land()
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     // `shell` is not in `MaintainedSkill::tools()` (only `bump`, `edit_file`,
@@ -731,6 +835,9 @@ async fn maintainer_proposed_next_with_inactive_tool_is_dropped_but_notes_land()
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec).unwrap();
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = log.append_record(rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
@@ -796,6 +903,13 @@ async fn maintainer_proposed_next_non_mutating_tool_is_dropped_but_notes_land() 
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     // `bump` *is* an active tool for `MaintainedSkill` (unlike `read_file`
@@ -829,6 +943,9 @@ async fn maintainer_proposed_next_non_mutating_tool_is_dropped_but_notes_land() 
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec).unwrap();
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = log.append_record(rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
@@ -881,6 +998,13 @@ async fn maintainer_proposed_next_empty_what_is_dropped_but_notes_land() {
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     let proposed = Commitment {
@@ -908,6 +1032,9 @@ async fn maintainer_proposed_next_empty_what_is_dropped_but_notes_land() {
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec).unwrap();
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = log.append_record(rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
@@ -960,6 +1087,13 @@ async fn maintainer_proposed_next_missing_path_is_dropped_but_notes_land() {
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     let proposed = Commitment {
@@ -987,6 +1121,9 @@ async fn maintainer_proposed_next_missing_path_is_dropped_but_notes_land() {
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec).unwrap();
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = log.append_record(rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
@@ -1040,6 +1177,13 @@ async fn maintainer_proposed_next_not_applied_when_worker_already_set_one() {
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     let maintainer_proposed = Commitment {
@@ -1067,6 +1211,9 @@ async fn maintainer_proposed_next_not_applied_when_worker_already_set_one() {
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec).unwrap();
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = log.append_record(rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(
@@ -1111,6 +1258,13 @@ async fn over_budget_notes_logs_maintainer_error_and_keeps_previous_notes() {
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     // Notes budget of 1 token: any nonempty text overflows it.
@@ -1135,6 +1289,9 @@ async fn over_budget_notes_logs_maintainer_error_and_keeps_previous_notes() {
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
     assert!(matches!(outcome, Outcome::Continue));
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(state.agent.notes, "", "previous (empty) notes must be kept");
@@ -1178,6 +1335,13 @@ async fn maintainer_backend_error_logs_error_and_does_not_change_step_outcome() 
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     let maintainer = Arc::new(MockMaintainer::new(vec![Err(MaintainError::Backend(
@@ -1203,6 +1367,9 @@ async fn maintainer_backend_error_logs_error_and_does_not_change_step_outcome() 
         matches!(outcome, Outcome::Continue),
         "a maintainer failure must never change the step outcome"
     );
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
 
     let (state, _version) = active.session().state().await.unwrap();
     assert_eq!(state.agent.notes, "");
@@ -1326,6 +1493,15 @@ async fn maintainer_called_after_ask_user_park() {
             "ack_inbox": []
         })
         .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call -- the
+        // session stays parked, so this second turn is delivered via a
+        // `User` event the same way a real driver would resume it.
+        serde_json::json!({
+            "patch": {"value": 2},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
     ]);
 
     let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
@@ -1350,6 +1526,12 @@ async fn maintainer_called_after_ask_user_park() {
     let outcome = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
     assert!(matches!(outcome, Outcome::Parked(Park::AskUser(_))));
 
+    let rec2 = active
+        .step(Event::User("here".to_string()), &mut NullSink)
+        .await
+        .unwrap();
+    let _ = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+
     assert_eq!(
         maintainer.calls().len(),
         1,
@@ -1369,6 +1551,13 @@ async fn maintainer_patch_log_entry_has_source_maintainer() {
     let model = RecordingModel::new(vec![
         serde_json::json!({
             "patch": {"value": 1},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+        // Unit 43: forces the drain of step 1's maintainer call.
+        serde_json::json!({
+            "patch": {"value": 2},
             "action": bump_tool_call(),
             "ack_inbox": []
         })
@@ -1395,6 +1584,9 @@ async fn maintainer_patch_log_entry_has_source_maintainer() {
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let _ = log.append_record(rec).unwrap();
+
+    let rec2 = drain_step(&mut active).await;
+    let _ = log.append_record(rec2).unwrap();
 
     let entries = log.entries(Some(LogKind::Patch), 100);
     let maintainer_patch = entries
@@ -1481,4 +1673,439 @@ async fn mock_maintainer_script_exhausted_returns_backend_error() {
         .await
         .expect_err("an exhausted script should return an error");
     assert!(matches!(err, MaintainError::Backend(ref m) if m == "script exhausted"));
+}
+
+// ---------------------------------------------------------------------
+// Unit 43 spec item 2: the maintainer is not started after a step whose
+// committed action was `Action::Continue` -- a `maintainer_skipped` entry
+// names the reason instead, and the maintainer records zero calls for that
+// step. `ContinuingMaintainedSkill` mirrors `continue_action.rs`'s own
+// `ContinueSkill` (its `validate` override always converts the model's
+// action to the harness-internal `Action::Continue`), grafted onto
+// `MaintainedSkill`'s `notes`/`commitment` wiring so a maintainer can be
+// attached at all.
+// ---------------------------------------------------------------------
+
+struct ContinuingMaintainedSkill;
+
+impl Skill for ContinuingMaintainedSkill {
+    type Workspace = Workspace;
+    type Patch = MergePatch;
+
+    fn name(&self) -> &str {
+        "continuing-maintained"
+    }
+
+    fn spec(&self) -> Arc<SkillSpec> {
+        Arc::new(SkillSpec::new(
+            "continuing-maintained",
+            "a skill that always continues, for the maintainer skip-rule tests",
+        ))
+    }
+
+    fn initial_workspace(&self) -> Workspace {
+        Workspace::default()
+    }
+
+    fn tools(&self) -> Vec<String> {
+        vec!["bump".to_string()]
+    }
+
+    fn is_terminal(&self, s: &Workspace) -> bool {
+        s.done
+    }
+
+    fn harness_owned_fields(&self) -> Vec<String> {
+        vec!["notes".to_string()]
+    }
+
+    fn notes(&self, ws: &Workspace) -> Option<String> {
+        if ws.notes.is_empty() {
+            None
+        } else {
+            Some(ws.notes.clone())
+        }
+    }
+
+    fn commitment(&self, ws: &Workspace) -> Option<Commitment> {
+        ws.next.clone()
+    }
+
+    fn validate(
+        &self,
+        cur: &CommittedState<Workspace>,
+        mut out: ParsedOutput<Workspace>,
+    ) -> Result<ValidatedStep<Workspace>, PatchError> {
+        out.set_action(Action::Continue {
+            note: "nothing new: keep going".to_string(),
+        });
+        validate_default::<Workspace, MergePatch>(self, cur, out)
+    }
+}
+
+#[tokio::test]
+async fn maintainer_skipped_and_not_called_after_a_harness_continue_step() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    // `ContinuingMaintainedSkill::validate` always overrides the action to
+    // `Action::Continue` regardless of what the model sends here.
+    let model = RecordingModel::new(vec![
+        serde_json::json!({
+            "patch": {"value": 1},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+    ]);
+
+    let maintainer = Arc::new(MockMaintainer::new(vec![Ok(MaintainOutput {
+        notes: "should never be produced".to_string(),
+        next: None,
+    })]));
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 400),
+    )
+    .with_maintainer(Arc::clone(&maintainer) as Arc<dyn statie_core::Maintainer>);
+
+    let skill = Arc::new(ContinuingMaintainedSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome = statie_core::SessionLogExt::append_record(log.as_ref(), rec).unwrap();
+    assert!(matches!(outcome, Outcome::Continue));
+
+    let entries = log.entries(None, 100);
+    let skipped_entry = entries
+        .iter()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_skipped"))
+        .expect("expected a maintainer_skipped system entry");
+    assert_eq!(
+        skipped_entry.payload.get("reason").and_then(Value::as_str),
+        Some("continue"),
+        "reason should name the continue shape: {skipped_entry:?}"
+    );
+    assert_eq!(
+        maintainer.calls().len(),
+        0,
+        "the maintainer must not be called for a step whose action was Continue"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unit 43 acceptance: a five-step scripted session with a maintainer that
+// records the step it was called for and returns distinct notes per call.
+// Asserts, per step, exactly which notes text the prompt carried and the
+// exact `notes_step` in the committed harness state, and that the session
+// log's `maintainer` events appear in step order with the same payload
+// shape as today.
+// ---------------------------------------------------------------------
+
+/// A scripted `Maintainer` that returns `"notes from step {n}"`, where `n`
+/// is the 1-based call count (NOT the harness step -- unit 43's whole point
+/// is that these two numbers are read from different places: the maintainer
+/// itself is never told which harness step it's summarising, only
+/// `Active::spawn_maintainer`/`drain_pending_maintainer` track that).
+struct SequentialMaintainer {
+    calls: Mutex<u64>,
+}
+
+impl SequentialMaintainer {
+    fn new() -> Arc<SequentialMaintainer> {
+        Arc::new(SequentialMaintainer {
+            calls: Mutex::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl Maintainer for SequentialMaintainer {
+    async fn maintain(
+        &self,
+        _input: statie_core::MaintainInput<'_>,
+    ) -> Result<MaintainOutput, MaintainError> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        Ok(MaintainOutput {
+            notes: format!("notes from step {calls}"),
+            next: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn five_step_session_notes_are_at_most_one_step_stale() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let turns: Vec<String> = (1..=5)
+        .map(|v| {
+            serde_json::json!({
+                "patch": {"value": v},
+                "action": bump_tool_call(),
+                "ack_inbox": []
+            })
+            .to_string()
+        })
+        .collect();
+    let model = RecordingModel::new(turns);
+
+    let maintainer = SequentialMaintainer::new();
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 400),
+    )
+    .with_maintainer(Arc::clone(&maintainer) as Arc<dyn Maintainer>);
+
+    let skill = Arc::new(MaintainedSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let mut notes_steps: Vec<Option<u64>> = Vec::new();
+    for _ in 0..5 {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        let _ = log.append_record(rec).unwrap();
+        let (state, _version) = active.session().state().await.unwrap();
+        notes_steps.push(state.harness.notes_step);
+    }
+
+    // `notes_step` is the harness step whose maintainer call was drained --
+    // NOT a simple 1-per-turn counter, since a drained maintainer's own
+    // notes patch (`apply_trusted_patch`) itself advances `HarnessState.
+    // step`, so the raw step counter runs ahead of the worker's own turn
+    // count once a maintainer is configured: turn N's own worker commit
+    // lands at harness step 1, 2, 4, 6, 8 for N = 1..5 (turn 1 costs one
+    // step; every later turn costs two, once its predecessor's drain starts
+    // adding its own commit into the mix). `notes_step` names the PREVIOUS
+    // turn's own (already-advanced) harness step once drained.
+    assert_eq!(notes_steps[0], None, "step 1: no notes committed yet");
+    assert_eq!(
+        notes_steps[1],
+        Some(1),
+        "step 2: its own step() call drains and commits step 1's maintainer result (harness step 1) at its end"
+    );
+    assert_eq!(
+        notes_steps[2],
+        Some(2),
+        "step 3: its own step() call drains the maintainer spawned for harness step 2"
+    );
+    assert_eq!(
+        notes_steps[3],
+        Some(4),
+        "step 4: its own step() call drains the maintainer spawned for harness step 4"
+    );
+    assert_eq!(
+        notes_steps[4],
+        Some(6),
+        "step 5: its own step() call drains the maintainer spawned for harness step 6"
+    );
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 5);
+    // Step 1 and step 2's prompts carry no notes header at all (no notes
+    // have been committed yet when either is built).
+    assert!(
+        !prompts[0].contains("notes (kept by the harness from your previous reasoning)"),
+        "step 1's prompt must carry no notes header:\n{}",
+        prompts[0]
+    );
+    assert!(
+        !prompts[1].contains("notes (kept by the harness from your previous reasoning)"),
+        "step 2's prompt must carry no notes header:\n{}",
+        prompts[1]
+    );
+    // Step 3's prompt carries step 1's notes (the first call, so "notes
+    // from step 1" -- `SequentialMaintainer`'s own call counter, not the
+    // harness step).
+    assert!(
+        prompts[2]
+            .contains("notes (kept by the harness from your previous reasoning) (as of step 1)"),
+        "step 3's prompt must carry the ` (as of step 1)` heading:\n{}",
+        prompts[2]
+    );
+    assert!(
+        prompts[2].contains("notes from step 1"),
+        "step 3's prompt must carry the first maintainer call's notes text:\n{}",
+        prompts[2]
+    );
+    // Step 4's prompt carries step 2's notes (the second call).
+    assert!(
+        prompts[3]
+            .contains("notes (kept by the harness from your previous reasoning) (as of step 2)"),
+        "step 4's prompt must carry the ` (as of step 2)` heading:\n{}",
+        prompts[3]
+    );
+    assert!(
+        prompts[3].contains("notes from step 2"),
+        "step 4's prompt must carry the second maintainer call's notes text:\n{}",
+        prompts[3]
+    );
+    // Step 5's prompt carries the third maintainer call's notes, committed
+    // as of harness step 4 (`notes_steps[3]` above).
+    assert!(
+        prompts[4]
+            .contains("notes (kept by the harness from your previous reasoning) (as of step 4)"),
+        "step 5's prompt must carry the ` (as of step 4)` heading:\n{}",
+        prompts[4]
+    );
+    assert!(
+        prompts[4].contains("notes from step 3"),
+        "step 5's prompt must carry the third maintainer call's notes text:\n{}",
+        prompts[4]
+    );
+
+    // The session log's `maintainer` events appear in step order with the
+    // same payload shape as today (`notes_tokens`/`next_set`/
+    // `reasoning_chars`/`observation_chars`).
+    let entries = log.entries(None, 100);
+    let maintainer_events: Vec<&statie_core::LogEntry> = entries
+        .iter()
+        .filter(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer"))
+        .collect();
+    assert_eq!(
+        maintainer_events.len(),
+        4,
+        "four maintainer calls (spawned for turns 1-4) were drained across \
+         turns 2-5's own step() calls; turn 5's own spawned call is never \
+         drained within this five-step run (there is no turn 6 to drain it)"
+    );
+    for event in &maintainer_events {
+        let payload = &event.payload;
+        assert!(
+            payload
+                .get("notes_tokens")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert!(payload.get("next_set").and_then(Value::as_bool).is_some());
+        assert!(
+            payload
+                .get("reasoning_chars")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            payload
+                .get("observation_chars")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+    }
+    // Step order: the events' own `step` field (the harness step the drain
+    // committed at) is strictly increasing.
+    let steps: Vec<u64> = maintainer_events.iter().map(|e| e.step).collect();
+    assert!(
+        steps.windows(2).all(|w| w[0] < w[1]),
+        "maintainer events must appear in step order: {steps:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unit 43 spec item 4: a maintainer task in flight is always awaited
+// (bounded by the maintainer's own timeout) before any terminal outcome is
+// returned. `SleepingMaintainer` sleeps on its LAST scripted call; the
+// session's final `Done` outcome is only returned after that call's notes
+// are committed.
+// ---------------------------------------------------------------------
+
+struct SleepingMaintainer {
+    notes: Mutex<Vec<String>>,
+}
+
+impl SleepingMaintainer {
+    fn new(notes: Vec<String>) -> Arc<SleepingMaintainer> {
+        Arc::new(SleepingMaintainer {
+            notes: Mutex::new(notes),
+        })
+    }
+}
+
+#[async_trait]
+impl Maintainer for SleepingMaintainer {
+    async fn maintain(
+        &self,
+        _input: statie_core::MaintainInput<'_>,
+    ) -> Result<MaintainOutput, MaintainError> {
+        let (text, is_last) = {
+            let mut notes = self.notes.lock().unwrap();
+            let is_last = notes.len() == 1;
+            (notes.remove(0), is_last)
+        };
+        if is_last {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Ok(MaintainOutput {
+            notes: text,
+            next: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn done_outcome_waits_for_the_in_flight_maintainer_to_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let model = RecordingModel::new(vec![
+        serde_json::json!({
+            "patch": {"value": 1},
+            "action": bump_tool_call(),
+            "ack_inbox": []
+        })
+        .to_string(),
+        serde_json::json!({
+            "patch": {"done": true},
+            "action": {"type": "done"},
+            "ack_inbox": []
+        })
+        .to_string(),
+    ]);
+
+    // Step 1's own call returns immediately; step 2's park/`Done` handling
+    // must await THIS call (spawned right after step 2 commits, since
+    // `Done` still reaches the context-maintenance gate's `else` branch --
+    // no, `Done` is not maintainer-eligible, so nothing is spawned for step
+    // 2 itself; what's in flight when `Done` is returned is step 1's own
+    // call, which the drain at the START of the `Done`-producing step must
+    // still catch). Only one entry is scripted for step 1; step 2 spawns no
+    // call of its own (its outcome is `Done`), so the sleeping entry here
+    // is step 1's.
+    let maintainer = SleepingMaintainer::new(vec!["notes from step 1".to_string()]);
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 400),
+    )
+    .with_maintainer(Arc::clone(&maintainer) as Arc<dyn Maintainer>);
+
+    let skill = Arc::new(MaintainedSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec1).unwrap();
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome = statie_core::SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+    assert!(matches!(outcome, Outcome::Done));
+
+    let (state, _version) = active.session().state().await.unwrap();
+    assert_eq!(
+        state.agent.notes, "notes from step 1",
+        "the sleeping maintainer's notes must be committed before Done is returned"
+    );
+    assert_eq!(state.harness.notes_step, Some(1));
 }

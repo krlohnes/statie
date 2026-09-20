@@ -4355,20 +4355,27 @@ async fn a_third_identical_shell_attempt_still_yields_the_loop_guard_note() {
     assert_eq!(skipped_count, 3, "expected three skipped repeats");
 }
 
+/// Unit 43 spec item 2: a `skipped_redundant` step (7.7/7.8's "do NOT run
+/// the tool" path -- the observation carries nothing new) no longer starts
+/// a maintainer call of its own; it logs `maintainer_skipped` with reason
+/// `"skipped_read"` instead, and the previous notes stand. Any maintainer
+/// call already in flight from an earlier step is still drained on a skip
+/// (unit 43: only the SPAWN is withheld), so the first turn's own call
+/// (spawned after it commits for real) is awaited and committed during the
+/// second (skipped) turn's own `step()` call -- this test was originally
+/// named `the_maintainer_still_runs_after_a_skipped_step` under the old,
+/// synchronous, always-runs-after-every-committed-step behaviour; it now
+/// asserts the opposite for the skip itself.
 #[tokio::test]
-async fn the_maintainer_still_runs_after_a_skipped_step() {
+async fn the_maintainer_is_skipped_but_drains_after_a_skipped_step() {
     let root = tempfile::tempdir().unwrap();
 
-    let maintainer = Arc::new(statie_core::MockMaintainer::new(vec![
-        Ok(statie_core::MaintainOutput {
+    let maintainer = Arc::new(statie_core::MockMaintainer::new(vec![Ok(
+        statie_core::MaintainOutput {
             notes: "ran the tests once".to_string(),
             next: None,
-        }),
-        Ok(statie_core::MaintainOutput {
-            notes: "ran the tests again (skipped, unchanged)".to_string(),
-            next: None,
-        }),
-    ]));
+        },
+    )]));
 
     let turns = vec![coding_shell_call("echo hi"), coding_shell_call("echo hi")];
     let model = Arc::new(MockModel::new(turns));
@@ -4390,10 +4397,22 @@ async fn the_maintainer_still_runs_after_a_skipped_step() {
         "the skipped step still commits, got {outcome2:?}"
     );
 
+    let skipped_entry = log
+        .entries(Some(LogKind::System), 10_000)
+        .into_iter()
+        .find(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer_skipped"))
+        .expect("expected a maintainer_skipped system entry for the skipped step");
+    assert_eq!(
+        skipped_entry.payload.get("reason").and_then(Value::as_str),
+        Some("skipped_read"),
+        "reason must be exactly \"skipped_read\": {skipped_entry:?}"
+    );
+
     let calls = maintainer.calls();
     assert_eq!(
         calls.len(),
-        2,
-        "the maintainer must run after a skipped step just like any other committed step"
+        1,
+        "the maintainer must not be called for the skipped step itself, only for the \
+         first (real) turn, whose call is drained during the skipped turn's own step()"
     );
 }

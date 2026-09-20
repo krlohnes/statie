@@ -44,6 +44,7 @@ fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
             last_stall: None,
             last_tool: None,
             fails_since_green: 0,
+            notes_step: None,
         },
         agent,
     }

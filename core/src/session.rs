@@ -16,7 +16,7 @@ use crate::fixer::{CandidateRunner, FixInput, Fixer, RunnerEdit};
 use crate::guards::Guards;
 use crate::log::{LogEntry, LogKind, SessionLog, StepRecord};
 use crate::loop_types::{Event, Executable, Outcome, Park};
-use crate::maintainer::{MaintainInput, Maintainer};
+use crate::maintainer::{MaintainError, MaintainInputOwned, Maintainer};
 use crate::model::{
     Action, Model, RawOutput, Schema, StepOutput, StepSink, Usage, restrict_action_types,
 };
@@ -143,6 +143,38 @@ struct AppliedTrustedPatch {
     version: Version,
     step: u64,
     keys: Vec<String>,
+}
+
+/// Unit 43 (D17 addendum: the maintainer's call is 1.3 s of a 3.25 s step;
+/// `short_fixer_b23`: 42 of 235 maintainer calls followed a rejection, a
+/// refused step, or a skipped read): the maintainer call spawned right
+/// after the step it was given (`Active::spawn_maintainer`) runs off the
+/// critical path. Held on `Session` between the step that spawned it and
+/// the step that awaits it (`Active::drain_pending_maintainer`) -- never
+/// more than one at a time (spec item 1: "at most one maintainer call in
+/// flight"), since a drain always fully empties this back to `None` before
+/// `spawn_maintainer` fills it again. The task itself
+/// (`tokio::task::JoinHandle`) only calls `Maintainer::maintain` -- it never
+/// touches the store or the log, so no commit ever races the task with the
+/// session loop's own writes (spec item 4: "the store is never written from
+/// two tasks at once").
+struct PendingMaintainer {
+    /// The harness step the spawned call was given (`MaintainInputOwned`'s
+    /// step at spawn time) -- becomes `HarnessState.notes_step` once this
+    /// task's result commits.
+    step: u64,
+    /// The token budget `notes` must fit, captured at spawn time alongside
+    /// the rest of `MaintainInputOwned` -- needed again at drain time to
+    /// check `out.notes` against it, exactly as `run_maintainer` does today.
+    budget: usize,
+    /// `reasoning.map(str::len).unwrap_or(0)` at spawn time, carried through
+    /// to the `maintainer` System entry the drain logs (unchanged from
+    /// today's `run_maintainer`).
+    reasoning_chars: usize,
+    /// The observation text's length at spawn time, carried through the
+    /// same way as `reasoning_chars`.
+    observation_chars: usize,
+    handle: tokio::task::JoinHandle<Result<crate::maintainer::MaintainOutput, MaintainError>>,
 }
 
 /// A verification command (`shell` or `test`) that ran to completion, kept
@@ -837,6 +869,12 @@ pub struct Session<W> {
     /// `Done` -- to distil the step's dropped reasoning into the
     /// harness-owned `notes` field.
     maintainer: Option<Arc<dyn Maintainer>>,
+    /// Unit 43: the in-flight maintainer task (if any), spawned right after
+    /// some earlier step committed and not yet awaited. `None` whenever no
+    /// call is outstanding -- always true right after a drain, and before
+    /// the first maintainer-eligible step of an activation. See
+    /// `PendingMaintainer`'s doc for the "at most one in flight" invariant.
+    pending_maintainer: Option<PendingMaintainer>,
     /// The `think` tool (statie-spec.md's `think` tool): `None` means
     /// `think` is registered (if the active tool set includes it) but every
     /// call reports itself as unconfigured, telling the model to decide
@@ -1090,6 +1128,7 @@ impl<W> Session<W> {
             child_runner: None,
             delegations: 0,
             maintainer: None,
+            pending_maintainer: None,
             thinker: None,
             fixer: None,
             candidate_runner: None,
@@ -1279,6 +1318,7 @@ impl<W> Session<W> {
                         last_stall: None,
                         last_tool: None,
                         fails_since_green: 0,
+                        notes_step: None,
                     },
                     agent: skill.initial_workspace(),
                 };
@@ -1825,6 +1865,11 @@ where
                 let (cur, _version) = self.session.state().await?;
                 let step = cur.harness.step;
                 entries.push(system_entry(step, "cancelled", serde_json::json!({})));
+                // Spec item 4: cancellation is a terminal outcome for this
+                // `step` call -- drain any maintainer task still in flight
+                // from an earlier step before returning, so it is never
+                // left to outlive the session.
+                self.drain_pending_maintainer(sink).await;
                 return Ok(StepRecord::new(entries, Outcome::Parked(Park::Cancelled)));
             }
             Event::Tick => {}
@@ -1842,6 +1887,9 @@ where
 
         if self.skill.is_terminal(&cur.agent) {
             entries.push(system_entry(step_at_start, "done", serde_json::json!({})));
+            // Spec item 4: `Done` is terminal -- drain any maintainer task
+            // still in flight before returning it.
+            self.drain_pending_maintainer(sink).await;
             return Ok(StepRecord::new(entries, Outcome::Done));
         }
 
@@ -1936,7 +1984,7 @@ where
         .spec(&self.spec)
         .tools(&tool_list)
         .agent(&agent_state)
-        .notes(notes.as_ref())
+        .notes(notes.as_ref(), cur.harness.notes_step)
         .harness(&harness_view)
         .situational(situational.as_deref())
         .working_set(working_set.as_ref());
@@ -1979,6 +2027,10 @@ where
                     "cancelled",
                     serde_json::json!({}),
                 ));
+                // Spec item 4: cancellation is terminal for this `step`
+                // call -- drain any maintainer task still in flight before
+                // returning it.
+                self.drain_pending_maintainer(sink).await;
                 return Ok(StepRecord::new(entries, Outcome::Parked(Park::Cancelled)));
             }
             Err(e) => return Err(SessionError::Model(e)),
@@ -2637,18 +2689,96 @@ where
         // after `Done`/a handoff/a cancellation/the retry-cap `Failure`
         // park (none of those represent "a committed step whose next
         // observation is ready").
+        //
+        // Unit 43 (D17 addendum: the maintainer's call is 1.3 s of a 3.25 s
+        // step): the call itself runs off the critical path. Right after a
+        // step commits, this drains whatever call was spawned for the
+        // PREVIOUS eligible step (awaiting it and committing its result,
+        // exactly as `run_maintainer` always did synchronously) and only
+        // then spawns this step's own call -- never awaited here. Net: at
+        // most one maintainer call in flight, and every prompt sees notes
+        // at most one step stale (the drain for step N's call happens at
+        // the earliest opportunity after step N+1 commits, so step N+1's
+        // own prompt -- already built before this point in its `step`
+        // call -- never sees it; step N+2's prompt, built at the top of the
+        // next `step` call, does).
         let run_maintainer = matches!(
             outcome,
             Outcome::Continue | Outcome::Parked(Park::AskUser(_)) | Outcome::Parked(Park::Yield)
         );
-        if run_maintainer {
+        // short_fixer_b23: 42 of 235 maintainer calls followed a harness
+        // `Continue`, a `tool_rejected`, or a `skipped_redundant` read --
+        // none of those put anything new in the observation for the
+        // maintainer to distil, so the call is skipped outright rather than
+        // spawned and later found to have nothing to say. The previous
+        // notes stand (nothing is committed for this step), and a
+        // `maintainer_skipped` entry names which of the three shapes fired,
+        // in the same priority order `is_non_progress`/`tool_error_entry`
+        // above already establish (`Continue` first, since it's checked via
+        // `action_for_maintainer` rather than an entry search).
+        let skip_reason = if matches!(action_for_maintainer, Action::Continue { .. }) {
+            Some("continue")
+        } else if entries.iter().any(|e| {
+            e.kind == LogKind::System
+                && e.payload.get("event").and_then(Value::as_str) == Some("tool_rejected")
+        }) {
+            Some("rejected")
+        } else if tool_skipped {
+            Some("skipped_read")
+        } else {
+            None
+        };
+        if run_maintainer && let Some(reason) = skip_reason {
+            entries.push(system_entry(
+                next_harness.step,
+                "maintainer_skipped",
+                serde_json::json!({"reason": reason}),
+            ));
+            // Only the SPAWN is withheld (spec item 2: "the maintainer is
+            // not started" -- nothing about this step's own reasoning is
+            // worth summarising, so there is nothing to spawn). Any task
+            // already in flight from an earlier eligible step is still
+            // drained here, exactly as it would be on a normal eligible
+            // step -- otherwise a skip in between would push that task's
+            // notes more than one step stale, and a run of consecutive
+            // skips could leave it pending indefinitely.
+            self.drain_pending_maintainer(sink).await;
+        } else if run_maintainer {
+            // Unit 43: this step's own committed state (the snapshot
+            // `spawn_maintainer` needs -- `next_harness.step`, `cur.agent`,
+            // `commitment`, `active_tools`) MUST be read before the drain
+            // below runs. The drain's own `apply_trusted_patch` (a fresh
+            // commit on top of THIS step's) advances the harness step again
+            // and can change `notes`/`next` -- reading state after it would
+            // hand `spawn_maintainer` the drain's own post-commit state
+            // instead of this worker step's, corrupting `notes_step` and
+            // every other captured field.
+            let (cur_for_spawn, _version) = self.session.state().await?;
             let reasoning_text = entries.iter().find_map(|e| {
                 (e.kind == LogKind::Reasoning)
                     .then(|| e.payload.get("text").and_then(Value::as_str))
                     .flatten()
             });
-            self.run_maintainer(reasoning_text, &patch_raw, &action_for_maintainer, sink)
-                .await;
+            self.drain_pending_maintainer(sink).await;
+            self.spawn_maintainer(
+                &cur_for_spawn,
+                reasoning_text,
+                &patch_raw,
+                &action_for_maintainer,
+            )
+            .await;
+        } else {
+            // Spec item 4: `Done`/a handoff/the retry-cap `Failure` park
+            // reaches here too (this `else` covers every `outcome` not
+            // matched by `run_maintainer` above) -- any maintainer task
+            // still in flight from an earlier step must be awaited and
+            // committed (or its error logged) before such a terminal
+            // outcome is returned, so no task outlives the session and no
+            // commit races the store. Never spawns a new one: none of
+            // these outcomes represent a step whose reasoning is worth
+            // distilling further (the same rule the comment above `run_
+            // maintainer` already states).
+            self.drain_pending_maintainer(sink).await;
         }
 
         // Repeated-`Continue`-note guard (`CONTINUE_REPEAT_CAP`): any step
@@ -5204,49 +5334,41 @@ where
         Ok(())
     }
 
-    /// Context maintenance (statie-spec.md "9. Context maintenance"): runs
-    /// after a committed step's action has been fully handled -- tool
-    /// executed and the next observation produced, or an `AskUser`/`Yield`
-    /// park -- and never on a rejection or after `Done`. Distils the
-    /// step's reasoning (which is otherwise dropped) into the
-    /// harness-owned `notes` field, and, when the workspace has no open
-    /// commitment, may propose one the model itself did not write.
+    /// Context maintenance (statie-spec.md "9. Context maintenance"), spawn
+    /// half (unit 43, D17 addendum: the maintainer's call is 1.3 s of a
+    /// 3.25 s step): builds this step's `MaintainInput` -- unchanged from
+    /// before this unit, spec item 5 -- and hands it to `maintainer.maintain`
+    /// as a `tokio::spawn`ed task, stored as `self.session.pending_maintainer`.
+    /// Never awaited here: callers must call `drain_pending_maintainer`
+    /// first (this step's caller in `step` always does, right before this),
+    /// so there is at most one call in flight at a time (spec item 1).
     ///
-    /// A maintainer error (backend down, over budget after one retry, or
-    /// its patch rejected twice) logs `maintainer_error`, keeps the
-    /// previous notes, and never changes the step outcome -- callers must
-    /// not propagate its `Result` into the step's own.
-    ///
-    /// The `maintainer` System entry logged on success carries
-    /// `reasoning_chars`/`observation_chars` (`reasoning.map(str::len)
-    /// .unwrap_or(0)` / `observation_text.len()`) alongside `notes_tokens`/
-    /// `next_set`, so a run's log can show whether the maintainer ever
-    /// actually saw any reasoning -- the maintainer's own output carries no
-    /// record of what it was given.
-    async fn run_maintainer(
+    /// `cur` is THIS step's own just-committed state, read by the caller
+    /// BEFORE it calls `drain_pending_maintainer` -- never re-read here via
+    /// `self.session.state()`, since the drain's own `apply_trusted_patch`
+    /// commits on top of it (bumping the harness step again and possibly
+    /// changing `notes`/`next`), and reading afterward would hand this
+    /// function the drain's post-commit state instead of this step's,
+    /// corrupting `notes_step` and everything else captured below. An
+    /// absent `Maintainer` leaves `pending_maintainer` untouched (`None`
+    /// stays `None`) exactly the way the old synchronous `run_maintainer`
+    /// returned early without logging anything for that case. Reports
+    /// nothing to `sink`/the log itself: unlike the old synchronous
+    /// version, spawning never fails in a way worth reporting this step --
+    /// the spawned call's own success/failure is only known once
+    /// `drain_pending_maintainer` awaits it, at which point THAT call
+    /// reports it.
+    async fn spawn_maintainer(
         &mut self,
+        cur: &CommittedState<K::Workspace>,
         reasoning: Option<&str>,
         patch: &Value,
         action: &Action,
-        sink: &mut dyn StepSink,
     ) {
         let Some(maintainer) = self.session.maintainer.clone() else {
             return;
         };
 
-        let (cur, _version) = match self.session.state().await {
-            Ok(s) => s,
-            Err(e) => {
-                let reason = e.to_string();
-                let _ = self.session.log.append(system_entry(
-                    self.session.log.last_step(),
-                    "maintainer_error",
-                    serde_json::json!({"reason": reason}),
-                ));
-                sink.maintainer_failed(&reason);
-                return;
-            }
-        };
         let step = cur.harness.step;
 
         let observation_text = self
@@ -5254,34 +5376,75 @@ where
             .pending_observation
             .as_ref()
             .map(Observation::as_str)
-            .unwrap_or("");
-        let agent_value = serde_json::to_value(&cur.agent).unwrap_or(Value::Null);
+            .unwrap_or("")
+            .to_string();
+        let agent = serde_json::to_value(&cur.agent).unwrap_or(Value::Null);
         let commitment = self.skill.commitment(&cur.agent);
         let notes = self.skill.notes(&cur.agent).unwrap_or_default();
         let budget = cur.harness.budgets.notes;
         let active_tools = cur.harness.active_tools.clone();
 
-        // Recorded in the `maintainer` System entry below so a run can show
-        // whether the maintainer ever actually saw any reasoning: the
-        // maintainer's own log entry does not otherwise say.
+        // Recorded in the `maintainer` System entry the drain logs, so a
+        // run can show whether the maintainer ever actually saw any
+        // reasoning: the maintainer's own log entry does not otherwise say.
         let reasoning_chars = reasoning.map(str::len).unwrap_or(0);
         let observation_chars = observation_text.len();
 
-        let input = MaintainInput {
-            reasoning,
-            patch,
-            action,
+        let owned = MaintainInputOwned {
+            reasoning: reasoning.map(str::to_string),
+            patch: patch.clone(),
+            action: action.clone(),
             observation: observation_text,
-            agent: &agent_value,
-            commitment: commitment.as_ref(),
-            notes: &notes,
-            budget: TokenBudget(budget),
-            active_tools: &active_tools,
+            agent,
+            commitment,
+            notes,
+            budget,
+            active_tools,
         };
 
-        let mut out = match maintainer.maintain(input).await {
-            Ok(out) => out,
-            Err(e) => {
+        let handle = tokio::spawn(async move { maintainer.maintain(owned.as_input()).await });
+
+        self.session.pending_maintainer = Some(PendingMaintainer {
+            step,
+            budget,
+            reasoning_chars,
+            observation_chars,
+            handle,
+        });
+    }
+
+    /// Context maintenance (statie-spec.md "9. Context maintenance"), drain
+    /// half (unit 43): awaits whatever call `spawn_maintainer` most recently
+    /// started (a no-op when `pending_maintainer` is `None`) and commits its
+    /// result exactly as the old synchronous `run_maintainer` always did --
+    /// same log entries, same `maintainer`/`maintainer_error` system events,
+    /// same `next` handling (the inactive-tool/malformed-`next`/
+    /// commitment-is-set checks all re-read the CURRENT state via
+    /// `self.skill`, not a snapshot from spawn time, so a commitment or
+    /// activation change in the step(s) between spawn and drain is honoured
+    /// -- spawn time only froze what the maintainer itself was GIVEN, per
+    /// spec item 5). Also commits `HarnessState.notes_step` alongside the
+    /// notes patch, set to the step the drained call was spawned for.
+    ///
+    /// A maintainer error (backend down, over budget after one retry, or
+    /// its patch rejected twice) logs `maintainer_error`, keeps the
+    /// previous notes, and never changes the step outcome -- callers must
+    /// not propagate this into the step's own `Result`.
+    async fn drain_pending_maintainer(&mut self, sink: &mut dyn StepSink) {
+        let Some(pending) = self.session.pending_maintainer.take() else {
+            return;
+        };
+        let PendingMaintainer {
+            step,
+            budget,
+            reasoning_chars,
+            observation_chars,
+            handle,
+        } = pending;
+
+        let out = match handle.await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
                 let reason = e.to_string();
                 let _ = self.session.log.append(system_entry(
                     step,
@@ -5291,7 +5454,18 @@ where
                 sink.maintainer_failed(&reason);
                 return;
             }
+            Err(join_err) => {
+                let reason = join_err.to_string();
+                let _ = self.session.log.append(system_entry(
+                    step,
+                    "maintainer_error",
+                    serde_json::json!({"reason": reason}),
+                ));
+                sink.maintainer_failed(&reason);
+                return;
+            }
         };
+        let mut out = out;
 
         let notes_tokens = self.session.tokenizer.count(&out.notes);
         if notes_tokens > budget {
@@ -5305,8 +5479,24 @@ where
             return;
         }
 
-        // A proposed `next` whose tool isn't active for this activation is
-        // never a real commitment (statie-spec.md "9. Context
+        let (cur, _version) = match self.session.state().await {
+            Ok(s) => s,
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = self.session.log.append(system_entry(
+                    step,
+                    "maintainer_error",
+                    serde_json::json!({"reason": reason}),
+                ));
+                sink.maintainer_failed(&reason);
+                return;
+            }
+        };
+        let commitment = self.skill.commitment(&cur.agent);
+        let active_tools = cur.harness.active_tools.clone();
+
+        // A proposed `next` whose tool isn't active for the CURRENT
+        // activation is never a real commitment (statie-spec.md "9. Context
         // maintenance"): the worker has no way to satisfy it. Drop it and
         // log `maintainer_error`, but still apply the notes below.
         if let Some(c) = &out.next
@@ -5358,8 +5548,9 @@ where
         }
 
         // `next` is applied only when the workspace's own commitment is
-        // still `None`: a maintainer-proposed commitment never overrides
-        // one the worker wrote itself.
+        // still `None` as of THIS (drain) time -- a maintainer-proposed
+        // commitment never overrides one the worker wrote itself, including
+        // one the worker set in a step after this call was spawned.
         let propose_next = commitment.is_none() && out.next.is_some();
 
         let mut patch_value = serde_json::json!({"notes": out.notes});
@@ -5375,6 +5566,7 @@ where
             .await
         {
             Ok(applied) => {
+                self.set_notes_step(step).await;
                 let _ = self.session.log.append(system_entry(
                     applied.step,
                     "maintainer",
@@ -5399,6 +5591,7 @@ where
                 let retry_value = serde_json::json!({"notes": out.notes});
                 match self.apply_trusted_patch(retry_value, "maintainer").await {
                     Ok(applied) => {
+                        self.set_notes_step(step).await;
                         let _ = self.session.log.append(system_entry(
                             applied.step,
                             "maintainer",
@@ -5431,6 +5624,23 @@ where
                 ));
                 sink.maintainer_failed(&reason);
             }
+        }
+    }
+
+    /// Sets `HarnessState.notes_step` to `step` via the same out-of-band
+    /// `set_harness` commit pattern `last_skip`/`last_tool_error`/
+    /// `last_stall` use (unit 43): called right after `apply_trusted_patch`
+    /// commits the drained maintainer's notes, so the harness state a
+    /// prompt reads afterward carries which step those notes summarise.
+    /// Never fails the drain: a `state()`/`set_harness` error here is
+    /// swallowed the same way those other call sites don't propagate one
+    /// (this is bookkeeping on top of an already-committed notes patch, not
+    /// the patch itself).
+    async fn set_notes_step(&mut self, step: u64) {
+        if let Ok((cur, _version)) = self.session.state().await {
+            let mut harness = cur.harness;
+            harness.notes_step = Some(step);
+            let _ = self.session.store.set_harness(harness).await;
         }
     }
 

@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 43. The maintainer runs off the critical path; notes are one step stale
-- **Status.** Proposed, design only. Evidence: D17 addendum (the
+- **Status.** Committed (Milestone 49). Measured next on the gemma and Qwen short batteries (build 27) against builds 26. Evidence: D17 addendum (the
   maintainer's call is 1.3 s of a 3.25 s step and three runs of
   landing on the gemma short battery); `short_fixer_b23`: 235
   maintainer calls, 42 of them (18%) after a rejection, a refused

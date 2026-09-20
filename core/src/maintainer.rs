@@ -48,6 +48,45 @@ pub struct MaintainOutput {
     pub next: Option<Commitment>,
 }
 
+/// An owned copy of one `MaintainInput`, for a call spawned off the
+/// critical path (unit 43: the maintainer runs asynchronously, so its input
+/// must outlive the borrows `Active::step` holds -- `tokio::spawn` requires
+/// `'static`). Built once, right after the step that produced it commits
+/// (`Active::spawn_maintainer`), exactly the same values `MaintainInput`
+/// would have borrowed at that point -- spec item 5: no change to what the
+/// maintainer is given. Never mutated after construction; `as_input`
+/// borrows it back into a `MaintainInput` for the actual call.
+pub struct MaintainInputOwned {
+    pub reasoning: Option<String>,
+    pub patch: Value,
+    pub action: Action,
+    pub observation: String,
+    pub agent: Value,
+    pub commitment: Option<Commitment>,
+    pub notes: String,
+    /// `TokenBudget`'s inner value: the type itself carries no `Clone`/`Copy`
+    /// (see `tokenizer.rs`), so this holds the same `usize` and re-wraps it
+    /// in `as_input`.
+    pub budget: usize,
+    pub active_tools: Vec<String>,
+}
+
+impl MaintainInputOwned {
+    pub fn as_input(&self) -> MaintainInput<'_> {
+        MaintainInput {
+            reasoning: self.reasoning.as_deref(),
+            patch: &self.patch,
+            action: &self.action,
+            observation: &self.observation,
+            agent: &self.agent,
+            commitment: self.commitment.as_ref(),
+            notes: &self.notes,
+            budget: TokenBudget(self.budget),
+            active_tools: &self.active_tools,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MaintainError {
     #[error("maintainer backend error: {0}")]

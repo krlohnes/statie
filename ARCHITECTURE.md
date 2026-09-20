@@ -2061,3 +2061,37 @@ path-named call with `offset`/`limit` runs `read_file` with the exact
 note; with `old`/`new` runs `edit_file`; with empty args is rejected
 with today's text; a real `read_file` name is untouched).
 
+## Milestone 49: the maintainer runs off the critical path (BACKLOG.md item 43)
+
+After a step commits, the session (`core/src/session.rs`) spawns the
+maintainer's call for that step as a task (`spawn_maintainer`, holding
+a `PendingMaintainer` with the step, budget, and join handle; the
+input is an owned copy, `MaintainInputOwned` in `core/src/maintainer.rs`)
+and builds the next prompt without waiting. Before the following
+step's maintainer is spawned, and before every terminal return (park,
+`Done`, handoff, cancellation), `drain_pending_maintainer` awaits the
+task and commits its result exactly as the synchronous call did: the
+budget check, the inactive-tool and non-mutating `next` checks against
+freshly read state, the same `maintainer` and `maintainer_error`
+events. At most one call is in flight and every prompt's notes are at
+most one step stale. A step whose committed action was a harness
+`Continue`, or whose entries carry `tool_rejected` or
+`skipped_redundant`, does not spawn a maintainer: a `maintainer_skipped`
+event with `reason` `continue`, `rejected`, or `skipped_read` is logged
+and the previous notes stand. `HarnessState.notes_step` records the
+step whose maintainer produced the current notes, and the prompt's
+notes heading ends ` (as of step {n})`.
+
+Why: D17 addendum. The maintainer's call was 1.3 s of a 3.25 s step,
+on the critical path only because the very next prompt read its
+notes; 42 of 235 calls on `short_fixer_b23` followed a step that
+produced nothing new.
+
+Tests: `core/tests/it/maintainer.rs` (a five-step scripted session
+asserts, per prompt, exactly which step's notes it carried and the
+`notes_step` committed; a refused step logs `maintainer_skipped` with
+the exact reason and calls the maintainer zero times; a `Done` outcome
+returns only after an in-flight maintainer's notes are committed),
+`core/tests/it/prompt.rs` (the heading with a step, exact),
+`skills/tests/it/recovery.rs` (a skipped read skips the maintainer).
+

@@ -346,6 +346,21 @@ pub struct HarnessState {
     /// before this field existed still deserializes.
     #[serde(default)]
     pub fails_since_green: u32,
+    /// Unit 43: the harness step whose committed reasoning the current
+    /// `notes` text summarises -- i.e. the step the maintainer call that
+    /// produced these notes was spawned for, NOT the step at which the
+    /// notes were actually committed (the maintainer call for step N is
+    /// spawned right after step N commits, but its result is only awaited
+    /// and committed at the end of step N+1, so the notes a prompt sees are
+    /// always at most one step stale; see `Active::spawn_maintainer`/
+    /// `Active::drain_pending_maintainer`). `None` before any maintainer
+    /// call has ever committed notes this activation. Rendered in the
+    /// prompt's notes section heading (`core/src/prompt.rs`'s `IDX_NOTES`)
+    /// as ` (as of step {n})`. Harness-owned: patches cannot touch it.
+    /// `#[serde(default)]` so state persisted before this field existed
+    /// still deserializes.
+    #[serde(default)]
+    pub notes_step: Option<u64>,
 }
 
 /// One skipped-redundant read, recorded on `HarnessState::last_skip`. See

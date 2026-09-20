@@ -71,6 +71,12 @@ pub struct PromptBuilder<'t> {
     budgets: Budgets,
     version: Version,
     rendered: [Option<String>; 10],
+    /// Unit 43: the step the maintainer call that produced the current
+    /// `Notes` text was spawned for (`HarnessState.notes_step`), appended to
+    /// the notes section's heading as ` (as of step {n})` so the model can
+    /// tell how stale the notes are. `None` renders the heading exactly as
+    /// before (no maintainer has committed notes yet).
+    notes_step: Option<u64>,
 }
 
 const IDX_SYSTEM: usize = 0;
@@ -104,6 +110,7 @@ impl<'t> PromptBuilder<'t> {
             budgets,
             version,
             rendered: Default::default(),
+            notes_step: None,
         }
     }
 
@@ -134,11 +141,21 @@ impl<'t> PromptBuilder<'t> {
 
     /// Renders the harness-maintained notes section. `None` (no maintainer
     /// configured, or nothing maintained yet) or empty notes render
-    /// nothing — the same as never calling this method.
-    pub fn notes(self, n: Option<&Notes>) -> Self {
+    /// nothing — the same as never calling this method. `notes_step`
+    /// (`HarnessState.notes_step`, unit 43) is the step the maintainer call
+    /// that produced `n` was spawned for; appended to the section's heading
+    /// as ` (as of step {n})` in `build`. `None` leaves the heading
+    /// unchanged from before unit 43 -- only reached when `n` is also
+    /// `Some` with a caller that never set `notes_step` (shouldn't happen
+    /// via `Active::step`, which always sets both together, but the two are
+    /// independent parameters rather than one so a caller building a prompt
+    /// without going through the harness's own notes/notes_step pairing
+    /// still compiles).
+    pub fn notes(mut self, n: Option<&Notes>, notes_step: Option<u64>) -> Self {
         match n {
             Some(n) if !n.as_str().is_empty() => {
                 let text = n.render();
+                self.notes_step = notes_step;
                 self.set(IDX_NOTES, text)
             }
             _ => self,
@@ -245,10 +262,20 @@ impl<'t> PromptBuilder<'t> {
         }
 
         // Headed text per slot, indexed the same way as `self.rendered`.
+        // Unit 43: the Notes section's heading gets ` (as of step {n})`
+        // appended when `notes_step` is set, so the model can tell how
+        // stale the notes are -- every other section's heading is the
+        // fixed text `Section::heading` returns.
         let mut headed: [Option<String>; 10] = Default::default();
         for (idx, section) in SECTION_ORDER.iter().enumerate() {
             if let Some(text) = &self.rendered[idx] {
-                headed[idx] = Some(format!("## {}\n{}", section.heading(), text));
+                let heading = match (section, self.notes_step) {
+                    (Section::Notes, Some(n)) => {
+                        format!("{} (as of step {n})", section.heading())
+                    }
+                    _ => section.heading().to_string(),
+                };
+                headed[idx] = Some(format!("## {heading}\n{text}"));
             }
         }
 

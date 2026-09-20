@@ -33,5 +33,6 @@
     "allow_shell": true,
     "max_output_bytes": 200000
   },
-  "max_autonomous_steps": 200
+  "max_autonomous_steps": 200,
+  "maintainer": { "overlap": true }
 }

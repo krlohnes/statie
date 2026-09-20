@@ -124,6 +124,17 @@ pub struct MaintainerConfig {
     pub budget: usize,
     pub timeout_secs: u64,
     pub prompt_budget: usize,
+    /// Unit 48 (D24: per-model behaviour is a config choice, not a code
+    /// default): whether the maintainer call spawned for a step is left
+    /// overlapping the next step (`true`, the default, `Session::with_
+    /// maintainer_overlap`'s default -- unit 43's behaviour) or drained
+    /// immediately after it is spawned (`false`, the synchronous behaviour
+    /// of builds through 26). Live bench evidence set the default: Qwen
+    /// gained a third of its wall clock at unchanged landing with overlap on
+    /// (builds 27, 29, 30), but gemma's refusal walks lost two to four runs
+    /// on every such build (16, 15 -> 12, 13), guidance one step late
+    /// letting the walk reach the cap -- gemma configs turn this off.
+    pub overlap: bool,
 }
 
 impl Default for MaintainerConfig {
@@ -133,6 +144,7 @@ impl Default for MaintainerConfig {
             budget: 400,
             timeout_secs: 120,
             prompt_budget: 4000,
+            overlap: true,
         }
     }
 }
@@ -1538,6 +1550,30 @@ mod tests {
         // Defaults filled in for fields not given.
         assert_eq!(m.prompt_budget, MaintainerConfig::default().prompt_budget);
         assert!(m.model.is_none());
+        assert!(m.overlap, "overlap defaults to true");
+    }
+
+    #[test]
+    fn maintainer_overlap_defaults_to_true() {
+        assert!(MaintainerConfig::default().overlap);
+        let cfg: Config =
+            serde_json::from_str(r#"{"maintainer":{"budget":300,"timeout_secs":30}}"#).unwrap();
+        let m = cfg.maintainer.expect("maintainer section should parse");
+        assert!(
+            m.overlap,
+            "overlap absent from the config text defaults to true"
+        );
+    }
+
+    #[test]
+    fn maintainer_overlap_parses_false() {
+        let text = serde_json::json!({
+            "maintainer": {"budget": 300, "timeout_secs": 30, "overlap": false}
+        })
+        .to_string();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let m = cfg.maintainer.expect("maintainer section should parse");
+        assert!(!m.overlap, "overlap: false must parse to false exactly");
     }
 
     #[test]

@@ -34,6 +34,15 @@ thinks`, the skip and stall thinks): D19, second strike a question, third a park
    (`HarnessState.last_think_step` or equivalent) exactly.
 3. The plan skill's empty-plan refusal gets the same treatment in `plan`'s `validate`, with the
    same constants.
+3a. Core carve-out (allowed, minimal): in `core/src/session.rs`, a committed `think` tool
+   action is NEUTRAL for the three refusal counters, exactly as it already is for
+   `tool_error_repeat_count` (`else if !is_think_action(..)`): `HarnessState.consecutive_continues`,
+   the identical-note `continue_repeat_count` (`CONTINUE_REPEAT_CAP`), and the mixed-shape
+   `non_progress_count` (`NON_PROGRESS_CAP`) are neither incremented nor reset by a `think`
+   step. So a walk goes: refusal (cc 1), refusal → `think` substituted (cc stays 1), refusal
+   (cc 2, no second `think` because `last_think_step` is the previous step), refusal (cc 3,
+   the identical-note cap parks). The walk terminates one step later than today, with one
+   question in it.
 4. The substitution is thinker-agnostic, exactly like `implement_repeated_error_thinks` and
    its siblings: `Skill::validate` cannot see session config, and `Session::execute_think`
    already answers an unconfigured `think` with its own "not configured ... decide from what
@@ -62,8 +71,10 @@ thinks`, the skip and stall thinks): D19, second strike a question, third a park
 
 ## Boundaries
 `skills/src/coding/mod.rs`, `skills/src/lib.rs` (exports), `skills/src/coding/tests.rs`,
-`skills/tests/it/*.rs`, and any test the compiler or a failing assertion names. No core
-changes. No .md edits.
-Allowed cargo: `cargo build -p statie-skills`, `cargo test -p statie-skills --test it`,
+`skills/tests/it/*.rs`, `core/src/session.rs` (only the counter carve-out in 3a), a core test
+for it (`core/tests/it/continue_action.rs` or `non_progress.rs`: Continue, think, Continue,
+Continue reads `consecutive_continues` 1, 1, 2, 3 and parks at the identical-note cap on the
+third refusal, exact), and any test the compiler or a failing assertion names. No .md edits.
+Allowed cargo: `cargo build -p statie-core`, `cargo test -p statie-core --test it`, `cargo build -p statie-skills`, `cargo test -p statie-skills --test it`,
 `cargo test -p statie-skills --lib`, `cargo test -p statie --bin statie`,
 `cargo clippy -p statie-skills --all-targets -- -D warnings`.

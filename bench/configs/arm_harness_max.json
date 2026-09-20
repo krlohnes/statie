@@ -24,7 +24,8 @@
   "maintainer": {
     "budget": 400,
     "timeout_secs": 300,
-    "prompt_budget": 4000
+    "prompt_budget": 4000,
+    "overlap": false
   },
   "working_set": {
     "max_windows": 4,

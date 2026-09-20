@@ -541,6 +541,12 @@ async fn run_coding(
     );
     if let Some(m) = maintainer {
         session = session.with_maintainer(m);
+        // Unit 48 (D24): `maintainer.overlap`, defaulting true, is the
+        // per-model overlap knob -- absent when the `maintainer` section
+        // itself is absent, but `maintainer` above is only `Some` when that
+        // section IS present, so this always reads the configured value.
+        let overlap = cfg.maintainer.as_ref().map(|m| m.overlap).unwrap_or(true);
+        session = session.with_maintainer_overlap(overlap);
     }
     if let Some(t) = thinker {
         session = session.with_thinker(t);

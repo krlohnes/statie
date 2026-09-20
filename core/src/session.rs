@@ -874,6 +874,17 @@ pub struct Session<W> {
     /// the first maintainer-eligible step of an activation. See
     /// `PendingMaintainer`'s doc for the "at most one in flight" invariant.
     pending_maintainer: Option<PendingMaintainer>,
+    /// Unit 48 (D24: per-model behaviour is a config choice, not a code
+    /// default): whether `spawn_maintainer`'s call is left in flight for the
+    /// next eligible step to drain (`true`, unit 43's overlapped behaviour,
+    /// the default) or drained immediately after it is spawned (`false`,
+    /// the pre-unit-43 synchronous behaviour, same spawn/drain code path --
+    /// no second implementation). Live bench evidence set the default: Qwen
+    /// gained a third of its wall clock at unchanged landing with overlap on
+    /// (builds 27, 29, 30), but gemma's refusal walks lost two to four runs
+    /// on every such build (16, 15 -> 12, 13) with notes one step stale, so
+    /// gemma configs turn this off while Qwen keeps it on.
+    maintainer_overlap: bool,
     /// The `think` tool (statie-spec.md's `think` tool): `None` means
     /// `think` is registered (if the active tool set includes it) but every
     /// call reports itself as unconfigured, telling the model to decide
@@ -1128,6 +1139,7 @@ impl<W> Session<W> {
             delegations: 0,
             maintainer: None,
             pending_maintainer: None,
+            maintainer_overlap: true,
             thinker: None,
             fixer: None,
             candidate_runner: None,
@@ -1161,6 +1173,17 @@ impl<W> Session<W> {
     /// loop behaves exactly as it did before this feature existed.
     pub fn with_maintainer(mut self, m: Arc<dyn Maintainer>) -> Self {
         self.maintainer = Some(m);
+        self
+    }
+
+    /// Unit 48 (D24: per-model behaviour is a config choice, not a code
+    /// default): sets whether the maintainer call spawned for a step is left
+    /// overlapping the next step (`true`, the default -- unit 43's
+    /// behaviour) or drained immediately after it is spawned (`false`, the
+    /// synchronous behaviour of builds through 26, same spawn/drain code
+    /// path). Has no effect without `with_maintainer`.
+    pub fn with_maintainer_overlap(mut self, overlap: bool) -> Self {
+        self.maintainer_overlap = overlap;
         self
     }
 
@@ -2827,6 +2850,18 @@ where
                 &action_for_maintainer,
             )
             .await;
+            // Unit 48 (D24: per-model behaviour is a config choice, not a
+            // code default): `maintainer_overlap == false` drains the call
+            // just spawned right away -- same spawn, same drain, same log
+            // entries, same `notes_step` -- so the next prompt sees THIS
+            // step's notes instead of the previous eligible step's (the
+            // synchronous behaviour of builds through 26, unchanged code
+            // path, no second implementation). `pending_maintainer` is
+            // always `None` again by the time this returns, exactly as it
+            // was before unit 43 ever left a call in flight.
+            if !self.session.maintainer_overlap {
+                self.drain_pending_maintainer(sink).await;
+            }
         } else {
             // Spec item 4: `Done`/a handoff/the retry-cap `Failure` park
             // reaches here too (this `else` covers every `outcome` not

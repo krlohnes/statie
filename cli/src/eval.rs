@@ -293,6 +293,8 @@ async fn run_toy_eval(cfg: &Config, steps: u64, verbose: bool) -> anyhow::Result
     );
     if let Some(m) = cfg.build_maintainer()? {
         session_a = session_a.with_maintainer(m);
+        let overlap = cfg.maintainer.as_ref().map(|m| m.overlap).unwrap_or(true);
+        session_a = session_a.with_maintainer_overlap(overlap);
     }
     if let Some(t) = cfg.build_thinker()? {
         session_a = session_a.with_thinker(t);
@@ -396,6 +398,8 @@ async fn run_coding_eval(cfg: &Config, verbose: bool) -> anyhow::Result<EvalResu
     );
     if let Some(m) = cfg.build_maintainer()? {
         session_a = session_a.with_maintainer(m);
+        let overlap = cfg.maintainer.as_ref().map(|m| m.overlap).unwrap_or(true);
+        session_a = session_a.with_maintainer_overlap(overlap);
     }
     if let Some(t) = cfg.build_thinker()? {
         session_a = session_a.with_thinker(t);

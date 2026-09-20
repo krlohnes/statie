@@ -2146,6 +2146,145 @@ async fn five_step_session_notes_are_at_most_one_step_stale() {
 }
 
 // ---------------------------------------------------------------------
+// Unit 48 (D24: per-model behaviour is a config choice, not a code
+// default): with `Session::with_maintainer_overlap(false)`, the maintainer
+// call spawned for a step is drained immediately -- same spawn, same drain,
+// same log entries, same `notes_step` -- so the NEXT step's prompt already
+// carries THIS step's notes (the synchronous behaviour of builds through
+// 26), unlike the overlapped default where it's one step stale.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn overlap_off_next_prompt_carries_immediately_prior_step_notes() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let turns: Vec<String> = (1..=3)
+        .map(|v| {
+            serde_json::json!({
+                "patch": {"value": v},
+                "action": bump_tool_call(),
+                "ack_inbox": []
+            })
+            .to_string()
+        })
+        .collect();
+    let model = RecordingModel::new(turns);
+
+    let maintainer = SequentialMaintainer::new();
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root, 400),
+    )
+    .with_maintainer(Arc::clone(&maintainer) as Arc<dyn Maintainer>)
+    .with_maintainer_overlap(false);
+
+    let skill = Arc::new(MaintainedSkill);
+    let mut active = session.activate(skill).await.unwrap();
+
+    let mut notes_steps: Vec<Option<u64>> = Vec::new();
+    for _ in 0..3 {
+        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
+        let _ = log.append_record(rec).unwrap();
+        let (state, _version) = active.session().state().await.unwrap();
+        notes_steps.push(state.harness.notes_step);
+    }
+
+    // Step 1's own step() call spawns AND drains its own maintainer call
+    // before returning, so `notes_step` is already set right after step 1
+    // commits -- not `None`, the way the overlapped test sees it. The
+    // drain's own `apply_trusted_patch` commit advances `HarnessState.step`
+    // again (same accounting the overlapped five-step test documents), so
+    // with every turn costing two harness steps (its own worker commit,
+    // then its own immediately-drained maintainer commit), turn N's own
+    // worker commit lands at harness step 2N-1 -- and `notes_step` names
+    // THAT step, since it's the one just drained.
+    assert_eq!(
+        notes_steps[0],
+        Some(1),
+        "step 1: overlap off drains its own spawned call before step() returns, so notes_step is 1 immediately"
+    );
+    assert_eq!(
+        notes_steps[1],
+        Some(3),
+        "step 2: its own maintainer call (spawned for its own worker commit, harness step 3) is drained synchronously too"
+    );
+    assert_eq!(
+        notes_steps[2],
+        Some(5),
+        "step 3: same synchronous spawn-then-drain, worker commit at harness step 5"
+    );
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 3);
+    // Step 1's prompt carries no notes header (nothing committed yet when it
+    // was built).
+    assert!(
+        !prompts[0].contains("notes (kept by the harness from your previous reasoning)"),
+        "step 1's prompt must carry no notes header:\n{}",
+        prompts[0]
+    );
+    // Step 2's prompt already carries step 1's notes (exact text), not one
+    // step stale the way the overlapped default would leave it. The
+    // heading names `notes_step` (harness step 1, `notes_steps[0]` above),
+    // not the turn number.
+    assert!(
+        prompts[1]
+            .contains("notes (kept by the harness from your previous reasoning) (as of step 1)"),
+        "step 2's prompt must carry the ` (as of step 1)` heading:\n{}",
+        prompts[1]
+    );
+    assert!(
+        prompts[1].contains("notes from step 1"),
+        "step 2's prompt must carry step 1's maintainer call's exact notes text:\n{}",
+        prompts[1]
+    );
+    // Step 3's prompt carries step 2's notes, immediately (not step 1's, the
+    // way an overlapped run's step 3 would still be showing). The heading
+    // names `notes_step` (harness step 3, `notes_steps[1]` above).
+    assert!(
+        prompts[2]
+            .contains("notes (kept by the harness from your previous reasoning) (as of step 3)"),
+        "step 3's prompt must carry the ` (as of step 3)` heading:\n{}",
+        prompts[2]
+    );
+    assert!(
+        prompts[2].contains("notes from step 2"),
+        "step 3's prompt must carry step 2's maintainer call's exact notes text:\n{}",
+        prompts[2]
+    );
+
+    // The session log's `maintainer` events: one per step (all three are
+    // drained within this run, unlike the overlapped five-step test where
+    // the last spawn is never drained).
+    let entries = log.entries(None, 100);
+    let maintainer_events: Vec<&statie_core::LogEntry> = entries
+        .iter()
+        .filter(|e| e.payload.get("event").and_then(Value::as_str) == Some("maintainer"))
+        .collect();
+    assert_eq!(
+        maintainer_events.len(),
+        3,
+        "all three maintainer calls are drained synchronously with overlap off"
+    );
+    // The event's own `step` field is the DRAIN commit's step (`applied.
+    // step` in `drain_pending_maintainer`, unchanged from the overlapped
+    // path) -- one past the worker commit `notes_step` names, since the
+    // notes patch itself advances the harness step again.
+    let steps: Vec<u64> = maintainer_events.iter().map(|e| e.step).collect();
+    assert_eq!(
+        steps,
+        vec![2, 4, 6],
+        "maintainer log events land at the drain's own harness step (2, 4, 6), in order"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Unit 43 spec item 4: a maintainer task in flight is always awaited
 // (bounded by the maintainer's own timeout) before any terminal outcome is
 // returned. `SleepingMaintainer` sleeps on its LAST scripted call; the

@@ -1822,6 +1822,18 @@ either a default or a config knob:
   step 4 with no edit; the empty-plan refusal has no repeat rule the
   way item 37 gave the open-step one.
 
+  Build 26, Qwen json (items 40 and 42 in): 15 of 16 as on builds 23
+  and 24, median 16.5 steps, 104 s a run against 112. Tool errors
+  doubled, 31 against 14, spread across kinds (`old text occurs 2
+  times` appeared four times where it had not appeared before; the
+  description now tells the model `old` must occur once, and it uses
+  `old` more). The name inference did not fire once: on the short
+  tasks Qwen names its tools. The miss is a first: `recent_summary`
+  over its 1,200-character cap four times in a row, each a rejected
+  step, to the retry-cap park; the rejection names the cap and the
+  model shortened by a hundred characters each time. One run in five
+  batteries, so noted, not an item.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

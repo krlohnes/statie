@@ -421,7 +421,7 @@ moves the metric it was built for. Ordered within each tier.
   and 24.
 
 ### 40. Tool descriptions state their forms and failure texts up front
-- **Status.** Committed (Milestone 47). Measured on `short_fixer_b26` (gemma, with item 42): 15 of 16 at 76 s a run against 16 of 16 at 113 on build 23; five anchor misses in two runs, each recovered with a `think` and a corrected edit; prompt peak up about 800 tokens. Qwen next. Evidence: OpenCode's `default.txt` prompt (what
+- **Status.** Committed (Milestone 47). Measured on `short_fixer_b26` (gemma, with item 42): 15 of 16 at 76 s a run against 16 of 16 at 113 on build 23; five anchor misses in two runs, each recovered with a `think` and a corrected edit; prompt peak up about 800 tokens. `qwen_json_short_b26`: 15 of 16 as before at 104 s against 112, tool errors 31 against 14 spread across kinds. Landing unchanged on both models; time down on both; kept. Evidence: OpenCode's `default.txt` prompt (what
   it sends to Ollama models; no Qwen or gemma tuning) and its 231-word
   edit tool description state the exact-match rule and its failure
   texts before the first call; statie's `edit_file` description is one

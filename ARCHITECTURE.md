@@ -2164,3 +2164,24 @@ Tests: `core/tests/it/maintainer.rs` (the maintainer is called after
 a harness `Continue` step), `skills/tests/it/recovery.rs` (it still
 runs after a skipped read).
 
+## Milestone 53: the maintainer's overlap is a config knob (BACKLOG.md item 48)
+
+`MaintainerConfig.overlap` (`cli/src/config.rs`, serde default `true`)
+reaches the session as `Session::with_maintainer_overlap(bool)`. When
+false, the session drains the maintainer immediately after spawning
+it, through the same `spawn_maintainer`/`drain_pending_maintainer`
+path, so the next prompt carries this step's notes: the synchronous
+behaviour of builds through 26 with no second implementation.
+`statie.example.json` documents the knob. `bench/configs/arm_harness_max.json`
+(gemma) sets it false; the Qwen configs keep the default.
+
+Why: D24 and D29. The overlap is worth a third of Qwen's wall clock at
+unchanged landing and cost gemma two to four runs on every overlapped
+build (16, 15 synchronous; 12, 13 overlapped), its losses refusal
+walks in which guidance one step late lets the walk reach the cap.
+
+Tests: `core/tests/it/maintainer.rs` (overlap off: step 2's prompt
+carries step 1's notes, exact, and `notes_step` is 1 after step 1;
+overlap on: the five-step staleness test unchanged), `cli` config
+tests (the default and parsing `false`).
+

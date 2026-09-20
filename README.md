@@ -111,6 +111,7 @@ statie would actually use and where it came from.
 | `working_set.recent_calls` | integer | `6` | How many recent steps get a one-line `tool args -> result` entry at the top of the working set. |
 | `maintainer` | object or absent | absent | Context maintenance (spec section 9). When present, a second model call runs after every committed step and distils that step's reasoning into the harness-owned `notes` field before the reasoning is dropped; it may also propose `next` when the model decided on a mutating call but did not write it. Absent means no maintainer and no behaviour change. |
 | `maintainer.model` | object | the top-level `model` | Same shape as `model`. A smaller model here buys back the extra call's latency; on one GPU the calls are serialized. |
+| `maintainer.overlap` | `true` | run the maintainer's call off the critical path, notes one step stale; `false` waits for it each step (gemma's bench config) |
 | `maintainer.budget` | integer | `400` | Token cap on `notes`; the maintainer is told the cap and retried once if it overruns, then the previous notes are kept. |
 | `maintainer.timeout_secs` | integer | `120` | Per-call timeout; a timeout keeps the previous notes and never blocks the step. |
 | `maintainer.prompt_budget` | integer | `4000` | Cap on the maintainer's own prompt (previous notes, state, commitment, patch, action, reasoning, observation; the last two are head/tail truncated to fit). |

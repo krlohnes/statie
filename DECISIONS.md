@@ -685,3 +685,31 @@ holds the resulting design; this file holds why.
   38 and 39, against 6 of 10 and 53 s. Landing at or above 6 closes
   the gap on landing; time is D25's check.
 
+## D28. "Patch what changed" is reverted; output is not cut by instruction
+
+- **Decision.** Item 41's paragraph is reverted. Output length is not
+  reduced by telling the model to write less state; every build that
+  wrote less state has landed fewer runs (build 22, build 25 on both
+  models). Per-step output is reduced, if at all, by changing what the
+  harness asks for, not by asking for less of it.
+- **Evidence.** Build 25 against builds 23 and 24, same binary
+  otherwise. gemma: completion 168 tokens a step against 214, 86 s a
+  run against 113, 13 of 16 against 16. Qwen: 116 against 166 tokens,
+  135 s against 112, 14 of 16 against 15, with median steps up from 16
+  to 22.5. Two of gemma's three misses are shapes the paragraph could
+  have invited: a `done` on an empty patch, and a skipped test. The
+  unchanged `task` was still resent on 37% of gemma's steps, so the
+  instruction was only partly followed even where it cost landing.
+- **Why revert rather than revise.** Two seeds do not fix the size of
+  either landing move (D22). But three batteries across two models now
+  point the same way, and the prime directive weighs landing over
+  speed. A narrower version (only the plan-entry delta, which is
+  mechanical and cannot lose state) is worth a battery later; it is
+  not this paragraph.
+- **What this leaves.** The step's cost is still output (D25 addendum)
+  and the maintainer (D17 addendum). The levers that do not ask the
+  model to remember less are structural: a smaller patch schema, or a
+  maintainer that runs on fewer steps. Neither is designed yet.
+- **Check.** A future output-length change is kept only if landing on
+  both models is at or above the builds before it.
+

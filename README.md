@@ -1809,6 +1809,7 @@ either a default or a config knob:
   completion 116 tokens a step against 166, median generation
   0.7 s against 1.01. Recorded at the pause; the decision on the
   paragraph is taken on both batteries together when work resumes.
+  Taken: reverted, D28. Both models wrote less and landed less.
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

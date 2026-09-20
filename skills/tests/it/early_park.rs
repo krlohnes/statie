@@ -312,32 +312,35 @@ async fn second_consecutive_empty_ask_user_becomes_think_and_the_run_does_not_pa
 /// Concretely, with the model sending the SAME non-question `ask_user`
 /// message every step and no thinker configured:
 /// - Step 1: first occurrence -- `ask_user_statement_note` converts to
-///   `Action::Continue`; `CONTINUE_REPEAT_CAP`'s streak count is 1.
+///   `Action::Continue`; `CONTINUE_REPEAT_CAP`'s streak count
+///   (`continue_repeat_count`) is 1, `consecutive_continues` is 1.
 /// - Step 2: `consecutive_non_question_asks` is now 1, so
-///   `implement_early_park_thinks` fires and substitutes `think`. Because
-///   the COMMITTED action for that step is `Action::Tool { name: "think",
-///   .. }`, not `Action::Continue`, `core/src/session.rs`'s repeated-note
-///   guard (`if !matches!(action_for_maintainer, Action::Continue { .. })`)
-///   resets the streak count to 0 -- the exact same reset any other real
-///   tool call would cause. This is the intended effect (the whole point
-///   of substituting `think` is to break a stall before the cap fires),
-///   but it also means a run that would have parked on the third identical
-///   `Continue` note now needs three FRESH ones after the substitution.
-/// - Step 3: the "once per streak" gate (`last_think_step` set at step 2,
-///   no `seen` entry recorded since -- `think` itself never adds one)
-///   blocks a second substitution, so this falls through to the ordinary
-///   `ask_user_statement_note` conversion again: `Continue`, streak count
-///   1 (fresh, post-reset).
-/// - Steps 4 and 5: two more identical occurrences bring the streak count
-///   to 2, then 3 -- `CONTINUE_REPEAT_CAP` parks on step 5.
+///   `implement_early_park_thinks` fires and substitutes `think`. Unit 47's
+///   core carve-out (`core/src/session.rs`, 3a) makes a committed `think`
+///   step NEUTRAL for `consecutive_continues`/`continue_repeat_count`/
+///   `non_progress_count` -- unlike before that carve-out existed, none of
+///   the three resets here: all three stay exactly what they were after
+///   step 1.
+/// - Step 3: the "once per streak" gate (`last_think_step` set at step 2)
+///   blocks a second substitution (`implement_early_park_thinks`'s own
+///   `tool_call_since` check, AND unit 47's `refusal_thinks`, which never
+///   even gets a chance to look -- `consecutive_continues` is already 1
+///   going in, not the `== 1` this step would need after a real
+///   `Continue`), so this falls through to the ordinary `ask_user_
+///   statement_note` conversion again: `Continue`, with the SAME note text
+///   as step 1 -- `continue_repeat_count` (preserved through step 2's
+///   think, per the carve-out) advances from 1 to 2, `consecutive_
+///   continues` from 1 to 2.
+/// - Step 4: a third occurrence of the identical note -- `continue_repeat_
+///   count` reaches 3 = `CONTINUE_REPEAT_CAP`, and the run parks.
 ///
-/// So the run still safely reaches the same park it would reach with no
-/// trigger involved at all (a `Park::AskUser` carrying the repeated-note
-/// message) -- nothing hangs, nothing is rejected, no `think` call is ever
-/// left dangling -- it simply costs the one extra `think` step the
-/// substitution always costs (identically to `implement_repeat_failure_
-/// thinks`'s own effect on a repeated-failure streak), landing on the
-/// fifth occurrence of the statement rather than the third.
+/// So the run still safely reaches a park (a `Park::AskUser` carrying the
+/// repeated-note message) -- nothing hangs, nothing is rejected, no
+/// `think` call is ever left dangling -- one step EARLIER than before the
+/// carve-out (step 4 instead of step 5): the think at step 2 no longer
+/// dilutes the identical-note streak the way it used to, so only one more
+/// occurrence of the note (step 3) is needed after it, not three fresh
+/// ones.
 #[tokio::test]
 async fn non_question_asks_with_no_thinker_configured_still_park_eventually() {
     let root = tempfile::tempdir().unwrap();
@@ -393,29 +396,36 @@ async fn non_question_asks_with_no_thinker_configured_still_park_eventually() {
         "step 2: an unconfigured think must not be rejected"
     );
 
-    // Steps 3 through 5: the "once per streak" gate blocks a second
-    // substitution (no tool call landed since step 2's think call), so
-    // these fall through to the ordinary Continue conversion; the third
-    // FRESH occurrence of that identical note (this streak's own third,
-    // post-reset) parks on step 5.
-    let mut last_outcome = outcome2;
-    for step_no in 3..=5 {
-        let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
-        last_outcome = log.append_record(rec).unwrap();
-        if step_no < 5 {
-            assert!(
-                matches!(last_outcome, Outcome::Continue),
-                "step {step_no}: got {last_outcome:?}"
-            );
-            let (name, _args) = last_action(&log);
-            assert_eq!(
-                name, "continue",
-                "step {step_no}: once-per-streak must block a second think substitution"
-            );
-        }
-    }
+    // Step 3: the "once per streak" gate blocks a second substitution (no
+    // tool call landed since step 2's think call), so this falls through to
+    // the ordinary Continue conversion -- a plain `continue`, not `think`.
+    // Unit 47's core carve-out (3a) means `continue_repeat_count` was
+    // preserved through step 2's think (1, not reset to 0), so this step
+    // advances it to 2, not back to a fresh 1.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(
+        matches!(outcome3, Outcome::Continue),
+        "step 3: got {outcome3:?}"
+    );
+    let (name3, _args3) = last_action(&log);
+    assert_eq!(
+        name3, "continue",
+        "step 3: once-per-streak must block a second think substitution"
+    );
+    let (state3, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state3.harness.consecutive_continues, 2,
+        "step 3: the carve-out must have preserved consecutive_continues through step 2's think"
+    );
 
-    match last_outcome {
+    // Step 4: a THIRD occurrence of the identical note -- continue_repeat_
+    // count reaches CONTINUE_REPEAT_CAP (3) and the run parks, one step
+    // earlier than before the carve-out existed (step 4, not step 5): the
+    // think at step 2 no longer dilutes the identical-note streak.
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome4 = log.append_record(rec4).unwrap();
+    match outcome4 {
         Outcome::Parked(Park::AskUser(msg)) => {
             assert!(
                 msg.contains("statement of what you will do next"),
@@ -426,7 +436,7 @@ async fn non_question_asks_with_no_thinker_configured_still_park_eventually() {
                 "park message should say it repeated 3 times in a row: {msg}"
             );
         }
-        other => panic!("step 5: expected Parked(AskUser(_)), got {other:?}"),
+        other => panic!("step 4: expected Parked(AskUser(_)), got {other:?}"),
     }
     assert!(!any_rejected(&log));
 }

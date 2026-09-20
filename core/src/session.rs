@@ -2540,9 +2540,24 @@ where
         // read-paging rewrite, above -- have both had their say), unlike
         // `consecutive_non_question_asks` above, which counts the raw
         // pre-`validate` shape. A committed `Action::Continue` extends the
-        // previous streak; any other committed action resets it to 0.
+        // previous streak; any other committed action resets it to 0 --
+        // EXCEPT a `think` step (`is_think_action`, unit 47's carve-out,
+        // 3a), which leaves it exactly as it was: unit 47's refusal-think
+        // substitution (`skills/src/coding/mod.rs`'s `refusal_thinks`)
+        // converts the SECOND consecutive refusal into a `think` call
+        // instead of a `Continue`, and without this carve-out that `think`
+        // step would itself reset `consecutive_continues` to 0, so the
+        // model repeating the SAME refused action a third time would look
+        // like a fresh first refusal rather than the third strike --
+        // exactly the `error/think/error/think` forever bug `is_think_
+        // action`'s own doc describes for `last_tool_error`/`last_skip`,
+        // just for this counter instead. Mirrors `tool_error_repeat_count`/
+        // `continue_repeat_count`/`non_progress_count`'s own `else if
+        // !is_think_action(..)` carve-outs below.
         next_harness.consecutive_continues = if matches!(action, Action::Continue { .. }) {
             cur.harness.consecutive_continues.saturating_add(1)
+        } else if is_think_action(&action) {
+            cur.harness.consecutive_continues
         } else {
             0
         };
@@ -2882,8 +2897,17 @@ where
         // (handled inline in `execute`'s `Action::Continue` arm). The
         // park-and-reset the cap itself triggers also clears the streak
         // (see that arm), so this only ever fires for an ordinary,
-        // non-`Continue` step in between.
-        if !matches!(action_for_maintainer, Action::Continue { .. }) {
+        // non-`Continue` step in between -- EXCEPT a `think` step
+        // (`is_think_action`, unit 47's carve-out, 3a): mirrors `tool_
+        // error_repeat_count`/`skip_repeat_count`'s own `is_think_action`
+        // exemption (see that function's doc) -- unit 47's refusal-think
+        // substitution converts the SECOND consecutive refusal into a
+        // `think` call, and without this carve-out that `think` step would
+        // clear `continue_repeat_count`, so the SAME refused note
+        // recurring a third time would never reach `CONTINUE_REPEAT_CAP`.
+        if !matches!(action_for_maintainer, Action::Continue { .. })
+            && !is_think_action(&action_for_maintainer)
+        {
             self.session.last_continue_note = None;
             self.session.continue_repeat_count = 0;
         }
@@ -3340,6 +3364,17 @@ where
                         NON_PROGRESS_CAP,
                     );
                 }
+            } else if is_think_action(&action_for_maintainer) {
+                // Unit 47's carve-out (3a), mirroring `continue_repeat_
+                // count`/`tool_error_repeat_count`'s own `is_think_action`
+                // exemption above: a `think` step is neither non-progress
+                // itself nor does it clear a non-progress streak already in
+                // progress -- the refusal-think substitution
+                // (`skills/src/coding/mod.rs`'s `refusal_thinks`) converts
+                // the SECOND consecutive refusal into a `think` call, and
+                // without this carve-out that `think` step would clear
+                // `non_progress_count`, resetting the mixed-shape streak
+                // right alongside the identical-note one.
             } else {
                 self.session.non_progress_count = 0;
                 self.session.non_progress_shapes.clear();

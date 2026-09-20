@@ -19,10 +19,10 @@ use tokio_util::sync::CancellationToken;
 
 use statie_core::{
     Action, ApplyFn, Budgets, Capabilities, CommittedState, Event, HarnessState, LogKind,
-    LoggedPatch, Model, ModelError, NullSink, Outcome, Park, ParsedOutput, PatchError,
+    LoggedPatch, MockThinker, Model, ModelError, NullSink, Outcome, Park, ParsedOutput, PatchError,
     PatchStrategy, RawOutput, SandboxRoot, Schema, Session, SessionConfig, SessionLog,
-    SessionLogExt, Skill, SkillSpec, StateStore, StepSink, StoreError, Tool, ToolCtx, ToolSet,
-    Usage, ValidatedStep, Version, validate_default,
+    SessionLogExt, Skill, SkillSpec, StateStore, StepSink, StoreError, ThinkOutput, Tool, ToolCtx,
+    ToolSet, Usage, ValidatedStep, Version, validate_default,
 };
 
 // ---------------------------------------------------------------------
@@ -997,4 +997,214 @@ async fn consecutive_continues_tracks_the_streak_of_committed_continue_actions()
             "consecutive_continues after this commit"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Unit 47's core carve-out (3a, `core/src/session.rs`): a committed
+// `think` tool action is NEUTRAL for `HarnessState.consecutive_continues`,
+// the identical-note `continue_repeat_count` (`CONTINUE_REPEAT_CAP`), and
+// the mixed-shape `non_progress_count` (`NON_PROGRESS_CAP`) -- none of the
+// three is incremented OR reset by a `think` commit, mirroring
+// `is_think_action`'s existing carve-out for `tool_error_repeat_count`/
+// `skip_repeat_count`. Without it, a `skills/src/coding/mod.rs` trigger
+// substituting `think` for the second of a streak of identical `Continue`
+// refusals would make the streak un-completable: `consecutive_continues`
+// and `continue_repeat_count` would both reset to 0 on the `think` step,
+// so no later refusal could ever separately outrun the other back to
+// `CONTINUE_REPEAT_CAP` (proved live against the pre-3a code: a scripted
+// `Continue, think, Continue, Continue, think, Continue, Continue, ...`
+// sequence never parked after 20 steps).
+// ---------------------------------------------------------------------
+
+/// A no-op `Thinker` registration is not needed to exercise `think` here:
+/// `core/src/session.rs` intercepts `Action::Tool { name: "think", .. }`
+/// directly in `execute`, before dispatch to the registered `ToolSet`
+/// (`core/tests/it/think.rs`'s own fixtures use an empty `ToolSet::new()`
+/// for exactly this reason). A `MockThinker` is still attached so the
+/// step commits with a real answer rather than the "not configured"
+/// fallback text -- immaterial to this test (the carve-out is thinker-
+/// agnostic), but keeps the scripted `think` action's own commit ordinary.
+fn think_tool_call(question: &str) -> Value {
+    serde_json::json!({"type": "tool", "name": "think", "args": {"question": question}})
+}
+
+/// `ToggleSkill`'s own `tools()`, widened to also list `"think"` (mirrors
+/// `core/tests/it/think.rs`'s `ThinkingSkill`), so a scripted `think` call
+/// is not rejected for naming a tool outside the active set.
+struct ToggleSkillWithThink;
+
+impl Skill for ToggleSkillWithThink {
+    type Workspace = Workspace;
+    type Patch = MergePatch;
+
+    fn name(&self) -> &str {
+        "toggle"
+    }
+
+    fn spec(&self) -> Arc<SkillSpec> {
+        Arc::new(SkillSpec::new("toggle", "done converts to continue"))
+    }
+
+    fn initial_workspace(&self) -> Workspace {
+        Workspace::default()
+    }
+
+    fn tools(&self) -> Vec<String> {
+        vec!["edit_file".to_string(), "think".to_string()]
+    }
+
+    fn is_terminal(&self, s: &Workspace) -> bool {
+        s.done
+    }
+
+    fn validate(
+        &self,
+        cur: &CommittedState<Workspace>,
+        mut out: ParsedOutput<Workspace>,
+    ) -> Result<ValidatedStep<Workspace>, PatchError> {
+        if matches!(out.action(), Action::Done) {
+            out.set_action(Action::Continue {
+                note: "still open, keep going".to_string(),
+            });
+        }
+        validate_default::<Workspace, MergePatch>(self, cur, out)
+    }
+}
+
+/// The unit 47 brief's own stated trace, driven end to end: `done, think,
+/// done, done` (`Continue, think, Continue, Continue` at the committed-
+/// action level -- the SAME identical-note `Continue` shape
+/// `third_consecutive_identical_continue_note_parks_as_ask_user` above
+/// exercises without a `think` in the middle). Asserts `consecutive_
+/// continues` reads `1, 1, 2, 3` after each commit, exactly (the `think`
+/// step neither advances nor resets it, per the 3a carve-out), and that
+/// the FOURTH step -- the identical note's third occurrence -- parks via
+/// `CONTINUE_REPEAT_CAP`, exactly like the no-think sequence does on its
+/// own third step, just one step later (the `think` step costs one extra
+/// step, exactly as unit 47's own spec states: "the walk terminates one
+/// step later than today, with one question in it").
+#[tokio::test]
+async fn consecutive_continues_is_neutral_across_a_think_step_and_the_streak_still_parks() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(statie_core::MemoryLog::new());
+
+    let question = "which single tool call moves this step forward now?";
+    let answer = "run `test` to show the step is already done";
+
+    let model = ScriptedModel::new(vec![
+        step_output(serde_json::json!({}), serde_json::json!({"type": "done"})),
+        step_output(serde_json::json!({}), think_tool_call(question)),
+        step_output(serde_json::json!({}), serde_json::json!({"type": "done"})),
+        step_output(serde_json::json!({}), serde_json::json!({"type": "done"})),
+    ]);
+
+    let thinker = Arc::new(MockThinker::new(vec![Ok(ThinkOutput::answer(answer))]));
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        model as Arc<dyn Model>,
+        ToolSet::new(),
+        Box::new(statie_core::HeuristicTokenizer),
+        session_config(&root),
+    )
+    .with_thinker(Arc::clone(&thinker) as Arc<dyn statie_core::Thinker>);
+
+    let skill = Arc::new(ToggleSkillWithThink);
+    let mut active = session.activate(skill).await.unwrap();
+
+    assert_eq!(
+        active
+            .session()
+            .state()
+            .await
+            .unwrap()
+            .0
+            .harness
+            .consecutive_continues,
+        0,
+        "a fresh session must read 0"
+    );
+
+    // Step 1: `done` -> Continue, consecutive_continues becomes 1.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome1 = SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+    assert!(
+        matches!(outcome1, Outcome::Continue),
+        "step 1: got {outcome1:?}"
+    );
+    let (state1, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state1.harness.consecutive_continues, 1,
+        "step 1: consecutive_continues after the first Continue"
+    );
+
+    // Step 2: a real `think` tool call -> committed as Action::Tool, not
+    // Action::Continue. The 3a carve-out means consecutive_continues stays
+    // exactly 1 (neither incremented nor reset).
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let rec2_has_tool_output = rec2.entries().iter().any(|e| e.kind == LogKind::ToolOutput);
+    let outcome2 = SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+    assert!(
+        matches!(outcome2, Outcome::Continue),
+        "step 2: got {outcome2:?}"
+    );
+    assert!(
+        rec2_has_tool_output,
+        "step 2: the think call must have executed for real, not been rejected"
+    );
+    let (state2, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state2.harness.consecutive_continues, 1,
+        "step 2: the carve-out must leave consecutive_continues unchanged by a think commit"
+    );
+    assert_eq!(
+        thinker.calls().len(),
+        1,
+        "step 2: the mock thinker must have been called exactly once"
+    );
+    assert_eq!(thinker.calls()[0].question, question);
+
+    // Step 3: `done` again -> Continue, consecutive_continues advances to
+    // 2 (from 1, unaffected by step 2's think) -- NOT reset back to a
+    // fresh 1 the way it would without the carve-out.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = SessionLogExt::append_record(log.as_ref(), rec3).unwrap();
+    assert!(
+        matches!(outcome3, Outcome::Continue),
+        "step 3: got {outcome3:?}"
+    );
+    let (state3, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state3.harness.consecutive_continues, 2,
+        "step 3: consecutive_continues must advance from 1 (preserved through the think), not \
+         reset to a fresh 1"
+    );
+
+    // Step 4: `done` a third time -> the identical note's THIRD occurrence
+    // (steps 1, 3, 4 all carry "still open, keep going") reaches
+    // CONTINUE_REPEAT_CAP and parks as Outcome::Parked(Park::AskUser(_)) --
+    // exactly the same park `third_consecutive_identical_continue_note_
+    // parks_as_ask_user` reaches on its own (think-free) third step, one
+    // step later here because of the think in between.
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome4 = SessionLogExt::append_record(log.as_ref(), rec4).unwrap();
+    match &outcome4 {
+        Outcome::Parked(Park::AskUser(msg)) => {
+            assert!(
+                msg.contains("still open, keep going"),
+                "step 4: park message should contain the repeated note: {msg}"
+            );
+            assert!(
+                msg.contains("3 times in a row"),
+                "step 4: park message should say it repeated 3 times in a row: {msg}"
+            );
+        }
+        other => panic!("step 4: expected Parked(AskUser(_)), got {other:?}"),
+    }
+    let (state4, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state4.harness.consecutive_continues, 3,
+        "step 4: consecutive_continues reads 3 at the park"
+    );
 }

@@ -922,6 +922,149 @@ fn premature_done_repeat_refusal_status_only_entry_drops_plan_key_entirely() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Unit 47: `REFUSAL_QUESTION`'s exact formatting on a single refusal note,
+// and `refusal_thinks`'s substitution called directly (isolating the
+// function the same way the `premature_done_note` unit tests above do --
+// `refusal_thinks` is the caller-agnostic second half of the same
+// mechanism, run right after whichever refusal note function produced the
+// `Action::Continue` it substitutes).
+// ---------------------------------------------------------------------
+
+/// `REFUSAL_QUESTION`'s `{note}` placeholder filled with one refusal note
+/// text, exact -- the brief's own spec text, reproduced verbatim here so a
+/// change to either the template or this test's fill-in breaks a visible
+/// assertion, not just a `contains` check.
+#[test]
+fn refusal_question_formats_one_refusal_note_exactly() {
+    let note = "plan step 1 is still open: the first change. A step is finished by a tool call, \
+                not by marking it done; make the change with edit_file/write_file and run \
+                `test`, or if that step's work is already done, run `test` to show it. `done` \
+                is for a finished plan; your patch was kept.";
+
+    let question = super::REFUSAL_QUESTION.replace("{note}", note);
+
+    let expected = format!(
+        "The harness refused your last two actions for the same reason: {note}. You must not \
+         send that action again. Which single tool call moves this step forward now: `test`, \
+         `read_file` on the step's file, `edit_file`, or, if you are truly blocked, `ask_user` \
+         with a real question? Answer with the exact call."
+    );
+    assert_eq!(question, expected);
+}
+
+/// `refusal_thinks` called directly on a hand-built `Action::Continue` (the
+/// shape any of the refusal note functions leaves `out` in): with
+/// `consecutive_continues == 1` (the second refusal in a row) and no
+/// `think` since, substitutes `Action::Tool { name: "think", args:
+/// {"question": REFUSAL_QUESTION filled} }` and returns
+/// `REFUSAL_THINK_NOTE_PREFIX` plus the refusal note, exact.
+#[test]
+fn refusal_thinks_substitutes_think_with_the_exact_question_and_prefixed_note() {
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_continues = 1;
+    cur.harness.last_think_step = None;
+
+    let refusal_note = "plan step 1 is still open: the first change. No tool has run since                          your last `done`, and plan steps are not marked done without one; the                          status changes in this patch were dropped. Your next action must be a                          tool call: `test`. `done` is for a finished plan.";
+
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+    out.set_action(Action::Continue {
+        note: refusal_note.to_string(),
+    });
+
+    let note =
+        super::refusal_thinks(&cur, &mut out).expect("the second refusal must substitute think");
+
+    let expected_question = super::REFUSAL_QUESTION.replace("{note}", refusal_note);
+    assert!(
+        matches!(
+            out.action(),
+            Action::Tool { name, args }
+                if name == "think" && args == &json!({"question": expected_question})
+        ),
+        "expected a substituted think call with the filled REFUSAL_QUESTION, got {:?}",
+        out.action()
+    );
+    let expected_note = format!("{}{refusal_note}", super::REFUSAL_THINK_NOTE_PREFIX);
+    assert_eq!(
+        note, expected_note,
+        "note must be the prefix plus the refusal note, exact"
+    );
+}
+
+/// `refusal_thinks` does not fire on a FIRST refusal
+/// (`consecutive_continues == 0`): the caller's `Action::Continue` is left
+/// untouched.
+#[test]
+fn refusal_thinks_does_not_fire_on_the_first_refusal() {
+    let cur = committed(CodingWorkspace::default());
+    assert_eq!(cur.harness.consecutive_continues, 0);
+
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+    out.set_action(Action::Continue {
+        note: "still open".to_string(),
+    });
+
+    let note = super::refusal_thinks(&cur, &mut out);
+    assert_eq!(note, None, "the first refusal must not be substituted");
+    assert!(matches!(out.action(), Action::Continue { .. }));
+}
+
+/// "Once per streak": with `consecutive_continues == 1` but `last_think_
+/// step` at or after the current step (a `think` -- this trigger's or any
+/// other -- ran on the immediately preceding committed step), `refusal_
+/// thinks` does not fire again.
+#[test]
+fn refusal_thinks_once_per_streak_does_not_fire_right_after_a_think() {
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_continues = 1;
+    cur.harness.step = 5;
+    cur.harness.last_think_step = Some(4);
+
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+    out.set_action(Action::Continue {
+        note: "still open".to_string(),
+    });
+
+    let note = super::refusal_thinks(&cur, &mut out);
+    assert_eq!(
+        note, None,
+        "once per streak: a think on the immediately preceding step must block a second one"
+    );
+    assert!(matches!(out.action(), Action::Continue { .. }));
+}
+
+/// `refusal_thinks` only fires on `Action::Continue`: a `Done`/`Tool`/
+/// `AskUser` action is left untouched even with `consecutive_continues ==
+/// 1`.
+#[test]
+fn refusal_thinks_ignores_a_non_continue_action() {
+    let mut cur = committed(CodingWorkspace::default());
+    cur.harness.consecutive_continues = 1;
+
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let note = super::refusal_thinks(&cur, &mut out);
+    assert_eq!(note, None);
+    assert!(matches!(out.action(), Action::Done));
+}
+
 /// Fix 4 reproduction (bench battery, live run, thinking on): `implement_
 /// bare_done` should convert a `done` with neither `done: true` nor
 /// `next_skill` into a handoff to review when `green_step` is `Some` and the

@@ -4025,6 +4025,147 @@ fn common_absorb_report(ws: &mut CodingWorkspace, report: Report) -> Result<(), 
     Ok(())
 }
 
+/// The question the harness asks `think` on the model's behalf when the
+/// shared refusal-think substitution (`refusal_thinks`, wired into
+/// `ImplementSkill::validate` and `PlanSkill::validate`, unit 47) fires:
+/// the model has sent the SAME action the harness just refused (a harness
+/// `Action::Continue { note }`) two committed steps in a row
+/// (`HarnessState::consecutive_continues >= 1`) -- `short_fixer_b30` had
+/// five bench runs with three or more consecutive `done`/`ask_user`/
+/// `continue` actions, `b27` five, `b26` three, walking to the
+/// non-progress cap (`CONTINUE_REPEAT_CAP`, three repeats of the identical
+/// `Continue` note) instead of doing the one tool call that would actually
+/// move the step forward. `{note}` is filled from the CURRENT refusal's
+/// own note text (the same one that would otherwise have been sent again
+/// as a plain `Continue`).
+pub const REFUSAL_QUESTION: &str = "The harness refused your last two actions for the same \
+     reason: {note}. You must not send that action again. Which single tool call moves this \
+     step forward now: `test`, `read_file` on the step's file, `edit_file`, or, if you are \
+     truly blocked, `ask_user` with a real question? Answer with the exact call.";
+
+/// The note prefix the shared refusal-think substitution (`refusal_thinks`)
+/// attaches ahead of the refusal note it replaced (unit 47), so the model
+/// sees both the original refusal AND that this is why `think` ran instead
+/// of the refusal repeating a second time. `pub const` (D13) so tests
+/// import the exact text instead of duplicating it.
+pub const REFUSAL_THINK_NOTE_PREFIX: &str = "Second refusal in a row; the harness asked `think`: ";
+
+/// Shared by `ImplementSkill::validate` (after any of `implement_no_green_
+/// runs_test`'s Continue fallback / `premature_done_note` / `ask_user_
+/// empty_note` has decided on a harness `Action::Continue { note }`) and
+/// `PlanSkill::validate` (after its own empty-plan refusal has done the
+/// same): the SECOND committed refusal in a row -- `cur.harness.
+/// consecutive_continues == 1`, meaning the PREVIOUS committed step was
+/// already a harness `Continue` and nothing has substituted since -- is
+/// substituted for `Action::Tool { name: "think", args: {"question":
+/// REFUSAL_QUESTION filled with the current refusal's own note} }` instead
+/// of letting the refusal repeat a second time, the same "second strike a
+/// question, third a park" shape D19 already uses for the skip/error/stall
+/// triggers (`implement_repeated_skip_thinks`/`implement_repeated_error_
+/// thinks`/`implement_stall_thinks`). The patch is left exactly as the
+/// refusal would have kept it (this function runs AFTER the caller has
+/// already set `Action::Continue { note }` and made whatever patch changes
+/// the refusal itself makes, e.g. `premature_done_note` dropping `status:
+/// "done"` plan entries) -- only the action and the note change.
+///
+/// Thinker-agnostic by design, exactly like every other `think`
+/// substitution in this module (`implement_repeated_error_thinks` and
+/// siblings): `Skill::validate` never sees session config (`Session::
+/// thinker` lives on the execution layer, not `HarnessState` or the skill
+/// struct), so this does not and cannot gate on whether a thinker is
+/// actually attached -- `Session::execute_think` already answers an
+/// unconfigured `think` with its own graceful "`think` is not configured:
+/// ... Decide from what you have." fallback (`core/src/session.rs`), the
+/// same fallback every other trigger here already relies on. Does NOT gate
+/// on `thinker.listed` either (`PlanSkill`/`ImplementSkill::listed`):
+/// `listed` only controls whether `think` is advertised in the model's own
+/// tool list, and its own doc says outright that the harness's
+/// substitutions "still construct a `think` action directly" regardless.
+///
+/// Unit 47's core carve-out (`core/src/session.rs`, 3a): a committed
+/// `think` step is NEUTRAL for `HarnessState.consecutive_continues`, the
+/// identical-note `continue_repeat_count` (`CONTINUE_REPEAT_CAP`), and the
+/// mixed-shape `non_progress_count` (`NON_PROGRESS_CAP`) -- none of the
+/// three is incremented OR reset by a `think` commit, mirroring `is_think_
+/// action`'s existing carve-out for `tool_error_repeat_count`/
+/// `skip_repeat_count` (see that function's doc: without it, a model
+/// alternating error/think/error/think never reaches `CONTINUE_REPEAT_CAP`,
+/// since the substituted `think` itself always cleared the streak). This
+/// is WHY the gate below checks `== 1`, not `>= 1`: since a `think` commit
+/// no longer resets `consecutive_continues` back to 0, `cc` only equals 1
+/// on the ONE step right after the first plain refusal (before any
+/// substitution has happened in this episode) -- every later refusal in
+/// the same unbroken streak commits as a plain `Continue` again (see
+/// "once per streak" below) and keeps incrementing `cc` past 1 (2, 3, ...)
+/// on its way to the identical-note cap, so `== 1` naturally fires exactly
+/// once per episode without needing its own persistent "have I already
+/// substituted" flag. A gate of `>= 1` here (spec item 2's original
+/// wording, written before 3a's carve-out existed) would instead fire
+/// AGAIN at every later `cc` value too (2, 3, ...) once the once-per-streak
+/// gate stops blocking it (see below) -- proven live in this worktree to
+/// never terminate (`cc` and `continue_repeat_count` reset in lockstep on
+/// every `think`, so neither one can ever separately outrun the other to
+/// reach `CONTINUE_REPEAT_CAP`): `== 1` is what actually produces the
+/// spec's own stated trace (refusal cc1, refusal->think cc1, refusal cc2,
+/// refusal cc3->park) rather than an infinite think/refusal cycle.
+///
+/// "Once per streak": if the previous committed action was ITSELF this
+/// substituted `think`, this function must not fire again on the very next
+/// refusal, so that refusal falls through to the ordinary `Continue`
+/// conversion and keeps advancing `cc`/`continue_repeat_count` toward
+/// `CONTINUE_REPEAT_CAP`. `cur.harness.last_think_step` is set by
+/// `core/src/session.rs`'s `execute_think` to the COMMITTED step number
+/// of the `think` (`Active::step` hands `execute` the incremented
+/// `next_harness.step`). A configured `think` then commits ONE MORE
+/// version before the next `validate`: the skill's `after_tool` hook
+/// writes the decision into the workspace as a trusted patch
+/// (`apply_after_tool_patch`, `harness.step + 1`), so the next `validate`
+/// reads `cur.harness.step == last_think_step + 1`; an unconfigured
+/// `think` writes no decision and reads `cur.harness.step ==
+/// last_think_step`. Measured end to end in `skills/tests/it/
+/// premature_done.rs` (steps 4 and 6 around a think committed at 5). So
+/// "a `think` ran on the immediately preceding step" is `last_think_step
+/// + 1 >= cur.harness.step`, covering both. The skip/error/stall triggers
+/// compare `last_think_step` against their own event steps, not against
+/// `cur.harness.step`, and are unaffected.
+///
+/// Fires when all of these hold:
+/// - `out.action()` is `Action::Continue { note }` -- the caller has
+///   already converted a refusal.
+/// - `cur.harness.consecutive_continues == 1`.
+/// - `cur.harness.last_think_step` is `None`, or `Some(s)` with `s + 1 <
+///   cur.harness.step` (no `think` on the immediately preceding step).
+///
+/// Effect: replaces the action with `Action::Tool { name: "think", args:
+/// {"question": q} }` where `q` is [`REFUSAL_QUESTION`] with `{note}`
+/// filled from the refusal's own note text, and returns
+/// [`REFUSAL_THINK_NOTE_PREFIX`] plus that same note text as the step's
+/// note. The refusal's action was already `Continue` (never `AskUser`), so
+/// there is no `next_skill` to strip (`strip_next_skill_if_ask_user:
+/// false`), the same as the skip/error/stall triggers.
+fn refusal_thinks(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    let statie_core::Action::Continue { note } = out.action() else {
+        return None;
+    };
+    if cur.harness.consecutive_continues != 1 {
+        return None;
+    }
+    if let Some(think_step) = cur.harness.last_think_step
+        && think_step + 1 >= cur.harness.step
+    {
+        return None;
+    }
+
+    let refusal_note = note.clone();
+    let question = REFUSAL_QUESTION.replace("{note}", &refusal_note);
+    let think_note = format!("{REFUSAL_THINK_NOTE_PREFIX}{refusal_note}");
+
+    Some(substitute_think(out, &question, think_note, false))
+}
+
 /// The router skill: decides which coding skill should run next and does
 /// nothing else. Has no tools -- routing is a pure decision over the
 /// workspace and inbox.
@@ -4724,6 +4865,13 @@ impl Skill for PlanSkill {
                 _ => {}
             }
         }
+        // Unit 47: the second consecutive empty-plan refusal in a row
+        // becomes a `think` instead of repeating the same `Continue` note a
+        // second time -- see `refusal_thinks`'s doc. Run right after the
+        // empty-plan branch above has had its say (the only refusal
+        // `PlanSkill::validate` produces), so `out.action()` is `Continue`
+        // here exactly when that branch just fired.
+        let refusal_think_note = refusal_thinks(cur, &mut out);
         // `done: true` is never `plan`'s to set, with any action (see
         // `plan_done_not_ours_note`'s doc) -- so this runs unconditionally,
         // not just when the action is `done`. Runs AFTER the empty-plan
@@ -4738,6 +4886,7 @@ impl Skill for PlanSkill {
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
         notes.extend(note);
         notes.extend(shell_read_note);
+        notes.extend(refusal_think_note);
         notes.extend(not_ours_note);
         Ok(if notes.is_empty() {
             step
@@ -5209,6 +5358,15 @@ impl Skill for ImplementSkill {
         } else if let Some(note) = premature_done_note(cur, &mut out) {
             out.set_action(statie_core::Action::Continue { note });
         }
+        // Unit 47: the second consecutive refusal in a row (any of
+        // `implement_no_green_runs_test`'s Continue fallback /
+        // `premature_done_note` / `ask_user_empty_note`, all three of
+        // which run above and may have just set `Action::Continue`)
+        // becomes a `think` instead of repeating the same note a second
+        // time -- see `refusal_thinks`'s doc. Run right after the
+        // three-way refusal chain above, so `out.action()` is `Continue`
+        // here exactly when one of those three just fired.
+        let refusal_think_note = refusal_thinks(cur, &mut out);
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
         let notes: Vec<String> = owned_notes
             .into_iter()
@@ -5225,6 +5383,7 @@ impl Skill for ImplementSkill {
             .chain(early_park_think_note)
             .chain(not_ours_note)
             .chain(extra_note)
+            .chain(refusal_think_note)
             .collect();
         Ok(if notes.is_empty() {
             step

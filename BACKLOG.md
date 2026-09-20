@@ -360,7 +360,7 @@ moves the metric it was built for. Ordered within each tier.
   to 16 of 16; Qwen short unchanged.
 
 ### 47. The second consecutive refusal becomes a `think`; the walk ends there
-- **Status.** Proposed. Evidence: runs with three or more consecutive
+- **Status.** Committed (Milestone 54), thinker-agnostic: the substitution does not gate on a configured thinker (an unconfigured `think` answers "decide from what you have", like every other trigger), and a committed `think` is neutral for the three refusal counters so the third strike still parks. Measured next on build 32, gemma short (overlap off), Qwen short and long. Evidence: runs with three or more consecutive
   `done`/`ask_user`/`continue` actions: gemma 1, 2, 3, 5, 5 on builds
   23, 25, 26, 27, 30; three of build 30's four gemma misses and one of
   its two Qwen misses are such walks to the non-progress cap, six

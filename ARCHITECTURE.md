@@ -2185,3 +2185,43 @@ carries step 1's notes, exact, and `notes_step` is 1 after step 1;
 overlap on: the five-step staleness test unchanged), `cli` config
 tests (the default and parsing `false`).
 
+## Milestone 54: the second refusal in a row becomes a `think` (BACKLOG.md item 47)
+
+`refusal_thinks` (`skills/src/coding/mod.rs`) runs in
+`ImplementSkill::validate` after the three refusal producers
+(`implement_no_green_runs_test`'s Continue fallback,
+`premature_done_note`, `ask_user_empty_note`) and in
+`PlanSkill::validate` after the empty-plan refusal. When the action is
+a harness `Continue` and `consecutive_continues == 1`, and no `think`
+ran on the immediately preceding step, it substitutes `think` with
+`REFUSAL_QUESTION` (the refusal's note filled in, asking for the one
+tool call that moves the step) and notes `REFUSAL_THINK_NOTE_PREFIX`
+plus the refusal. The patch is left as the refusal left it.
+
+Core carve-out: a committed `think` is neutral for
+`consecutive_continues`, `continue_repeat_count` and
+`non_progress_count`, neither counted nor clearing them, mirroring
+`is_think_action`'s existing exemption for the error and skip
+counters. Without it the substituted `think` reset the streak and the
+walk became refusal, think, refusal, think forever. With it the trace
+is refusal (1), think (1), refusal (2), refusal (3, park): the walk
+still ends at the existing cap, one step later and with a question in
+it. The gate is `== 1`, not `>= 1`, because after the carve-out the
+count keeps climbing through the streak and `>= 1` would fire on every
+later refusal too.
+
+Step numbering: a configured `think` commits twice, the step and the
+after-tool patch that records the decision, so the next `validate`
+reads the think step one behind; "ran on the immediately preceding
+step" is `last_think_step + 1 >= cur.harness.step`, measured end to
+end in `skills/tests/it/premature_done.rs`.
+
+Tests: `core/tests/it/continue_action.rs` (done, think, done, done
+reads 1, 1, 2, 3 and the fourth step parks at `CONTINUE_REPEAT_CAP`);
+`skills/tests/it/premature_done.rs` (the no-green fallback's second
+refusal is `think` with the exact question and note; `plan`'s two
+empty `ask_user`s; a tool call between two refusals resets the streak;
+the rewritten done, done, done, test trace); `skills/tests/it/
+early_park.rs` (parks at step 4 now, the carve-out keeping the count
+through the think); five unit tests on the trigger's gates.
+

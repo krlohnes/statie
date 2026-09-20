@@ -342,6 +342,26 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 45. Notes over budget are cut to the budget, not dropped
+- **Status.** Proposed. Evidence: the maintainer's notes come back
+  over their 400-token budget and the whole call is discarded
+  (`maintainer_error: notes over budget`, previous notes stand):
+  `qwen_json_short_b26` 51 of 310 calls (16%),
+  `qwen_json_long_b24` 170 of 368 (46%),
+  `short_fixer_b26` (gemma) 7 of 219. Most overshoots are
+  by 3 to 60 tokens; the sweep rows show 55 in 32 runs.
+- **What.** In `drain_pending_maintainer`, notes over budget are cut
+  to the budget at the last sentence boundary that fits (falling
+  back to a token cut), committed, and logged as
+  `maintainer_notes_cut` with `from`/`to` token counts; `next` is kept.
+  Nothing is dropped. The maintainer's prompt keeps stating the budget.
+- **Why.** D17: the maintainer buys landing. A call whose output is
+  2% long is a call thrown away, 1.4 s of the step spent for nothing,
+  and the notes the model reads go one more step stale. Qwen
+  overshoots on a fifth to a third of its calls.
+- **Measure.** `maintainer_error: notes over budget` count on the next
+  Qwen short battery, expected zero; landing and steps against build 26.
+
 ### 44. The prompt fits by evicting from the working set before it fails
 - **Status.** Committed (Milestone 50). Measured next on the Qwen long battery (build 28). Evidence: `qwen_json_long_b26`, five of ten
   runs ended in "step failed: prompt section System over budget:

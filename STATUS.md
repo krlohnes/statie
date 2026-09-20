@@ -1,4 +1,4 @@
-# Status, 2026-09-20
+# Status, 2026-09-20, evening
 
 ## Where the code is
 Main is ahead of the last push (`c191e12`) by items 28 to 35 and 37 to
@@ -7,33 +7,34 @@ Main is ahead of the last push (`c191e12`) by items 28 to 35 and 37 to
 clean. Gate: 16 binaries, 12 to 19 minutes.
 
 ## Committed since the pause
-- Item 41 reverted (D28): output fell a fifth to a third on both
-  models and landing fell on both.
-- Item 43 (Milestone 49): the maintainer runs off the critical path;
-  notes are one step stale; steps that produced nothing new skip it.
-  Unmeasured; build 27 is its battery.
-- Item 44 (Milestone 50): the prompt fits by evicting from the
-  working set before it fails. From build 26's Qwen long battery,
-  where five of ten runs failed a step on the total after item 40
-  added 800 tokens of descriptions. Unmeasured; build 28 is its
-  battery.
+- Item 41 reverted (D28): both models wrote less and landed less.
+- Item 43 (Milestone 49): the maintainer runs off the critical path,
+  notes one step stale. Build 27: Qwen 15 of 16 at 66 s against 104;
+  gemma 12 of 16, its losses refusal walks where the skip rule starved
+  the notes. D29 keeps the overlap, drops the skip.
+- Item 44 (Milestone 50): the prompt fits by eviction before it
+  fails. Build 28, Qwen long: 6 of 10 against 2 of 10, zero over-budget
+  failures, 509 evictions. D27's landing check is met; time is not
+  (261 s a run against OpenCode's 53).
+- Item 45 (Milestone 51): notes over budget are cut, not dropped.
+  Build 29, Qwen short: 16 of 16 at 55 s, the first full Qwen
+  battery; the cut never fired, so the sixteenth run is not its doing.
+- Item 46 (Milestone 52): the skip rule removed. Build 30 measures it
+  on both models.
+- Item 33's 8-window rows at 16k: landing unmoved; default stays
+  4 windows at 6,000; 24k rows not run.
 
-## Build 26 (items 40 and 42)
-- gemma short: 15 of 16 at 76 s a run, the fastest gemma battery;
-  anchor misses now recovered with a think and a corrected edit.
-- Qwen short: 15 of 16 at 104 s, unchanged landing, tool errors
-  doubled across kinds. Item 40 kept.
-- Qwen long: 2 of 10, five of them the over-budget failure (item 44).
-  Item 42's inference never fired: the nameless calls were bare
-  `{path}` or empty, the shapes it leaves alone.
+## Where statie stands against OpenCode
+- Short tasks, 16k: gemma 15 to 16 of 16 (OpenCode 16); Qwen 16 of 16
+  (OpenCode 14). Time: gemma 66 to 76 s a run against 21; Qwen 55 s
+  against 15.
+- Long tasks, Qwen, 16k: 6 of 10 (OpenCode 6 of 10 at a 16k limit,
+  10 of 10 at 32k). Time: 261 s against 53. `refactor_signature` is
+  unlanded by statie with any model.
 
-## Running now, one at a time
-1. Item 33's two 8-window rows at 16k (Qwen short): row 1 done, row 2
-   at 13 of 16.
-2. Build 27: gemma and Qwen short on the off-critical-path maintainer
-   (item 43), against builds 26.
-3. Build 28: Qwen long on items 43 and 44, against build 24's 3 of 10
-   and D27's 6 of 10.
+## Running now
+Build 30: gemma and Qwen short on items 43 to 46 (the maintainer off
+the critical path, not skipped; eviction; the notes cut).
 
 ## Open threads
 - Push is yours.

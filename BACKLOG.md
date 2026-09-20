@@ -342,6 +342,21 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 46. The maintainer is not skipped after a refusal
+- **Status.** Proposed. Evidence: D29; build 27's three gemma losses
+  are refusal walks in which the maintainer was skipped after every
+  refusal (41 `continue` skips), where builds through 26 wrote notes
+  after each one and landed those runs.
+- **What.** Remove item 43's skip rule and its `maintainer_skipped`
+  event: the maintainer is spawned after every committed step that
+  ran it through build 26 (`Continue` outcomes and the two parks), off
+  the critical path as item 43 left it. The `notes_step` field and
+  heading stay.
+- **Why.** D17: the notes buy landing on the trap tasks; D29: the
+  skip took them away exactly during loops. The skip's saving was GPU
+  contention on 18% of calls, not critical-path time.
+- **Measure.** Build 30, gemma and Qwen short, against builds 26 and 27.
+
 ### 45. Notes over budget are cut to the budget, not dropped
 - **Status.** Committed (Milestone 51). Measured next on the Qwen short battery (build 29). Evidence: the maintainer's notes come back
   over their 400-token budget and the whole call is discarded
@@ -383,7 +398,7 @@ moves the metric it was built for. Ordered within each tier.
   battery; landing against build 24's 3 of 10 and D27's 6 of 10.
 
 ### 43. The maintainer runs off the critical path; notes are one step stale
-- **Status.** Committed (Milestone 49). Measured next on the gemma and Qwen short batteries (build 27) against builds 26. Evidence: D17 addendum (the
+- **Status.** Committed (Milestone 49); skip rule removed by item 46 (D29). Build 27 against build 26: Qwen 15 of 16 at 66 s against 104; gemma 12 of 16 at 66 s against 76, the three losses refusal walks where the skip rule starved the notes. Step gap down 0.8 s on both, not 1.3: the two calls share the GPU. Evidence: D17 addendum (the
   maintainer's call is 1.3 s of a 3.25 s step and three runs of
   landing on the gemma short battery); `short_fixer_b23`: 235
   maintainer calls, 42 of them (18%) after a rejection, a refused

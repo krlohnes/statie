@@ -1872,6 +1872,13 @@ either a default or a config knob:
   Qwen half of the battery decides whether the skip rule goes while
   the off-critical-path call stays.
 
+  Build 27, Qwen json: 15 of 16 as on builds 23 to 26, median 14.5
+  steps, 66 s a run against 104 on build 26, median step gap 2.98 s
+  against 3.73. Qwen sends few refusals (7 `continue` skips against
+  gemma's 41), so the skip rule took nothing from it and the
+  off-critical-path call gave it a third of its wall clock back. D29:
+  the call stays off the critical path; the skip rule goes (item 46).
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

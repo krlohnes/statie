@@ -713,3 +713,35 @@ holds the resulting design; this file holds why.
 - **Check.** A future output-length change is kept only if landing on
   both models is at or above the builds before it.
 
+## D29. The maintainer stays off the critical path; it is not skipped
+
+- **Decision.** Item 43's spawn-and-drain stays: the maintainer's call
+  overlaps the next model step and every prompt's notes are at most
+  one step stale. Its skip rule goes (item 46): the maintainer runs
+  after every committed step, refusals included, as it did through
+  build 26.
+- **Evidence (build 27 against build 26).** Qwen short: 15 of 16
+  unchanged, 66 s a run against 104, median step gap 2.98 s against
+  3.73. gemma short: 12 of 16 against 15, 66 s against 76, gap 3.07
+  against 3.85. gemma's three lost runs are refusal walks
+  (`trap_rounding` both seeds, one `rename_across_files`), and on
+  build 27 the maintainer was skipped after every refusal in them (41
+  of gemma's 63 skips were `continue`); through build 26 it wrote
+  notes after each refusal. The maintainer-off arm (D17 addendum)
+  lost the same task the same way. Qwen refuses rarely (7 `continue`
+  skips), lost nothing, and gained a third of its time.
+- **Why split the item.** The two halves have different costs. The
+  overlap costs one step of staleness and measured no landing on
+  Qwen; the skip costs the notes exactly where gemma loops. The step
+  gap fell 0.8 s, not the maintainer's 1.3 s, because the two calls
+  share one GPU; that is the overlap's real price and it is paid
+  either way.
+- **Ruled out.** Reverting item 43 whole: it would give back Qwen's
+  38 s a run for a gemma loss the skip rule explains. Keeping the
+  skip for `rejected` and `skipped_read` only: those are the other
+  two shapes of the same loops; the saving is GPU contention on 18%
+  of calls, not critical-path time.
+- **Check.** Build 30 (skip removed): gemma short at or above 15 of 16
+  with a step gap under build 26's 3.85 s; Qwen short at 15 of 16 with
+  its build-27 time.
+

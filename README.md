@@ -1857,6 +1857,21 @@ either a default or a config knob:
   default stays four windows at 6,000 (D22). The two 24k rows are not
   run: D27 put the long-task work inside 16k.
 
+  Build 27, gemma (item 43 in: the maintainer off the critical path,
+  skipped after steps that produced nothing new): 12 of 16, 66 s a
+  run against 76 on build 26, median step gap 3.07 s against 3.85.
+  The step got 0.8 s shorter, not the maintainer's 1.3 s: the two
+  model calls now share the GPU. Landing lost three runs, and the
+  shape is the maintainer-off arm's: `trap_rounding` on both seeds,
+  each a refusal walk (`done` on an open step, `done` after a failing
+  test, `ask_user` with no question) to the non-progress cap. On this
+  build the maintainer is skipped after every such refusal, 41 of the
+  63 skips, so the notes never move during a walk; on earlier builds
+  it wrote notes after each refusal, which is plausibly what broke
+  those loops (D17: the notes buy landing on the trap tasks). The
+  Qwen half of the battery decides whether the skip rule goes while
+  the off-critical-path call stays.
+
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps
 with zero rejections: router → plan → implement (baseline `test`, one

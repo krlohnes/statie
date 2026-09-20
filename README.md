@@ -1903,6 +1903,19 @@ either a default or a config knob:
   builds 27 and 28's changes. The overshoot itself has all but gone
   since the maintainer moved off the critical path (51, then 4, then
   0), which is unexplained. On landing, statie
+
+  Build 30 (items 43 to 46: the maintainer off the critical path and
+  not skipped, eviction, the notes cut): gemma 13 of 16 at 77 s a run,
+  Qwen 14 of 16 at 62 s. Removing the skip rule did not give gemma its
+  runs back: 16 and 15 on the synchronous builds 23 and 26, 12 and 13
+  on the overlapped builds 27 and 30. All four of gemma's and Qwen's
+  parks here are refusal walks, the same `done` or empty `ask_user`
+  repeated after the same refusal until the non-progress cap; runs
+  with such a walk went 1, 2, 3, 5, 5 across builds 23, 25, 26, 27,
+  30. With the notes one step stale the maintainer's guidance lands
+  one refusal late. Two items follow: the second refusal in a row
+  becomes a `think` (item 47), and the overlap becomes a per-model
+  knob, off for gemma and on for Qwen (item 48, D24).
   with Qwen is now two runs ahead of OpenCode's 14 of 16 on the short
   tasks, at under four times its wall clock.
 

@@ -1983,7 +1983,9 @@ different real tool errors still do not share a streak;
 `is_not_a_tool_rejection` on the three producer texts and two real
 error texts).
 
-## Milestone 46: the coding skills say "patch what changed" (BACKLOG.md item 41)
+## Milestone 46: the coding skills say "patch what changed" (BACKLOG.md item 41), reverted
+
+Reverted in D28: output fell a fifth to a third on both models and landing fell on both (gemma 13 of 16 against 16, Qwen 14 against 15), the same direction as build 22. The paragraph and the two bullet changes are gone; the specs read as before Milestone 46.
 
 `PATCH_WHAT_CHANGED` (`skills/src/coding/mod.rs`, exported) is one
 paragraph appended to the instructions of all four coding skills after

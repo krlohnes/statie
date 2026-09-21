@@ -433,7 +433,7 @@ async fn review_approval_with_next_skill_and_no_tool_call_runs_test_and_drops_ne
 }
 
 // ---------------------------------------------------------------------
-// Four approvals in a row with no prior tool call and no project test
+// Five approvals in a row with no prior tool call and no project test
 // command to auto-detect: the first is caught by
 // `review_blind_approval_runs_test` and substitutes a `test` call, which
 // fails (no command detected in this bare sandbox) without setting
@@ -441,18 +441,30 @@ async fn review_approval_with_next_skill_and_no_tool_call_runs_test_and_drops_ne
 // (its own guard, see that function's doc) and every further identical
 // approval instead falls to `review_no_green_note` (`green_step` is still
 // `None`), converting to `Action::Continue` with the identical
-// no-green-run note. The third occurrence of THAT note hits
-// `CONTINUE_REPEAT_CAP` and parks as `Park::AskUser` instead of looping
-// forever (the live-run failure mode this whole unit fixes -- runs 69/70
+// no-green-run note.
+//
+// Unit 53 wired item 47's `refusal_thinks` into `ReviewSkill::validate`
+// (previously only `implement`/`plan` had it): the SECOND consecutive such
+// refusal (step 3, `consecutive_continues == 1` going in) is now
+// substituted for a `think` call instead of repeating the note a second
+// time -- `is_think_action`'s carve-out (`core/src/session.rs`) leaves
+// `consecutive_continues`/`continue_repeat_count` exactly as they were
+// through that step, and the "once per streak" gate blocks a second
+// substitution right after it, so step 4 falls through to an ordinary
+// repeat `Continue` (the note's second real occurrence) and step 5 is its
+// THIRD real occurrence, hitting `CONTINUE_REPEAT_CAP` and parking as
+// `Park::AskUser` -- one step later than before unit 53, but still well
+// short of the live-run failure mode this whole unit fixes (runs 69/70
 // sent this shape three times running, and runs 45-46 35 times, before the
 // cap existed).
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn four_consecutive_identical_approvals_with_no_tool_call_parks_after_the_substituted_test() {
+async fn five_consecutive_identical_approvals_with_no_tool_call_parks_after_the_substituted_test() {
     let root = tempfile::tempdir().unwrap();
 
     let turns = vec![
+        done_turn(json!({"done": true})),
         done_turn(json!({"done": true})),
         done_turn(json!({"done": true})),
         done_turn(json!({"done": true})),
@@ -480,26 +492,49 @@ async fn four_consecutive_identical_approvals_with_no_tool_call_parks_after_the_
     );
 
     // Step 2: tool_calls >= 1 now, so the blind-approval fix does not fire
-    // again; green_step is None, so review_no_green_note converts instead.
+    // again; green_step is None, so review_no_green_note converts instead
+    // (first refusal, consecutive_continues 0 going in -- refusal_thinks
+    // does not fire yet).
     let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome2 = log.append_record(rec2).unwrap();
     assert!(
         matches!(outcome2, Outcome::Continue),
         "step 2: got {outcome2:?}"
     );
+    let (state2, _v) = active.session().state().await.unwrap();
+    assert_eq!(state2.harness.consecutive_continues, 1);
 
-    // Step 3: identical note again -- second occurrence.
+    // Step 3: second refusal in a row (consecutive_continues == 1 going
+    // in) -> unit 53's `refusal_thinks` substitutes `think` instead of
+    // repeating the note.
     let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome3 = log.append_record(rec3).unwrap();
     assert!(
         matches!(outcome3, Outcome::Continue),
         "step 3: got {outcome3:?}"
     );
+    let entries = log.entries(Some(LogKind::Action), 10_000);
+    let action3 = entries.last().expect("an Action entry must exist");
+    assert_eq!(
+        action3.payload.get("name").and_then(Value::as_str),
+        Some("think"),
+        "step 3 must be substituted for think: {action3:?}"
+    );
 
-    // Step 4: third occurrence of the identical note -> repeat cap parks.
+    // Step 4: "once per streak" blocks a second think substitution right
+    // after the first, so this is the ordinary repeat-refusal Continue --
+    // the note's second real occurrence.
     let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome4 = log.append_record(rec4).unwrap();
-    match outcome4 {
+    assert!(
+        matches!(outcome4, Outcome::Continue),
+        "step 4: got {outcome4:?}"
+    );
+
+    // Step 5: the note's third real occurrence -> repeat cap parks.
+    let rec5 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome5 = log.append_record(rec5).unwrap();
+    match outcome5 {
         Outcome::Parked(Park::AskUser(msg)) => {
             assert!(
                 msg.contains("the most recent test run failed, or none has run in this session"),
@@ -510,7 +545,7 @@ async fn four_consecutive_identical_approvals_with_no_tool_call_parks_after_the_
                 "park message should say it repeated 3 times in a row: {msg}"
             );
         }
-        other => panic!("step 4: expected Parked(AskUser(_)), got {other:?}"),
+        other => panic!("step 5: expected Parked(AskUser(_)), got {other:?}"),
     }
     assert!(!any_rejected(&log));
 

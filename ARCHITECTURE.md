@@ -2319,3 +2319,28 @@ list) and the end-to-end test in `skills/tests/it/infer_tool.rs`,
 whose bare-path case now asserts the read and the file's contents in
 the next prompt instead of the item 29 rejection it asserted before.
 
+## Milestone 59: all-uncited findings are a refusal (BACKLOG.md item 53)
+
+`review_grounded_findings` (`skills/src/coding/mod.rs`) returns
+`Option<(GroundedFindingsCase, String)>`: `PartialDrop` rewrites the
+patch's `findings` to the cited ones and notes the dropped, as before;
+`AllDropped` removes `findings` from the raw patch, keeps the rest,
+and notes `UNGROUNDED_FINDINGS_NOTE_PREFIX` plus the dropped list.
+`ReviewSkill::validate` turns the all-dropped case into a harness
+`Continue` with that note, strips `next_skill` (no findings, no
+send-back), and skips the rest of the conversion chain; the note
+reaches the prompt once, as the refusal's own. Item 47's
+`refusal_thinks` now runs in review too, before the rounds cap, so the
+second all-uncited send-back in a row is a `think` and the third the
+existing cap. Before this the all-dropped case was a rejection: the
+patch discarded and a retry burnt, three times to a `failure` park.
+
+Evidence: build 34 Qwen short, two runs parked as `failure` with the
+crate green; build 32 gemma once. Tests: three unit tests on the
+function's three cases; `skills/tests/it/grounded_findings.rs` (the
+all-uncited send-back commits as `continued` with the exact note,
+`findings` unchanged, the rest of the patch applied; two in a row and
+the second is `think` with `REFUSAL_QUESTION`; an out-of-range line is
+the same refusal); `skills/tests/it/review_looks.rs` (the identical
+approval walk parks one step later, its second refusal now a think).
+

@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 53. All-uncited findings are a refusal, not a rejection
-- **Status.** Proposed. Evidence: build 34 Qwen short, `python_method`
+- **Status.** Committed (Milestone 59). Measured next on build 35. Evidence: build 34 Qwen short, `python_method`
   seed 1 and `rename_across_files` seed 1, each rejected three times
   for findings with no `file:line` citation and parked as `failure`
   with the crate green on disk; build 32 gemma `rename_across_files`

@@ -3956,20 +3956,57 @@ fn finding_is_grounded(ws: &CodingWorkspace, finding: &str) -> bool {
     }
 }
 
+/// Which of the two drop shapes [`review_grounded_findings`] found, paired
+/// with its note so callers can tell them apart without matching on the
+/// note text (unit 53). `PartialDrop` is unchanged from before unit 53:
+/// some, but not all, findings were dropped, and the grounded subset was
+/// kept in the raw patch. `AllDropped` is unit 53's new case: every finding
+/// was dropped, `findings` was removed from the raw patch entirely (the
+/// committed `findings` are left as they were), and the rest of the patch
+/// is kept -- a refusal (`Action::Continue`), not a rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroundedFindingsCase {
+    PartialDrop,
+    AllDropped,
+}
+
+/// The note prefix [`review_grounded_findings`] attaches when EVERY finding
+/// in a send-back was dropped for want of a `file:line` citation (unit 53).
+/// Before unit 53 this case was a rejection (`PatchError::RuleViolation`):
+/// the whole step was discarded and a retry spent, so a model that sends
+/// uncited findings just sends them again next retry with no memory of
+/// having been told why -- build 34 Qwen short parked two runs after three
+/// such rejections each with the crate green on disk; build 32 gemma hit it
+/// twice. Now the send-back commits as a harness `Action::Continue` (the
+/// same shape every other refusal in this module already uses) carrying
+/// this note, with `findings` removed from the raw patch (so nothing
+/// ungrounded lands) and the rest of the patch -- and the previously
+/// committed `findings`, untouched -- kept, so the model sees the reason
+/// and its other work is not thrown away. `pub const` (D13) so tests import
+/// the exact text instead of duplicating it.
+pub const UNGROUNDED_FINDINGS_NOTE_PREFIX: &str = "Every finding was dropped for want of a \
+     file:line citation; none was recorded and the rest of your patch was kept. Name the line \
+     each finding is about, as `path:line: what is wrong`, and send them again. Dropped: ";
+
 /// `review`-only (item 12: grounded review findings; `guards.
 /// grounded_findings`, `core/src/guards.rs`, default on): on a send-back
 /// (the merged workspace's `findings` is non-empty), drops every ungrounded
 /// finding (`finding_is_grounded`) from the raw patch's `findings` array in
-/// place. Returns `Ok(None)` when nothing was dropped (including when
+/// place. Returns `None` when nothing was dropped (including when
 /// `findings` was not sent in this patch at all, or the merged `findings` is
 /// empty -- an approval, not this rule's concern) or when the switch is off.
-/// Returns `Ok(Some(note))` when some (but not all) findings were dropped,
-/// the note naming exactly which ones and why -- the raw patch's `findings`
-/// is rewritten to the grounded subset, in its original order. Returns
-/// `Err(PatchError::RuleViolation(note))` when every finding was dropped:
-/// the send-back is refused outright, the same as any other rule violation
-/// (the step never commits, the model sees the reason and gets a retry) --
-/// unlike a partial drop, there is no grounded subset left to send back with.
+/// Returns `Some((GroundedFindingsCase::PartialDrop, note))` when some (but
+/// not all) findings were dropped, the note naming exactly which ones and
+/// why -- the raw patch's `findings` is rewritten to the grounded subset, in
+/// its original order; the caller leaves the action untouched (still a real
+/// send-back). Returns `Some((GroundedFindingsCase::AllDropped, note))` when
+/// every finding was dropped (unit 53): `findings` is removed from the raw
+/// patch entirely (the previously committed `findings` are left as they
+/// were; the rest of the patch is kept), the note carries
+/// [`UNGROUNDED_FINDINGS_NOTE_PREFIX`] followed by the same quoted,
+/// `; `-joined drop list the partial-drop case uses -- the caller converts
+/// the action to `Action::Continue { note }` (a refusal, not a rejection:
+/// the step commits, nothing is discarded).
 ///
 /// Only inspects/rewrites `findings` when the raw patch actually carries the
 /// key (`out.patch().0.get("findings")`) -- a patch that leaves `findings`
@@ -3991,34 +4028,28 @@ fn finding_is_grounded(ws: &CodingWorkspace, finding: &str) -> bool {
 /// patch) is visible to the check, matching how `review_sendback_note`/
 /// `review_blind_approval_runs_test` already read `merged_workspace` rather
 /// than `cur` alone. A patch that fails to deserialize/apply is left alone
-/// (`Ok(None)`): it falls straight through to `validate_default`, which
-/// reports the real error.
+/// (`None`): it falls straight through to `validate_default`, which reports
+/// the real error.
 fn review_grounded_findings(
     grounded_findings_enabled: bool,
     cur: &CodingWorkspace,
     out: &mut statie_core::ParsedOutput<CodingWorkspace>,
-) -> Result<Option<String>, PatchError> {
+) -> Option<(GroundedFindingsCase, String)> {
     if !grounded_findings_enabled {
-        return Ok(None);
+        return None;
     }
 
-    let Some(sent) = out.patch().0.get("findings") else {
-        return Ok(None);
-    };
-    let Some(sent) = sent.as_array() else {
-        return Ok(None);
-    };
+    let sent = out.patch().0.get("findings")?;
+    let sent = sent.as_array()?;
     let sent: Vec<String> = sent
         .iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     if sent.is_empty() {
-        return Ok(None);
+        return None;
     }
 
-    let Some(merged) = merged_workspace(cur, out) else {
-        return Ok(None);
-    };
+    let merged = merged_workspace(cur, out)?;
 
     let mut grounded = Vec::with_capacity(sent.len());
     let mut dropped = Vec::new();
@@ -4031,16 +4062,22 @@ fn review_grounded_findings(
     }
 
     if dropped.is_empty() {
-        return Ok(None);
+        return None;
     }
 
+    let named: Vec<String> = dropped
+        .iter()
+        .map(|f| format!("\"{}\"", f.chars().take(60).collect::<String>()))
+        .collect();
+
     if grounded.is_empty() {
-        return Err(PatchError::RuleViolation(format!(
-            "Dropped {} finding{} with no file:line citation. Every finding must name the line \
-             it is about.",
-            dropped.len(),
-            if dropped.len() == 1 { "" } else { "s" },
-        )));
+        if let Some(obj) = out.patch_mut().0.as_object_mut() {
+            obj.remove("findings");
+        }
+        return Some((
+            GroundedFindingsCase::AllDropped,
+            format!("{UNGROUNDED_FINDINGS_NOTE_PREFIX}{}.", named.join("; ")),
+        ));
     }
 
     if let Some(obj) = out.patch_mut().0.as_object_mut() {
@@ -4055,17 +4092,16 @@ fn review_grounded_findings(
         );
     }
 
-    let named: Vec<String> = dropped
-        .iter()
-        .map(|f| format!("\"{}\"", f.chars().take(60).collect::<String>()))
-        .collect();
-    Ok(Some(format!(
-        "Dropped {} finding{} with no file:line citation. Every finding must name the line it \
-         is about. Dropped: {}.",
-        dropped.len(),
-        if dropped.len() == 1 { "" } else { "s" },
-        named.join("; "),
-    )))
+    Some((
+        GroundedFindingsCase::PartialDrop,
+        format!(
+            "Dropped {} finding{} with no file:line citation. Every finding must name the line \
+             it is about. Dropped: {}.",
+            dropped.len(),
+            if dropped.len() == 1 { "" } else { "s" },
+            named.join("; "),
+        ),
+    ))
 }
 
 /// Case (b) alone, shared by `plan`/`implement`/`review`: `ask_user` with an
@@ -6150,10 +6186,13 @@ impl Skill for ReviewSkill {
     /// ungrounded finding from whatever `findings` array the raw patch now
     /// carries (whether the model sent it directly or `review_sendback_note`
     /// just normalized it there), attaching a note naming what was dropped
-    /// and why -- or, if every finding was ungrounded, propagating a
-    /// `PatchError::RuleViolation` straight out of `validate` (via `?`) to
-    /// refuse the whole step instead, before any of the further conversions
-    /// run; converts an empty
+    /// and why -- or, if every finding was ungrounded
+    /// (`GroundedFindingsCase::AllDropped`, unit 53), converting the action
+    /// to `Action::Continue { note }` and stripping `next_skill` from the
+    /// raw patch (a send-back with no findings left is not a handoff,
+    /// mirroring `ask_user_empty_note`'s own `next_skill` strip) to refuse
+    /// the whole step as a harness-internal refusal instead of a rejection
+    /// -- the step still commits, unlike before unit 53; converts an empty
     /// `ask_user` into the harness-internal `Action::Continue` instead of
     /// rejecting the step (case (b) of `premature_done_note`'s doc;
     /// `review`'s `done` semantics -- `done: true` only with empty
@@ -6193,9 +6232,29 @@ impl Skill for ReviewSkill {
         let shell_read_note = shell_read_substitution(&mut out);
         write_file_auto_confirm(cur, &mut out);
         let sendback_note = review_sendback_note(self, &cur.agent, &mut out);
-        let grounded_note = review_grounded_findings(self.grounded_findings, &cur.agent, &mut out)?;
+        let grounded = review_grounded_findings(self.grounded_findings, &cur.agent, &mut out);
+        let all_dropped = matches!(grounded, Some((GroundedFindingsCase::AllDropped, _)));
+        // The all-dropped note travels as the refusal's own note (below),
+        // not through the notes chain as well, so it reaches the prompt
+        // once; the partial-drop note has no refusal to ride and stays in
+        // the chain.
+        let mut grounded_note = grounded.map(|(_, note)| note);
+        if all_dropped {
+            // Unit 53: every finding was ungrounded -- refuse the step as a
+            // harness-internal `Continue` (patch, and the previously
+            // committed `findings`, kept) instead of the rejection this
+            // used to be. `next_skill` is stripped: a send-back with no
+            // findings left is not a handoff, the same treatment
+            // `ask_user_empty_note` gives it.
+            if let Some(obj) = out.patch_mut().0.as_object_mut() {
+                obj.remove("next_skill");
+            }
+            out.set_action(statie_core::Action::Continue {
+                note: grounded_note.take().unwrap_or_default(),
+            });
+        }
         let mut blind_approval_note = None;
-        if sendback_note.is_none() {
+        if sendback_note.is_none() && !all_dropped {
             blind_approval_note = review_blind_approval_runs_test(cur, &mut out);
             if blind_approval_note.is_some() {
                 // Action already substituted for a `test` tool call inside
@@ -6211,6 +6270,14 @@ impl Skill for ReviewSkill {
                 out.set_action(statie_core::Action::Continue { note });
             }
         }
+        // Unit 47: the second consecutive refusal in a row (any of the
+        // conversions above, including unit 53's all-dropped-findings
+        // refusal, that just set `Action::Continue`) becomes a `think`
+        // instead of repeating the same note a second time -- see
+        // `refusal_thinks`'s doc. Run right after the refusal chain above,
+        // ahead of the review-rounds cap so a park always sees the true
+        // refusal note rather than a substituted `think`'s.
+        let refusal_think_note = refusal_thinks(cur, &mut out);
         // Unit 49: whatever the chain above leaves behind, if it is still a
         // send-back and `review_rounds` has passed the cap, park it with a
         // question instead of handing off to `implement` yet again. Run
@@ -6225,6 +6292,7 @@ impl Skill for ReviewSkill {
             .chain(sendback_note)
             .chain(grounded_note)
             .chain(blind_approval_note)
+            .chain(refusal_think_note)
             .chain(rounds_cap_note)
             .collect();
         Ok(if notes.is_empty() {

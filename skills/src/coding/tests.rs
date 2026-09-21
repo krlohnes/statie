@@ -9,14 +9,15 @@ use statie_core::{
 use statie_patch::JsonMergePatch;
 
 use super::{
-    CodingWorkspace, Decision, FINDINGS_OPEN_NOTE_PREFIX, FileNote, INFERRED_TOOL_NOTE_PREFIX,
-    ImplementSkill, OPEN_STEP_NOTE_FIRST, OPEN_STEP_NOTE_REPEAT, PlanSkill, PlanStep,
-    REVIEW_ROUNDS_CAP_QUESTION, ReadFileArgs, ReviewSkill, RouterSkill,
-    STEP_READ_ALREADY_NOTE_PREFIX, SeenFile, StepStatus, TestRecord, coding_skills,
-    coding_skills_with_delegates, common_after_tool, count_lines, failing_test_names,
-    finding_is_grounded, first_error_line, has_named_handoff, infer_tool_name, merge_range,
-    parse_edit_header, parse_finding_location, parse_revert_lines, seen_entry,
-    shell_read_as_read_file, write_file_confirmed_by_seen,
+    CodingWorkspace, Decision, FINDINGS_OPEN_NOTE_PREFIX, FileNote, GroundedFindingsCase,
+    INFERRED_TOOL_NOTE_PREFIX, ImplementSkill, OPEN_STEP_NOTE_FIRST, OPEN_STEP_NOTE_REPEAT,
+    PlanSkill, PlanStep, REVIEW_ROUNDS_CAP_QUESTION, ReadFileArgs, ReviewSkill, RouterSkill,
+    STEP_READ_ALREADY_NOTE_PREFIX, SeenFile, StepStatus, TestRecord,
+    UNGROUNDED_FINDINGS_NOTE_PREFIX, coding_skills, coding_skills_with_delegates,
+    common_after_tool, count_lines, failing_test_names, finding_is_grounded, first_error_line,
+    has_named_handoff, infer_tool_name, merge_range, parse_edit_header, parse_finding_location,
+    parse_revert_lines, review_grounded_findings, seen_entry, shell_read_as_read_file,
+    write_file_confirmed_by_seen,
 };
 
 fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
@@ -3307,6 +3308,135 @@ fn finding_is_grounded_prefers_seens_line_count_over_files_when_both_have_the_pa
     };
     assert!(finding_is_grounded(&ws, "src/foo.rs:10 in range"));
     assert!(!finding_is_grounded(&ws, "src/foo.rs:11 past the end"));
+}
+
+// ---------------------------------------------------------------------
+// Unit 53: `review_grounded_findings` -- (a) all findings uncited returns
+// `Some((AllDropped, note))` with the exact prefix and list, `findings`
+// removed from the raw patch, other patch keys kept; (b) one cited, one
+// not, is unchanged (`Some((PartialDrop, note))`, the pre-unit-53 note
+// text); (c) all cited returns `None`.
+// ---------------------------------------------------------------------
+
+/// (a) Every finding in the raw patch is ungrounded (no `path:line`
+/// citation at all): `Some((AllDropped, note))`, the note carrying
+/// [`UNGROUNDED_FINDINGS_NOTE_PREFIX`] followed by the same quoted,
+/// `; `-joined drop list the partial-drop case uses. `findings` is removed
+/// from the raw patch entirely; the other patch key (`recent_summary`) is
+/// kept untouched.
+#[test]
+fn review_grounded_findings_all_uncited_is_all_dropped_with_the_exact_note_and_findings_removed() {
+    let cur = CodingWorkspace::default();
+    let mut out = parsed_output(json!({
+        "patch": {
+            "findings": [
+                "something is wrong somewhere, no idea where",
+                "another vague complaint with no location",
+            ],
+            "recent_summary": "looked at the crate",
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let result = review_grounded_findings(true, &cur, &mut out);
+
+    let expected_note = format!(
+        "{UNGROUNDED_FINDINGS_NOTE_PREFIX}\"something is wrong somewhere, no idea where\"; \
+         \"another vague complaint with no location\"."
+    );
+    assert_eq!(
+        result,
+        Some((GroundedFindingsCase::AllDropped, expected_note)),
+        "expected the all-dropped case with the exact note"
+    );
+
+    let patch_obj = out.patch().0.as_object().expect("patch must be an object");
+    assert!(
+        !patch_obj.contains_key("findings"),
+        "findings must be removed from the raw patch entirely: {patch_obj:?}"
+    );
+    assert_eq!(
+        patch_obj.get("recent_summary").and_then(Value::as_str),
+        Some("looked at the crate"),
+        "the rest of the patch must be kept untouched"
+    );
+}
+
+/// (b) One cited, one not: unchanged from before unit 53 -- the ungrounded
+/// finding is dropped, the grounded one survives in the raw patch's
+/// `findings`, and the case returned is `PartialDrop` with the existing
+/// partial-drop note text.
+#[test]
+fn review_grounded_findings_one_cited_one_not_is_partial_drop_unchanged() {
+    let cur = CodingWorkspace {
+        seen: vec![SeenFile {
+            path: "src/foo.rs".to_string(),
+            lines: 10,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut out = parsed_output(json!({
+        "patch": {
+            "findings": [
+                "src/foo.rs:1 the loop never terminates",
+                "something is wrong somewhere, no idea where",
+            ],
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let result = review_grounded_findings(true, &cur, &mut out);
+
+    let expected_note = "Dropped 1 finding with no file:line citation. Every finding must name \
+                          the line it is about. Dropped: \"something is wrong somewhere, no \
+                          idea where\"."
+        .to_string();
+    assert_eq!(
+        result,
+        Some((GroundedFindingsCase::PartialDrop, expected_note)),
+        "expected the partial-drop case with the pre-unit-53 note text, unchanged"
+    );
+
+    let patch_obj = out.patch().0.as_object().expect("patch must be an object");
+    assert_eq!(
+        patch_obj.get("findings"),
+        Some(&json!(["src/foo.rs:1 the loop never terminates"])),
+        "only the grounded finding must survive in the raw patch"
+    );
+}
+
+/// (c) All findings are grounded: `None`, `findings` in the raw patch
+/// untouched.
+#[test]
+fn review_grounded_findings_all_cited_is_none() {
+    let cur = CodingWorkspace {
+        seen: vec![SeenFile {
+            path: "src/foo.rs".to_string(),
+            lines: 10,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut out = parsed_output(json!({
+        "patch": {
+            "findings": ["src/foo.rs:1 the loop never terminates"],
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let result = review_grounded_findings(true, &cur, &mut out);
+
+    assert_eq!(result, None, "no finding was dropped, so this must be None");
+    let patch_obj = out.patch().0.as_object().expect("patch must be an object");
+    assert_eq!(
+        patch_obj.get("findings"),
+        Some(&json!(["src/foo.rs:1 the loop never terminates"])),
+        "findings must be left exactly as sent"
+    );
 }
 
 #[test]

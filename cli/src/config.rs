@@ -1171,6 +1171,53 @@ mod tests {
         assert_eq!(round_tripped.guards, parsed.guards);
     }
 
+    /// Unit 49 (cap the implement-review round trip): `guards.
+    /// review_rounds_cap` defaults to `3` with an absent `guards` section,
+    /// and picks up a config value the same way every other `Guards` field
+    /// does, with the rest at default.
+    #[test]
+    fn guards_review_rounds_cap_defaults_to_three() {
+        assert_eq!(Guards::default().review_rounds_cap, 3);
+        let parsed: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.guards.review_rounds_cap, 3);
+    }
+
+    #[test]
+    fn guards_review_rounds_cap_parses_with_other_fields_at_default() {
+        let text = serde_json::json!({
+            "guards": {"review_rounds_cap": 5}
+        })
+        .to_string();
+        let parsed: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.guards,
+            Guards {
+                review_rounds_cap: 5,
+                ..Guards::default()
+            }
+        );
+        assert!(parsed.guards.redundant_reads);
+        assert!(parsed.guards.silent_reads);
+        assert!(parsed.guards.read_guard);
+        assert!(parsed.guards.redundant_verify);
+        assert!(
+            !parsed.guards.done_stays_done,
+            "done_stays_done defaults to false, unlike the other rules"
+        );
+        assert!(parsed.guards.commitment_read_cap);
+        assert!(parsed.guards.seen_map);
+        assert!(parsed.guards.decision_field);
+        assert!(parsed.guards.tests_field);
+        assert!(parsed.guards.grounded_findings);
+        assert!(!parsed.guards.situational_rules);
+        assert_eq!(parsed.guards.review_rounds_cap, 5);
+
+        // Round-trips through serialize -> deserialize unchanged.
+        let json = serde_json::to_string(&parsed).unwrap();
+        let round_tripped: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.guards, parsed.guards);
+    }
+
     #[test]
     fn unknown_key_inside_guards_errors() {
         let result: Result<Config, _> =

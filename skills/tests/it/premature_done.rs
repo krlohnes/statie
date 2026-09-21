@@ -34,7 +34,8 @@ use statie_core::{
 use statie_models::{MockModel, MockTurn};
 use statie_skills::{
     CodingWorkspace, ImplementSkill, OPEN_STEP_NOTE_FIRST, OPEN_STEP_NOTE_REPEAT, PlanSkill,
-    REFUSAL_QUESTION, REFUSAL_THINK_NOTE_PREFIX, ReviewSkill, StepStatus,
+    REFUSAL_QUESTION, REFUSAL_THINK_NOTE_PREFIX, ReviewSkill, STEP_READ_ALREADY_NOTE_PREFIX,
+    StepStatus,
 };
 use statie_store::InMemoryStore;
 use statie_tools::{ToolConfig, default_tools};
@@ -1636,4 +1637,176 @@ async fn implement_tool_call_between_two_refusals_resets_the_streak() {
     );
     let (state5, _v) = active.session().state().await.unwrap();
     assert_eq!(state5.harness.consecutive_continues, 1);
+}
+
+// ---------------------------------------------------------------------
+// Unit 50: a redundant read of the open step's own file closes that step
+// instead of refusing the `done` -- end to end, through the real
+// `skipped_redundant` guard (`core/src/session.rs` 7.7/7.8) and
+// `step_read_already_note` (`skills/src/coding/mod.rs`). Fixture style
+// copied from `skills/tests/it/skip_think.rs`'s redundant-read scenario (the
+// same `read_turn`/`last_skip` setup that file uses to exercise the
+// redundant-read guard end to end).
+// ---------------------------------------------------------------------
+
+/// Same shape as `skills/tests/it/skip_think.rs`'s `read_turn`: reads `path`
+/// with an empty patch.
+fn read_turn(path: &str) -> MockTurn {
+    MockTurn::new(
+        json!({
+            "patch": {},
+            "action": {"type": "tool", "name": "read_file", "args": {"path": path}},
+        })
+        .to_string(),
+    )
+}
+
+/// The `## Observation` section's body of the given recorded prompt, same
+/// helper as `skills/tests/it/no_green_runs_test.rs`'s.
+fn observation_body(prompt: &str) -> &str {
+    let idx = prompt
+        .find("## Observation")
+        .expect("prompt should carry an Observation section");
+    let heading = "## Observation\n";
+    prompt[idx..]
+        .strip_prefix(heading)
+        .expect("Observation section should start with its heading")
+}
+
+/// The exact note `implement_no_green_runs_test` attaches when it
+/// substitutes a real `test` call for a `done` sent with no passing run
+/// (`skills/src/coding/mod.rs`), same constant as
+/// `skills/tests/it/no_green_runs_test.rs`'s `RUNS_TEST_NOTE`.
+const RUNS_TEST_NOTE: &str = "you sent `done` without a passing test run, so the harness ran \
+                               the tests for you (below). If they pass, send `done` again; if \
+                               they fail, fix what they report first.";
+
+#[tokio::test]
+async fn redundant_read_of_open_steps_file_closes_it_then_no_green_runs_test_handles_done() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/tax.rs"), "fn round() {}\n").unwrap();
+
+    let turns = vec![
+        // Step 1: seed the plan with the open step naming `src/tax.rs`.
+        MockTurn::new(
+            json!({
+                "patch": {
+                    "plan": [{
+                        "id": 2,
+                        "text": "examine `src/tax.rs` to understand the rounding logic",
+                        "status": "pending",
+                    }],
+                },
+                "action": {"type": "ask_user", "message": "confirm?"},
+            })
+            .to_string(),
+        ),
+        // Step 2: ordinary first read of src/tax.rs.
+        read_turn("src/tax.rs"),
+        // Step 3: identical repeat -- core's 7.7/7.8 guard skips it outright
+        // (the file is one line), setting `harness.last_skip`.
+        read_turn("src/tax.rs"),
+        // Step 4: `done` with the step still open and no green run at all.
+        MockTurn::new(json!({"patch": {}, "action": {"type": "done"}}).to_string()),
+        // Step 5: filler so the substituted call's own observation prompt
+        // can be captured.
+        MockTurn::new(json!({"patch": {}, "action": {"type": "yield"}}).to_string()),
+    ];
+    let model = Arc::new(MockModel::new(turns));
+    let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
+
+    let skill: Arc<ImplementSkill> = Arc::new(ImplementSkill::new());
+    let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
+
+    // Step 1: seed the plan.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome1 = log.append_record(rec1).unwrap();
+    assert!(matches!(outcome1, Outcome::Parked(Park::AskUser(_))));
+
+    // Step 2: ordinary first read -- no skip yet.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec2).unwrap();
+    let (state2, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state2.harness.last_skip, None,
+        "the first read must not set last_skip"
+    );
+
+    // Step 3: identical repeat -- skipped as redundant, last_skip set for
+    // src/tax.rs.
+    let rec3 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome3 = log.append_record(rec3).unwrap();
+    assert!(matches!(outcome3, Outcome::Continue), "got {outcome3:?}");
+    let (state3, _v) = active.session().state().await.unwrap();
+    let skip = state3
+        .harness
+        .last_skip
+        .clone()
+        .expect("the identical repeat must set harness.last_skip");
+    assert_eq!(skip.tool, "read_file");
+    assert_eq!(
+        state3.harness.last_test_cmd, None,
+        "no test has run at all -- the no-green-runs-test shape this test needs"
+    );
+
+    // Step 4: `done` with the step still open -- `step_read_already_note`
+    // closes the step (the note lands on the substituted test call's
+    // observation, not a `continued` entry -- see below); since no test has
+    // ever run, `implement_no_green_runs_test` then substitutes a real
+    // `test` call for the (now step-closed) `done`, so the committed action
+    // is a real `Tool` call, never the harness-internal `Continue`.
+    let rec4 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let outcome4 = log.append_record(rec4).unwrap();
+    assert!(
+        matches!(outcome4, Outcome::Continue),
+        "got {outcome4:?}; the ordinary tool-call outcome is still `Continue` at the `Outcome` \
+         level"
+    );
+    assert!(!any_rejected(&log), "must not have been rejected");
+
+    let (name4, args4) = last_action(&log);
+    assert_eq!(
+        name4, "test",
+        "implement_no_green_runs_test must have substituted a real test call for the done"
+    );
+    assert_eq!(args4, json!({}), "no last_test_cmd -- auto-detect args");
+
+    let (state4, _v) = active.session().state().await.unwrap();
+    assert_eq!(
+        state4.harness.consecutive_continues, 0,
+        "a real tool call (the substituted test) is not the harness-internal Continue, so the \
+         streak must stay at 0"
+    );
+    let plan: Vec<(u32, StepStatus)> = state4.agent.plan.iter().map(|s| (s.id, s.status)).collect();
+    assert_eq!(
+        plan,
+        vec![(2, StepStatus::Done)],
+        "step 2 must have been marked done by step_read_already_note: {plan:?}"
+    );
+
+    // The exact note lands in the NEXT prompt's Observation section,
+    // alongside implement_no_green_runs_test's own note -- both notes are
+    // attached to the same substituted tool call.
+    let rec5 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    let _ = log.append_record(rec5).unwrap();
+    let prompts = model.prompts();
+    let last = prompts.last().expect("a prompt must have been recorded");
+    let body = observation_body(&last.user);
+
+    let expected_prefix = STEP_READ_ALREADY_NOTE_PREFIX
+        .replace("{id}", "2")
+        .replace("{path}", "src/tax.rs");
+    let expected_note =
+        format!("{expected_prefix}examine `src/tax.rs` to understand the rounding logic");
+    assert!(
+        body.contains(&expected_note),
+        "the substituted test's observation must carry the exact step_read_already_note text: \
+         {body}"
+    );
+    assert!(
+        body.contains(RUNS_TEST_NOTE),
+        "the substituted test's observation must also carry implement_no_green_runs_test's own \
+         note: {body}"
+    );
 }

@@ -133,6 +133,14 @@ pub struct CodingWorkspace {
     /// it.
     #[serde(default)]
     pub tests: Option<TestRecord>,
+    /// Unit 49 (cap the implement-review round trip): the number of times
+    /// `review` has been activated, kept by the harness -- you cannot patch
+    /// it. Incremented by one on every `review` activation
+    /// (`ReviewSkill::on_activate`); the first activation is round 1. Once
+    /// it passes `guards.review_rounds_cap`, a send-back is parked with a
+    /// question instead of handing off to `implement` again.
+    #[serde(default)]
+    pub review_rounds: u32,
 }
 
 /// One entry of `CodingWorkspace::seen` (milestone 10): what the harness
@@ -347,9 +355,12 @@ fn common_commitment(ws: &CodingWorkspace) -> Option<Commitment> {
 /// after_tool` after a `read_file`/`edit_file`/`write_file`/`revert_file`
 /// call), `decision` (written by `Skill::after_tool` from a `think`
 /// call's output, cleared on a passing `test`; see `common_after_tool`),
-/// and `tests` (BACKLOG.md item 5, written by `Skill::after_tool` on every
-/// successful `test` call) are never model-patchable. Checked uniformly by
-/// `validate_default` against every action.
+/// `tests` (BACKLOG.md item 5, written by `Skill::after_tool` on every
+/// successful `test` call), and `review_rounds` (unit 49, written only by
+/// `ReviewSkill::on_activate`; listed here rather than kept `review`-only so
+/// the model can never patch it regardless of which skill is active) are
+/// never model-patchable. Checked uniformly by `validate_default` against
+/// every action.
 fn common_harness_owned_fields() -> Vec<String> {
     vec![
         "notes".to_string(),
@@ -357,6 +368,7 @@ fn common_harness_owned_fields() -> Vec<String> {
         "seen".to_string(),
         "decision".to_string(),
         "tests".to_string(),
+        "review_rounds".to_string(),
     ]
 }
 
@@ -2670,6 +2682,138 @@ fn has_named_handoff(
     }
 }
 
+/// Unit 50: the prefix of [`step_read_already_note`]'s returned note, with
+/// `{id}` and `{path}` filled in before the FIRST open step's own `text` is
+/// appended verbatim. `pub`: `skills/tests/it/premature_done.rs` imports
+/// the exact text instead of duplicating it (D13).
+pub const STEP_READ_ALREADY_NOTE_PREFIX: &str = "step {id} only asked to read {path}, which is \
+     already in your working set; the harness marked it done: ";
+
+/// Unit 50: a `done` action (regardless of `next_skill`) whose merged plan
+/// has an open step (`pending`/`in_progress`) whose `text` names a path the
+/// harness has ALREADY refused to re-read as redundant this activation
+/// (`HarnessState::last_skip`, `core/src/version.rs`) is not, in fact,
+/// premature -- the step asked for nothing but a read the harness already
+/// satisfied from the working set, so there is no real tool call left to
+/// run for it. Rather than refuse the `done` the way
+/// [`premature_done_note`]'s case (a) otherwise would, this closes the step
+/// itself: the raw patch is rewritten so that step's `status` is `"done"`
+/// (merged with the model's own entry for that id if it sent one -- any
+/// other field it set is kept, only `status` is forced), and the action is
+/// left exactly as the caller passed it (`Done`, never converted to the
+/// harness-internal `Continue`) so the rewritten patch falls straight
+/// through to whichever of `green_done_note`/`implement_bare_done`/
+/// `implement_no_green_runs_test`/`premature_done_note`'s own ordinary
+/// case (a) applies to the plan with that step now closed -- if a later
+/// step is also open, the normal rules still apply to IT on this or a
+/// future `done`.
+///
+/// Called twice in practice: first, unconditionally, at the top of
+/// `ImplementSkill::validate`'s chain (mirroring where `green_done_note`
+/// runs), so every later check in that chain sees the rewritten patch;
+/// second, from the top of [`premature_done_note`] itself, so a direct call
+/// into that function -- the shape `skills/src/coding/tests.rs`'s unit
+/// tests use -- exhibits the identical behaviour without going through the
+/// wiring. In the wired path the second call is a harmless no-op: by the
+/// time `premature_done_note` runs (last in the chain), the target step is
+/// already closed if this fired earlier, so the FIRST open step it would
+/// find (if any) is a different one this function's own match check no
+/// longer applies to.
+///
+/// Fires only when ALL of these hold:
+/// - `out.action()` is `Action::Done`.
+/// - The merged workspace is not itself terminal (`done: true`) and has at
+///   least one `pending`/`in_progress` step -- the same top-level gate
+///   `premature_done_note`'s case (a) uses. The step checked is the FIRST
+///   such step in plan order, the same one `OPEN_STEP_NOTE_FIRST` would
+///   name.
+/// - `cur.harness.last_skip` is `Some(skip)` with `skip.tool == "read_file"`.
+/// - `skip`'s own path (recovered from `skip.key`, `core/src/session.rs`'s
+///   `read_call_key` -- `"{tool} {args}"` with `args`'s compact JSON, so the
+///   path is `args.path`) appears verbatim as a substring of that first open
+///   step's `text`.
+///
+/// A patch that fails to deserialize/apply, or whose raw `plan` is present
+/// but not an array of objects, is left alone (`None`): it falls straight
+/// through to `premature_done_note`'s own checks, which report the real
+/// error via `validate_default` if nothing else claims the step first.
+fn step_read_already_note(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    if !matches!(out.action(), statie_core::Action::Done) {
+        return None;
+    }
+    let skip = cur.harness.last_skip.as_ref()?;
+    if skip.tool != "read_file" {
+        return None;
+    }
+    let path = skip_read_path(skip)?;
+
+    let merged = merged_workspace(&cur.agent, out)?;
+    if merged.done {
+        return None;
+    }
+    let open = merged
+        .plan
+        .iter()
+        .find(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))?;
+    if !open.text.contains(path.as_str()) {
+        return None;
+    }
+    let id = open.id;
+    let text = open.text.clone();
+
+    let obj = out.patch_mut().0.as_object_mut()?;
+    let plan_entry = obj
+        .entry("plan")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let serde_json::Value::Array(plan_entries) = plan_entry else {
+        // The model sent a non-array `plan` (malformed) -- leave it to
+        // `premature_done_note`/`validate_default` to report the real
+        // error.
+        return None;
+    };
+    if let Some(existing) = plan_entries.iter_mut().find(|e: &&mut serde_json::Value| {
+        e.get("id").and_then(serde_json::Value::as_u64) == Some(u64::from(id))
+    }) {
+        if let serde_json::Value::Object(map) = existing {
+            map.insert(
+                "status".to_string(),
+                serde_json::Value::String("done".to_string()),
+            );
+        } else {
+            return None;
+        }
+    } else {
+        plan_entries.push(serde_json::json!({"id": id, "status": "done"}));
+    }
+
+    let prefix = STEP_READ_ALREADY_NOTE_PREFIX
+        .replace("{id}", &id.to_string())
+        .replace("{path}", &path);
+    Some(format!("{prefix}{text}"))
+}
+
+/// Recovers the path a skipped `read_file` call named from
+/// `SkippedRead::key` (`core/src/version.rs`), which
+/// `core/src/session.rs`'s `read_call_key` builds as `"{tool} {args}"` with
+/// `args` as compact JSON -- e.g. `read_file {"path":"src/tax.rs"}`. Strips
+/// the `"{tool} "` prefix (using `skip.tool` itself, so this only ever
+/// matches a key this exact `SkippedRead` produced) and parses the
+/// remainder as JSON to pull out its `path` field. `None` if the prefix
+/// doesn't match, the remainder isn't valid JSON, or it has no string
+/// `path` -- a key from a tool with no `path` argument (e.g. `search`),
+/// which [`step_read_already_note`]'s own `skip.tool == "read_file"` check
+/// already rules out in practice.
+fn skip_read_path(skip: &statie_core::SkippedRead) -> Option<String> {
+    let json_part = skip.key.strip_prefix(&format!("{} ", skip.tool))?;
+    let args: serde_json::Value = serde_json::from_str(json_part).ok()?;
+    args.get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 /// The harness has learned that rejecting a step throws away the state
 /// progress in its patch and burns one of three retries, and that a small
 /// local model then flails: `done`/`ask_user` sent in a shape that can
@@ -2740,11 +2884,37 @@ fn has_named_handoff(
 ///   the merge is then recomputed on the dropped patch to find the first
 ///   still-open step, and [`OPEN_STEP_NOTE_REPEAT`] names it, demanding a
 ///   real tool call next.
+///
+/// Case (a) also has a pre-check, run BEFORE either shape above decides to
+/// refuse: [`step_read_already_note`]. A build-32 gemma `trap_rounding`
+/// seed-2 run parked at the mixed-shape non-progress cap after six
+/// alternations: `read_file src/tax.rs` skipped as redundant (the file is
+/// already in the working set, `core/src/session.rs` 7.8's guard,
+/// `HarnessState::last_skip = Some(SkippedRead{..})`), then `done` on the
+/// open plan step "examine `src/tax.rs` to understand the rounding logic"
+/// refused by this very function -- the only tool call the step names is
+/// the one the harness just refused to re-run, so marking the step done was
+/// refused too, and each shape kept resetting the other's streak, so
+/// neither second-strike `think` trigger ever fired either. See
+/// `step_read_already_note`'s own doc for the fix.
 fn premature_done_note(
     cur: &CommittedState<CodingWorkspace>,
     out: &mut statie_core::ParsedOutput<CodingWorkspace>,
 ) -> Option<String> {
     if matches!(out.action(), statie_core::Action::Done) {
+        // Unit 50: BEFORE deciding to refuse, check whether the FIRST open
+        // step is asking for nothing but a re-read the harness already
+        // skipped as redundant (`HarnessState::last_skip`) -- if so, the
+        // step is already satisfied by what's in the working set, so mark
+        // it done instead of refusing. See `step_read_already_note`'s doc.
+        // Called here too (not just from `ImplementSkill::validate`'s
+        // wiring) so a direct call into this function -- the shape the unit
+        // tests use -- exhibits the same behaviour; in the wired path the
+        // step is normally already closed by the time this runs (see that
+        // function's doc), so this call is a harmless no-op there.
+        if let Some(note) = step_read_already_note(cur, out) {
+            return Some(note);
+        }
         let merged = merged_workspace(&cur.agent, out)?;
         if !merged.done
             && merged
@@ -3000,6 +3170,68 @@ fn implement_no_green_runs_test(
             .to_string(),
     )
 }
+
+/// Unit 49: build 32 gemma `rename_across_files` seed 2 handed `review`'s
+/// findings back to `implement` 75 times in a row, each time with `implement`
+/// answering with an empty `files` patch and no tool call -- re-activation
+/// keeps `harness.green_step` and zeroes `harness.tool_calls`
+/// (`core/src/session.rs`, `activate`'s `Some((cur, _))` branch), so
+/// `green_done_note` (right below) accepted `implement`'s immediate `done`
+/// and injected `next_skill: review` again with nothing actually fixed.
+///
+/// Called in `ImplementSkill::validate` BEFORE `green_done_note` (and
+/// therefore before the rest of the done chain too). Fires when all of these
+/// hold:
+/// - the action is `done` (any `next_skill`, or none);
+/// - `cur.agent.findings` is non-empty -- review sent work back and it is
+///   still sitting there, unaddressed;
+/// - `cur.harness.tool_calls == 0` -- nothing has been touched (no
+///   `edit_file`/`write_file`/`test`/etc.) since this activation started.
+///
+/// A `done` sent after at least one tool call this activation is NOT this
+/// function's concern (`tool_calls > 0`): the model did something about the
+/// findings, so it falls through to `green_done_note` and the rest of the
+/// chain as usual, whether or not the fix actually addressed them.
+///
+/// Effect: the action becomes `Action::Continue { note }` with
+/// [`FINDINGS_OPEN_NOTE_PREFIX`] followed by `cur.agent.findings` joined
+/// with "; ", then " Fix them with `edit_file` and `test`, or `ask_user` why
+/// they are wrong. Your patch was kept." The raw patch is left exactly as
+/// sent -- unlike `green_done_note`/`premature_done_note`, this function
+/// never rewrites it, since there is nothing here to normalize (the findings
+/// live on `cur.agent`, already committed; whatever the model patched this
+/// step, if anything, commits unchanged).
+///
+/// This produces a harness `Action::Continue`, so `refusal_thinks` (unit 47)
+/// already covers the second strike (substituting `think`) and the ordinary
+/// non-progress caps cover the third (parking); this function does not add
+/// another `think` trigger of its own.
+fn implement_findings_open_note(
+    cur: &CommittedState<CodingWorkspace>,
+    out: &statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    if !matches!(out.action(), statie_core::Action::Done) {
+        return None;
+    }
+    if cur.agent.findings.is_empty() {
+        return None;
+    }
+    if cur.harness.tool_calls != 0 {
+        return None;
+    }
+
+    Some(format!(
+        "{FINDINGS_OPEN_NOTE_PREFIX}{} Fix them with `edit_file` and `test`, or `ask_user` why \
+         they are wrong. Your patch was kept.",
+        cur.agent.findings.join("; ")
+    ))
+}
+
+/// The note prefix [`implement_findings_open_note`] attaches ahead of the
+/// findings themselves. `pub const` (D13) so tests import the exact text
+/// instead of duplicating it.
+pub const FINDINGS_OPEN_NOTE_PREFIX: &str =
+    "review sent this work back and you have not touched it since: ";
 
 /// A live run showed `premature_done_note`'s case (a) steering the model the
 /// wrong way right after verification passed: the target test passed and
@@ -3532,6 +3764,94 @@ fn review_sendback_note(
                 .to_string(),
         )
     }
+}
+
+/// The question the harness asks the user when the round-trip cap
+/// (`review_rounds_cap_note`, unit 49) parks a send-back:
+/// `review_rounds_cap` fills `{n}`; the joined findings fill `{findings}`.
+/// `pub const` (D13) so tests import the exact text instead of duplicating
+/// it.
+pub const REVIEW_ROUNDS_CAP_QUESTION: &str = "review has sent this work back {n} times and \
+     implement did not resolve it. The open findings: {findings}. Decide: accept the work as \
+     is, or say which finding to fix first.";
+
+/// Unit 49 (cap the implement-review round trip): build 32 gemma
+/// `rename_across_files` seed 2 bounced findings back and forth 75 times
+/// with nothing counting the handoffs themselves. `CodingWorkspace::
+/// review_rounds` (harness-owned, written by `ReviewSkill::on_activate`)
+/// counts activations of `review`; this caps how many of those activations
+/// may end in a send-back before the harness parks the step and asks the
+/// user to decide, instead of handing off to `implement` yet again.
+///
+/// Called in `ReviewSkill::validate` AFTER `review_sendback_note` and the
+/// rest of the existing chain (`review_grounded_findings`/
+/// `review_blind_approval_runs_test`/`review_looked_note`/
+/// `review_no_green_note`/`review_filtered_note`/`ask_user_empty_note`) have
+/// had their say, so it sees the FINAL action and patch those conversions
+/// leave behind. Fires when the step, as it stands at that point, is a
+/// send-back:
+/// - action `done` with the merged workspace's `next_skill == "implement"`
+///   (the shape `review_sendback_note`'s case (a) produces, or a plain
+///   model-sent send-back that needed no normalizing at all), or
+/// - the merged workspace's `findings` is non-empty and `done == false`
+///   (covers `review_sendback_note`'s case (b), where the action was
+///   converted to `Done` but `next_skill` may have been left as whatever
+///   the model already had, or any other already-`Done` send-back shape).
+///
+/// and `cur.agent.review_rounds > cap` -- `review_rounds` was already
+/// incremented for THIS activation by `on_activate`, so `review_rounds == 1`
+/// is the first activation's own round; a cap of 3 allows round-trips 1
+/// through 3 to send back normally and parks starting at round 4.
+///
+/// Effect: the action becomes `Action::AskUser { message }` with
+/// [`REVIEW_ROUNDS_CAP_QUESTION`] filled in (`{n}` = `cur.agent.
+/// review_rounds - 1`, the number of send-backs so far; `{findings}` the
+/// merged `findings` joined with "; "), `next_skill` is stripped from the
+/// raw patch (core's own rule 7.5, `core/src/session.rs`, rejects any
+/// non-`done` action whose patch would change the handoff target -- an
+/// `AskUser` park is exactly such an action, so the `next_skill` the
+/// send-back conversion above just set, e.g. `"implement"`, must not reach
+/// the committed patch or the step is rejected instead of parked), and the
+/// returned note records that the cap parked the step with the findings
+/// still attached. `findings`/`done` are left exactly as the send-back
+/// conversion produced them (a park is not an approval, so `done: false`
+/// staying committed is correct either way).
+///
+/// A patch that fails to deserialize/apply is left alone (`None`): it falls
+/// straight through to `validate_default`, which reports the real error.
+fn review_rounds_cap_note(
+    cap: u32,
+    cur: &CommittedState<CodingWorkspace>,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    let merged = merged_workspace(&cur.agent, out)?;
+    // Only a real send-back counts: `done` handing off to `implement`.
+    // `review_sendback_note` has already turned the tool-call-plus-
+    // `next_skill` shape into that `done`. A plain tool call or `ask_user`
+    // with stale findings still in the workspace (they persist across
+    // rounds until review rewrites them) is review doing its job, not a
+    // send-back, and must not be parked.
+    let is_sendback = matches!(out.action(), statie_core::Action::Done)
+        && merged.next_skill.as_deref() == Some("implement");
+    if !is_sendback {
+        return None;
+    }
+    if cur.agent.review_rounds <= cap {
+        return None;
+    }
+
+    let n = cur.agent.review_rounds - 1;
+    let message = REVIEW_ROUNDS_CAP_QUESTION
+        .replace("{n}", &n.to_string())
+        .replace("{findings}", &merged.findings.join("; "));
+    if let Some(obj) = out.patch_mut().0.as_object_mut() {
+        obj.remove("next_skill");
+    }
+    out.set_action(statie_core::Action::AskUser { message });
+
+    Some(format!(
+        "review rounds cap ({cap}) reached: parked with the findings"
+    ))
 }
 
 /// Parses the first `<path>:<digits>` token out of a review finding (item
@@ -4277,6 +4597,10 @@ pub struct ReviewSkill {
     /// affects `spec()`'s doc note and `situational()`'s (empty) return --
     /// see `ReviewSkill::spec`.
     situational: bool,
+    /// `guards.review_rounds_cap` (unit 49: cap the implement-review round
+    /// trip; `core/src/guards.rs`). Set with
+    /// [`ReviewSkill::with_review_rounds_cap`].
+    review_rounds_cap: u32,
 }
 
 impl Default for ReviewSkill {
@@ -4291,6 +4615,7 @@ impl Default for ReviewSkill {
             listed: true,
             grounded_findings: true,
             situational: false,
+            review_rounds_cap: 3,
         }
     }
 }
@@ -5236,7 +5561,16 @@ impl Skill for ImplementSkill {
     /// that function's doc for why this only strips the key and returns a
     /// note, rather than also deciding the action the way `plan`/`router`'s
     /// `done_not_ours_note` does). Every conversion below therefore sees a
-    /// merged workspace exactly as if `done` had never been sent. Then, when
+    /// merged workspace exactly as if `done` had never been sent. Then
+    /// `implement_findings_open_note` (unit 49): a `done` sent while
+    /// `cur.agent.findings` is still non-empty and no tool call has run this
+    /// activation is converted to `Action::Continue` naming the open
+    /// findings, patch untouched -- run BEFORE every conversion below, so an
+    /// unaddressed send-back from `review` never reaches `green_done_note`'s
+    /// or `implement_bare_done`'s handoff (see its doc: build 32 gemma
+    /// `rename_across_files` seed 2 bounced 75 times on exactly this shape).
+    /// When it does not fire (findings empty, or at least one tool call
+    /// already ran this activation), falls through unchanged. Then, when
     /// verification passed as of this activation
     /// (`cur.harness.green_step.is_some()`) and the action is
     /// `done`, `green_done_note` overrides the ordinary premature-done
@@ -5335,8 +5669,22 @@ impl Skill for ImplementSkill {
         // substituted -- the two never both act on the same step.
         let early_park_think_note = implement_early_park_thinks(cur, &mut out);
         let not_ours_note = implement_done_not_ours_strip(&cur.agent, &mut out);
+        // Unit 50: BEFORE any of `green_done_note`/`implement_bare_done`/
+        // `implement_no_green_runs_test`/`premature_done_note` decide how to
+        // handle a `done`, close any open step whose text names nothing but
+        // a read the harness already skipped as redundant -- run first so
+        // every check below sees the rewritten patch (mirrors where
+        // `green_done_note` itself runs: first, unconditional, action left
+        // alone). See `step_read_already_note`'s doc.
+        let redundant_read_note = step_read_already_note(cur, &mut out);
         let mut extra_note = None;
-        if let Some(note) = green_done_note(cur, &mut out) {
+        if let Some(note) = implement_findings_open_note(cur, &out) {
+            // Unit 49: review sent findings back and nothing has touched
+            // them this activation -- park the `done` as a harness `Continue`
+            // before any of the green/bare-done/no-green-test conversions
+            // below get a look, patch untouched.
+            out.set_action(statie_core::Action::Continue { note });
+        } else if let Some(note) = green_done_note(cur, &mut out) {
             // Action stays `Done`: verification already passed, so this is
             // a real handoff, not a harness-internal `Continue`.
             extra_note = Some(note);
@@ -5382,6 +5730,7 @@ impl Skill for ImplementSkill {
             .chain(repeat_think_note)
             .chain(early_park_think_note)
             .chain(not_ours_note)
+            .chain(redundant_read_note)
             .chain(extra_note)
             .chain(refusal_think_note)
             .collect();
@@ -5412,6 +5761,7 @@ impl ReviewSkill {
             listed: true,
             grounded_findings: true,
             situational: false,
+            review_rounds_cap: 3,
         }
     }
 
@@ -5454,6 +5804,17 @@ impl ReviewSkill {
     /// doc note; `situational()` always returns `None` for `review`.
     pub fn with_situational_rules(mut self, enabled: bool) -> Self {
         self.situational = enabled;
+        self
+    }
+
+    /// Sets `guards.review_rounds_cap` (default `3`; `core/src/guards.rs`,
+    /// unit 49: cap the implement-review round trip). Counts activations of
+    /// `review`; the cap allows this many send-backs (non-empty `findings`)
+    /// before a further send-back is parked with
+    /// [`REVIEW_ROUNDS_CAP_QUESTION`] instead of handing off to `implement`
+    /// again.
+    pub fn with_review_rounds_cap(mut self, cap: u32) -> Self {
+        self.review_rounds_cap = cap;
         self
     }
 }
@@ -5538,8 +5899,22 @@ impl Skill for ReviewSkill {
         common_handoff(self.name(), s)
     }
 
+    /// `common_on_activate`'s `next_skill: null` clear, merged with unit
+    /// 49's `review_rounds: ws.review_rounds + 1` -- every activation of
+    /// `review` counts, so the first activation commits `review_rounds: 1`.
+    /// Both patches are `serde_json::Value` objects with disjoint keys
+    /// (`next_skill` vs. `review_rounds`), so merging them is just inserting
+    /// the second key into the first object's map (or building a
+    /// single-key object when `common_on_activate` had nothing to clear).
     fn on_activate(&self, ws: &Self::Workspace) -> Option<Patch> {
-        common_on_activate(ws)
+        let mut patch = common_on_activate(ws).unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = patch.as_object_mut() {
+            obj.insert(
+                "review_rounds".to_string(),
+                serde_json::Value::from(ws.review_rounds + 1),
+            );
+        }
+        Some(patch)
     }
 
     fn rules(
@@ -5682,6 +6057,11 @@ impl Skill for ReviewSkill {
                 out.set_action(statie_core::Action::Continue { note });
             }
         }
+        // Unit 49: whatever the chain above leaves behind, if it is still a
+        // send-back and `review_rounds` has passed the cap, park it with a
+        // question instead of handing off to `implement` yet again. Run
+        // last, after every other conversion has had its say.
+        let rounds_cap_note = review_rounds_cap_note(self.review_rounds_cap, cur, &mut out);
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
         let notes: Vec<String> = owned_notes
             .into_iter()
@@ -5691,6 +6071,7 @@ impl Skill for ReviewSkill {
             .chain(sendback_note)
             .chain(grounded_note)
             .chain(blind_approval_note)
+            .chain(rounds_cap_note)
             .collect();
         Ok(if notes.is_empty() {
             step
@@ -5724,8 +6105,10 @@ pub fn coding_skills() -> Vec<(
 /// worse -- see `plan_rules`'s doc); `seen_map`/`decision_field`/
 /// `tests_field`/`grounded_findings` default to `true` (today's behaviour,
 /// like every other guard -- see `core/src/guards.rs`); `situational_rules`
-/// (unit 26) defaults to `false`, like `guards.situational_rules` itself.
-/// Use `coding_skills_configured` directly to opt any of these back.
+/// (unit 26) defaults to `false`, like `guards.situational_rules` itself;
+/// `review_rounds_cap` (unit 49) defaults to `3`, like `guards.
+/// review_rounds_cap` itself. Use `coding_skills_configured` directly to opt
+/// any of these back.
 #[allow(clippy::type_complexity)]
 pub fn coding_skills_with_delegates(
     delegates: Vec<String>,
@@ -5733,7 +6116,7 @@ pub fn coding_skills_with_delegates(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
 )> {
-    coding_skills_configured(delegates, false, true, true, true, true, true, false)
+    coding_skills_configured(delegates, false, true, true, true, true, true, false, 3)
 }
 
 /// All four coding skills with every knob: `delegates` as in
@@ -5744,12 +6127,15 @@ pub fn coding_skills_with_delegates(
 /// `grounded_findings` = `guards.grounded_findings` (`core/src/guards.rs`,
 /// item 12: grounded review findings, `review`-only); `situational` =
 /// `guards.situational_rules` (`core/src/guards.rs`, unit 26: situational
-/// rules) -- all threaded into `plan`, `implement`, and `review` via
+/// rules); `review_rounds_cap` = `guards.review_rounds_cap` (`core/src/
+/// guards.rs`, unit 49: cap the implement-review round trip, `review`-only)
+/// -- all threaded into `plan`, `implement`, and `review` via
 /// [`PlanSkill::with_done_stays_done`]/[`PlanSkill::state_fields`]/
 /// [`ReviewSkill::with_grounded_findings`]/[`PlanSkill::
-/// with_situational_rules`] and their siblings. `router` is unaffected by
-/// all six: it has no plan-step rules, no tools, and no procedure-graph
-/// text, so nothing in it reads any of them.
+/// with_situational_rules`]/[`ReviewSkill::with_review_rounds_cap`] and
+/// their siblings. `router` is unaffected by all seven: it has no plan-step
+/// rules, no tools, and no procedure-graph text, so nothing in it reads any
+/// of them.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn coding_skills_configured(
@@ -5761,6 +6147,7 @@ pub fn coding_skills_configured(
     grounded_findings: bool,
     listed: bool,
     situational: bool,
+    review_rounds_cap: u32,
 ) -> Vec<(
     String,
     Arc<dyn Skill<Workspace = CodingWorkspace, Patch = JsonMergePatch<CodingWorkspace>>>,
@@ -5795,7 +6182,8 @@ pub fn coding_skills_configured(
                     .state_fields(seen, decision, tests)
                     .with_grounded_findings(grounded_findings)
                     .with_listed(listed)
-                    .with_situational_rules(situational),
+                    .with_situational_rules(situational)
+                    .with_review_rounds_cap(review_rounds_cap),
             ),
         ),
     ]

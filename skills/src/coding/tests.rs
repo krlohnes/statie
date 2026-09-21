@@ -4,17 +4,19 @@ use serde_json::{Value, json};
 
 use statie_core::{
     Action, CommittedState, HarnessState, ParsedOutput, RawOutput, Report, ReportOutcome,
-    ReportStats, Skill, Version,
+    ReportStats, Skill, SkippedRead, Version,
 };
 use statie_patch::JsonMergePatch;
 
 use super::{
-    CodingWorkspace, Decision, FileNote, INFERRED_TOOL_NOTE_PREFIX, ImplementSkill,
-    OPEN_STEP_NOTE_FIRST, OPEN_STEP_NOTE_REPEAT, PlanSkill, PlanStep, ReadFileArgs, ReviewSkill,
-    RouterSkill, SeenFile, StepStatus, TestRecord, coding_skills, coding_skills_with_delegates,
-    common_after_tool, count_lines, failing_test_names, finding_is_grounded, first_error_line,
-    has_named_handoff, infer_tool_name, merge_range, parse_edit_header, parse_finding_location,
-    parse_revert_lines, seen_entry, shell_read_as_read_file, write_file_confirmed_by_seen,
+    CodingWorkspace, Decision, FINDINGS_OPEN_NOTE_PREFIX, FileNote, INFERRED_TOOL_NOTE_PREFIX,
+    ImplementSkill, OPEN_STEP_NOTE_FIRST, OPEN_STEP_NOTE_REPEAT, PlanSkill, PlanStep,
+    REVIEW_ROUNDS_CAP_QUESTION, ReadFileArgs, ReviewSkill, RouterSkill,
+    STEP_READ_ALREADY_NOTE_PREFIX, SeenFile, StepStatus, TestRecord, coding_skills,
+    coding_skills_with_delegates, common_after_tool, count_lines, failing_test_names,
+    finding_is_grounded, first_error_line, has_named_handoff, infer_tool_name, merge_range,
+    parse_edit_header, parse_finding_location, parse_revert_lines, seen_entry,
+    shell_read_as_read_file, write_file_confirmed_by_seen,
 };
 
 fn committed(agent: CodingWorkspace) -> CommittedState<CodingWorkspace> {
@@ -923,6 +925,207 @@ fn premature_done_repeat_refusal_status_only_entry_drops_plan_key_entirely() {
 }
 
 // ---------------------------------------------------------------------
+// Unit 50: `premature_done_note`'s pre-check, `step_read_already_note` --
+// a `done` with an open step whose text names nothing but a path the
+// harness already refused to re-read as redundant (`HarnessState::
+// last_skip`) closes that step instead of refusing.
+// ---------------------------------------------------------------------
+
+/// A `SkippedRead` for a `read_file` call of `path`, with the same `key`
+/// core's own guard would compute (`statie_core::read_call_key`), so the
+/// fixture matches production exactly rather than hand-writing the JSON
+/// shape.
+fn skipped_read(path: &str) -> SkippedRead {
+    SkippedRead {
+        tool: "read_file".to_string(),
+        key: statie_core::read_call_key("read_file", &json!({"path": path})),
+        count: 1,
+        step: 3,
+    }
+}
+
+/// Acceptance (a): plan step 2 open, its text naming `src/tax.rs`;
+/// `last_skip` a `read_file` of that same path; `done` with an empty patch.
+/// The note is exact, the merged plan reads step 2 `done`, and the action
+/// is still `Done` (never converted to `Continue` -- `premature_done_note`
+/// itself never sets the action; only its caller in `ImplementSkill::
+/// validate` does, and this test calls the function directly).
+#[test]
+fn premature_done_redundant_read_of_open_steps_file_marks_it_done() {
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![
+            PlanStep {
+                id: 1,
+                text: "first change".to_string(),
+                status: StepStatus::Done,
+            },
+            PlanStep {
+                id: 2,
+                text: "examine `src/tax.rs` to understand the rounding logic".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+        ..Default::default()
+    });
+    cur.harness.last_skip = Some(skipped_read("src/tax.rs"));
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let note = super::premature_done_note(&cur, &mut out)
+        .expect("a redundant read of the open step's file must convert");
+
+    let expected_prefix = STEP_READ_ALREADY_NOTE_PREFIX
+        .replace("{id}", "2")
+        .replace("{path}", "src/tax.rs");
+    let expected_note =
+        format!("{expected_prefix}examine `src/tax.rs` to understand the rounding logic");
+    assert_eq!(note, expected_note, "note text must match exactly");
+
+    let merged = super::merged_workspace(&cur.agent, &out).expect("patch should merge cleanly");
+    assert_eq!(
+        merged
+            .plan
+            .iter()
+            .map(|s| (s.id, s.status))
+            .collect::<Vec<_>>(),
+        vec![(1, StepStatus::Done), (2, StepStatus::Done)],
+        "step 2 must have been marked done by the rewritten patch: {:?}",
+        merged.plan
+    );
+    assert!(
+        matches!(out.action(), Action::Done),
+        "the action must stay Done, not be converted to Continue: {:?}",
+        out.action()
+    );
+}
+
+/// Acceptance (b): the same open step, but `last_skip` names a DIFFERENT
+/// path than the one the step's text mentions -- the ordinary
+/// `OPEN_STEP_NOTE_FIRST` refusal fires unchanged.
+#[test]
+fn premature_done_redundant_read_of_a_different_path_still_refuses() {
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 2,
+            text: "examine `src/tax.rs` to understand the rounding logic".to_string(),
+            status: StepStatus::Pending,
+        }],
+        ..Default::default()
+    });
+    cur.harness.last_skip = Some(skipped_read("src/other.rs"));
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let note = super::premature_done_note(&cur, &mut out).expect("first refusal should convert");
+
+    let expected_note = OPEN_STEP_NOTE_FIRST.replacen("{}", "2", 1).replacen(
+        "{}",
+        "examine `src/tax.rs` to understand the rounding logic",
+        1,
+    );
+    assert_eq!(
+        note, expected_note,
+        "a skip of a different path must not close the step: unchanged refusal"
+    );
+    let merged = super::merged_workspace(&cur.agent, &out).expect("patch should merge cleanly");
+    assert_eq!(
+        merged.plan.first().map(|s| s.status),
+        Some(StepStatus::Pending),
+        "the step must still be open: {:?}",
+        merged.plan
+    );
+}
+
+/// Acceptance (c): the same open step, but `last_skip == None` (nothing was
+/// ever skipped) -- the ordinary refusal fires unchanged.
+#[test]
+fn premature_done_no_last_skip_still_refuses() {
+    let cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 2,
+            text: "examine `src/tax.rs` to understand the rounding logic".to_string(),
+            status: StepStatus::Pending,
+        }],
+        ..Default::default()
+    });
+    assert_eq!(cur.harness.last_skip, None);
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let note = super::premature_done_note(&cur, &mut out).expect("first refusal should convert");
+
+    let expected_note = OPEN_STEP_NOTE_FIRST.replacen("{}", "2", 1).replacen(
+        "{}",
+        "examine `src/tax.rs` to understand the rounding logic",
+        1,
+    );
+    assert_eq!(
+        note, expected_note,
+        "no last_skip must not close the step: unchanged refusal"
+    );
+}
+
+/// Acceptance (d): the skipped path appears in step 3's text, but step 2 is
+/// the FIRST open step (and its text does not mention that path) -- the
+/// ordinary refusal fires unchanged, naming step 2, not step 3.
+#[test]
+fn premature_done_path_in_a_later_steps_text_does_not_close_the_first_open_step() {
+    let mut cur = committed(CodingWorkspace {
+        plan: vec![
+            PlanStep {
+                id: 2,
+                text: "wire up the CLI flag".to_string(),
+                status: StepStatus::Pending,
+            },
+            PlanStep {
+                id: 3,
+                text: "examine `src/tax.rs` to understand the rounding logic".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+        ..Default::default()
+    });
+    cur.harness.last_skip = Some(skipped_read("src/tax.rs"));
+    let mut out = parsed_output(json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    }));
+
+    let note = super::premature_done_note(&cur, &mut out).expect("first refusal should convert");
+
+    let expected_note =
+        OPEN_STEP_NOTE_FIRST
+            .replacen("{}", "2", 1)
+            .replacen("{}", "wire up the CLI flag", 1);
+    assert_eq!(
+        note, expected_note,
+        "the path matching a LATER step must not close the FIRST open step: unchanged refusal \
+         naming step 2"
+    );
+    let merged = super::merged_workspace(&cur.agent, &out).expect("patch should merge cleanly");
+    assert_eq!(
+        merged
+            .plan
+            .iter()
+            .map(|s| (s.id, s.status))
+            .collect::<Vec<_>>(),
+        vec![(2, StepStatus::Pending), (3, StepStatus::Pending)],
+        "neither step must have been touched: {:?}",
+        merged.plan
+    );
+}
+
+// ---------------------------------------------------------------------
 // Unit 47: `REFUSAL_QUESTION`'s exact formatting on a single refusal note,
 // and `refusal_thinks`'s substitution called directly (isolating the
 // function the same way the `premature_done_note` unit tests above do --
@@ -1131,6 +1334,201 @@ fn implement_bare_done_with_maintainer_next_and_all_steps_marked_done_hands_off_
         Some("review"),
         "implement_bare_done must inject next_skill: review"
     );
+}
+
+// ---------------------------------------------------------------------
+// Unit 49: `implement_findings_open_note` -- a `done` sent with `review`'s
+// findings still open and no tool call this activation is parked as a
+// harness `Continue` instead of handed straight back to `review`.
+// ---------------------------------------------------------------------
+
+/// (a) fires on `done` with non-empty `findings` and `tool_calls == 0`:
+/// exact note, action `Continue`, and the patch commits untouched (the
+/// model sent an empty patch here, so the merged workspace afterward still
+/// carries the same open findings).
+#[test]
+fn implement_findings_open_note_fires_on_bare_done_with_open_findings_and_no_tool_calls() {
+    let skill = ImplementSkill::new();
+    let cur = committed_with_tool_calls(
+        CodingWorkspace {
+            findings: vec!["a.rs:1 duplicated doc-comment line".to_string()],
+            ..Default::default()
+        },
+        0,
+    );
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("must not be rejected");
+    let expected_note = format!(
+        "{FINDINGS_OPEN_NOTE_PREFIX}a.rs:1 duplicated doc-comment line Fix them with \
+         `edit_file` and `test`, or `ask_user` why they are wrong. Your patch was kept."
+    );
+    let (patch, action, _) = step.into_parts();
+    assert!(
+        matches!(action, statie_core::Action::Continue { ref note } if *note == expected_note),
+        "expected Continue with the exact findings-open note, got {action:?}"
+    );
+    assert_eq!(
+        patch.next().findings,
+        vec!["a.rs:1 duplicated doc-comment line".to_string()],
+        "the patch must be left untouched -- findings still carried on the committed workspace"
+    );
+}
+
+/// (b) does not fire once a tool call has run this activation
+/// (`tool_calls == 1`): the `done` falls through to the ordinary chain
+/// instead (here, `implement_bare_done` hands off to review, since the plan
+/// is empty and there is nothing open -- see that test's sibling for the
+/// exact shape). The point under test is only that `implement_findings_
+/// open_note`'s own note never appears.
+#[test]
+fn implement_findings_open_note_does_not_fire_with_one_tool_call_this_activation() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed_with_tool_calls(
+        CodingWorkspace {
+            findings: vec!["a.rs:1 duplicated doc-comment line".to_string()],
+            ..Default::default()
+        },
+        1,
+    );
+    cur.harness.green_step = Some(0);
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("must not be rejected");
+    assert!(
+        !step
+            .notes()
+            .iter()
+            .any(|n| n.starts_with(FINDINGS_OPEN_NOTE_PREFIX)),
+        "the findings-open note must not fire once a tool call has run: {:?}",
+        step.notes()
+    );
+}
+
+/// (c) does not fire with empty `findings`, even with `tool_calls == 0`:
+/// falls through to the ordinary chain (`implement_bare_done` hands off to
+/// review here, plan empty and verification green).
+#[test]
+fn implement_findings_open_note_does_not_fire_with_empty_findings() {
+    let skill = ImplementSkill::new();
+    let mut cur = committed_with_tool_calls(CodingWorkspace::default(), 0);
+    cur.harness.green_step = Some(0);
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("must not be rejected");
+    assert!(
+        !step
+            .notes()
+            .iter()
+            .any(|n| n.starts_with(FINDINGS_OPEN_NOTE_PREFIX)),
+        "the findings-open note must not fire with empty findings: {:?}",
+        step.notes()
+    );
+    assert!(
+        matches!(step.action(), statie_core::Action::Done),
+        "expected the ordinary bare-done handoff to review, got {:?}",
+        step.action()
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unit 49: the review-rounds cap (`review_rounds_cap_note`) -- a hand-built
+// `CommittedState` with `review_rounds` past the cap turns a send-back into
+// `Action::AskUser` with the exact park question; at the cap, it stays a
+// send-back.
+// ---------------------------------------------------------------------
+
+/// A `review` workspace already carrying open findings (as if a prior
+/// activation had already sent them back), with `review_rounds` set
+/// directly (as `on_activate` would have left it committed). `seen` grounds
+/// the `a.rs:1` citation (item 12: grounded review findings, on by default)
+/// so the finding is not itself dropped by that unrelated guard.
+fn review_workspace_with_rounds(review_rounds: u32) -> CodingWorkspace {
+    CodingWorkspace {
+        findings: vec!["a.rs:1 duplicated doc-comment line".to_string()],
+        review_rounds,
+        seen: vec![SeenFile {
+            path: "a.rs".to_string(),
+            lines: 10,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// (d), over cap: `review_rounds == 4`, cap 3 (`ReviewSkill::default()`'s
+/// own default) -- a plain model-sent send-back (`done: false`, `findings`
+/// non-empty, no `next_skill`) is parked as `Action::AskUser` with the exact
+/// question, `{n}` filled with 3 (`review_rounds - 1`, the number of
+/// send-backs so far) and `{findings}` with the joined findings.
+#[test]
+fn review_rounds_cap_over_cap_parks_the_sendback_with_the_exact_question() {
+    let skill = ReviewSkill::new();
+    let cur = committed(review_workspace_with_rounds(4));
+    let content = json!({
+        "patch": {
+            "findings": ["a.rs:1 duplicated doc-comment line"],
+            "done": false,
+            "next_skill": "implement",
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("must not be rejected");
+    let expected_message = REVIEW_ROUNDS_CAP_QUESTION
+        .replace("{n}", "3")
+        .replace("{findings}", "a.rs:1 duplicated doc-comment line");
+    assert!(
+        matches!(
+            step.action(),
+            statie_core::Action::AskUser { message } if *message == expected_message
+        ),
+        "expected AskUser with the exact review-rounds-cap question, got {:?}",
+        step.action()
+    );
+    assert!(
+        step.notes()
+            .iter()
+            .any(|n| n == "review rounds cap (3) reached: parked with the findings"),
+        "expected the exact park note: {:?}",
+        step.notes()
+    );
+}
+
+/// (d), at cap: `review_rounds == 3`, cap 3 -- the same send-back shape
+/// stays a send-back (action `Done`, `next_skill: implement` via
+/// `review_sendback_note`'s own normalizing), not parked.
+#[test]
+fn review_rounds_cap_at_cap_stays_a_sendback() {
+    let skill = ReviewSkill::new();
+    let cur = committed(review_workspace_with_rounds(3));
+    let content = json!({
+        "patch": {
+            "findings": ["a.rs:1 duplicated doc-comment line"],
+            "done": false,
+            "next_skill": "implement",
+        },
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("must not be rejected");
+    assert!(
+        matches!(step.action(), statie_core::Action::Done),
+        "expected the ordinary send-back (Done, handing off to implement), got {:?}",
+        step.action()
+    );
+    let (patch, _action, _) = step.into_parts();
+    assert_eq!(patch.next().next_skill.as_deref(), Some("implement"));
+    assert!(!patch.next().done);
 }
 
 // ---------------------------------------------------------------------

@@ -2225,3 +2225,52 @@ the rewritten done, done, done, test trace); `skills/tests/it/
 early_park.rs` (parks at step 4 now, the carve-out keeping the count
 through the think); five unit tests on the trigger's gates.
 
+## Milestone 55: the implement-review round trip is bounded (BACKLOG.md item 49)
+
+Two rules. `implement_findings_open_note` (`skills/src/coding/mod.rs`)
+runs first in `ImplementSkill::validate`'s done chain: `done` while
+`findings` is non-empty and `harness.tool_calls == 0` (nothing done
+this activation) becomes a harness `Continue` with
+`FINDINGS_OPEN_NOTE_PREFIX` and the findings quoted; the patch is
+kept. Item 47's refusal think covers the second strike. The rule
+exists because re-activation keeps `green_step` and zeroes
+`tool_calls`, so `green_done_note` accepted implement's immediate
+`done` after every hand-back.
+
+`CodingWorkspace.review_rounds` (harness-owned) counts review
+activations: `ReviewSkill::on_activate` writes `review_rounds + 1`
+alongside the `next_skill` clear, so review's activation always
+commits one patch now. `review_rounds_cap_note` runs last in
+`ReviewSkill::validate`: a send-back (`done` with `next_skill:
+implement`, after `review_sendback_note` has normalised the other
+shapes) with `review_rounds > guards.review_rounds_cap` (default 3,
+`core/src/guards.rs`) becomes `AskUser` with
+`REVIEW_ROUNDS_CAP_QUESTION`, the findings filled in and `next_skill`
+stripped from the patch so core's handoff rule accepts it. A tool
+call or `ask_user` by review while stale findings sit in the workspace
+is not a send-back and is never parked.
+
+Evidence: build 32 gemma `rename_across_files` seed 2, 75 round trips,
+188 steps. Tests: five unit tests, `skills/tests/it/review_rounds_cap.rs`
+(the hand-back's immediate `done` is refused with the exact note, an
+edit then hands off; four send-backs park with the exact question),
+`cli` config tests for the knob's default and parsing.
+
+## Milestone 56: a redundant read finishes a read-only plan step (BACKLOG.md item 50)
+
+`step_read_already_note` (`skills/src/coding/mod.rs`) runs before the
+done chain in `ImplementSkill::validate` and at the top of
+`premature_done_note`: on `done`, if `harness.last_skip` is a
+`read_file` whose path appears in the first open step's text, the raw
+patch marks that step `done` (merging the model's own entry for it)
+and the note `STEP_READ_ALREADY_NOTE_PREFIX` records it; the action
+stays `done` and the rest of the chain sees the closed step.
+`skip_read_path` recovers the path from `SkippedRead::key`.
+
+Evidence: build 32 gemma `trap_rounding` seed 2, six alternations of a
+skipped read and a refused `done` to the mixed-shape cap. Tests: four
+unit tests (fires; different path, no skip, and a later step's path
+leave the refusal unchanged) and one end-to-end run in
+`skills/tests/it/premature_done.rs` (the step closes and
+`implement_no_green_runs_test` then substitutes the test call).
+

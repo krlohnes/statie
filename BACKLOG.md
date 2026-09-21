@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 50. A plan step that only reads a file already in the working set cannot be finished
-- **Status.** Proposed. Evidence: build 32 gemma `trap_rounding` seed
+- **Status.** Committed (Milestone 56): a `done` after a redundant read of the first open step's file marks that step done instead of refusing. Measured next on build 33. Evidence: build 32 gemma `trap_rounding` seed
   2, parked at the mixed-shape cap after six alternations of a
   redundant `read_file src/tax.rs` (skipped, 7.8) and `done` on the
   open step "examine `src/tax.rs`" (refused, item 37). The file was
@@ -362,7 +362,7 @@ moves the metric it was built for. Ordered within each tier.
   alternating walks at zero.
 
 ### 49. Cap the implement-review round trip
-- **Status.** Proposed. Evidence: build 32 gemma `rename_across_files`
+- **Status.** Committed (Milestone 55): implement's `done` with open findings and no tool call this activation is refused; `guards.review_rounds_cap` (default 3) parks the next send-back with the findings as the question. Measured next on build 33. Evidence: build 32 gemma `rename_across_files`
   seed 2, 188 steps, 148 activations: review handed back findings
   (a duplicated doc-comment line) 75 times; implement handed straight
   back to review each time with an empty `files` patch and no tool

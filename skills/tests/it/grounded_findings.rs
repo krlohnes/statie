@@ -298,10 +298,15 @@ async fn all_ungrounded_send_back_is_refused_and_state_is_unchanged() {
     let mut active = session.activate(Arc::clone(&skill)).await.unwrap();
 
     let (before, before_version) = active.session().state().await.unwrap();
-    assert_eq!(before_version, statie_core::Version(0));
+    // Unit 49: `ReviewSkill::on_activate` now always returns a patch (it
+    // sets `review_rounds: 1` on every activation, not just when
+    // `next_skill` needs clearing), so the version is already 1 by the
+    // time the model's first step runs, not 0.
+    assert_eq!(before_version, statie_core::Version(1));
     assert!(before.agent.findings.is_empty());
     assert!(!before.agent.done);
     assert_eq!(before.agent.next_skill, None);
+    assert_eq!(before.agent.review_rounds, 1);
 
     let rec = active.step(Event::Tick, &mut NullSink).await.unwrap();
     let outcome = log.append_record(rec).unwrap();

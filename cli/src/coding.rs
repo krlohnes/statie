@@ -25,8 +25,9 @@ impl CodingRegistry {
     /// rule audit"; `guards.seen_map`/`guards.decision_field`; BACKLOG.md
     /// item 2; `guards.tests_field`; BACKLOG.md item 5;
     /// `guards.grounded_findings`; item 12, grounded review findings;
-    /// `guards.situational_rules`; unit 26, situational rules).
-    /// `Guards::default()` gives exactly [`CodingRegistry::new`].
+    /// `guards.situational_rules`; unit 26, situational rules;
+    /// `guards.review_rounds_cap`; unit 49, cap the implement-review round
+    /// trip). `Guards::default()` gives exactly [`CodingRegistry::new`].
     pub fn with_guards(guards: Guards) -> Self {
         Self::with_guards_and_listed(guards, true)
     }
@@ -48,6 +49,7 @@ impl CodingRegistry {
                 guards.grounded_findings,
                 listed,
                 guards.situational_rules,
+                guards.review_rounds_cap,
             ),
         }
     }

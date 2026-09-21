@@ -23,6 +23,7 @@ mod recovery;
 mod rejected_handoff;
 mod review_blind;
 mod review_looks;
+mod review_rounds_cap;
 mod review_sendback;
 mod router;
 mod seen;

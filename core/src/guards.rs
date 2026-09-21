@@ -1,25 +1,27 @@
 //! Switches for the non-progress guards audited in statie-spec.md "10.
-//! After it works: the rule audit" (milestone 12). Every field defaults to
-//! `true`, so a config with no `guards` section (or one missing individual
-//! fields) behaves exactly as it did before this type existed -- except
-//! `done_stays_done`, which the first bench battery's audit turned off by
-//! default (see its own doc below): the rule rejected the model twelve
-//! times over for moving its "run cargo test" plan step back to
+//! After it works: the rule audit" (milestone 12). Every boolean field
+//! defaults to `true`, so a config with no `guards` section (or one missing
+//! individual fields) behaves exactly as it did before this type existed --
+//! except `done_stays_done`, which the first bench battery's audit turned
+//! off by default (see its own doc below): the rule rejected the model
+//! twelve times over for moving its "run cargo test" plan step back to
 //! in-progress after an edit, until the retry cap parked it as a failure
 //! with the crate already green, and the audit showed the switch off no
 //! worse; and `situational_rules` (unit 26), which defaults to `false` --
 //! an unproven, opt-in rendering change (localised per-step guidance
 //! instead of the skill's whole rules block) a battery can compare against
 //! today's behaviour, not yet a rule with a battery-backed default of its
-//! own to keep.
+//! own to keep. `review_rounds_cap` (unit 49) is not a switch -- it is a
+//! count, default `3` (see its own doc below).
 
 use serde::{Deserialize, Serialize};
 
-/// One switch per audited rule. All default `true` except `done_stays_done`
-/// and `situational_rules` (see the module doc); flipping one to `false`
-/// disables that rule and nothing else. See each field's doc comment for
-/// what "off" means precisely, and `ARCHITECTURE.md` "Guards against
-/// non-progress" for what each rule is guarding against.
+/// One switch per audited rule, plus `review_rounds_cap` (unit 49), a count
+/// rather than a switch. All boolean fields default `true` except
+/// `done_stays_done` and `situational_rules` (see the module doc); flipping
+/// one to `false` disables that rule and nothing else. See each field's doc
+/// comment for what "off" means precisely, and `ARCHITECTURE.md` "Guards
+/// against non-progress" for what each rule is guarding against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Guards {
@@ -112,6 +114,20 @@ pub struct Guards {
     /// text too, verbatim), and `situational` returns `None` -- no `## Now`
     /// section, nothing changes anywhere.
     pub situational_rules: bool,
+    /// Unit 49 (cap the implement-review round trip): `review`-only. The
+    /// number of times `review` may send work back to `implement`
+    /// (non-empty `findings`) before the harness parks the step with
+    /// `Action::AskUser` instead of handing off again. Counts activations of
+    /// `review` (`CodingWorkspace::review_rounds`, harness-owned, written by
+    /// `ReviewSkill::on_activate`): the first activation is round 1, so the
+    /// default `3` allows three send-backs and parks on the fourth review's
+    /// send-back. Evidence: build 32 gemma `rename_across_files` seed 2, 188
+    /// steps, 148 activations -- `review` sent the same duplicated
+    /// doc-comment finding back 75 times, and `implement` handed it straight
+    /// back with an empty patch and no tool call every time, because
+    /// re-activation resets `harness.tool_calls` to 0 and nothing counted
+    /// the handoffs themselves.
+    pub review_rounds_cap: u32,
 }
 
 impl Default for Guards {
@@ -128,6 +144,7 @@ impl Default for Guards {
             tests_field: true,
             grounded_findings: true,
             situational_rules: false,
+            review_rounds_cap: 3,
         }
     }
 }

@@ -137,6 +137,7 @@ statie would actually use and where it came from.
 | `guards.tests_field` | bool | `true` | The harness writes `tests` (`{cmd, pass, failing, first_error, step}`) on every `test` call, replaced whole. `false` never writes it. Off in the model-owned arm. |
 | `guards.grounded_findings` | bool | `true` | A review send-back keeps only findings that cite `path:line` for a file in `files` or `seen`, with the line inside the seen line count when one is recorded. Dropped findings are named in the note; a send-back with none left is refused. `false` passes every finding through. |
 | `guards.situational_rules` | bool | `false` | Render only the rules that neighbour the last action as a `## Now` section, and keep the universal bullets in the skill text (BACKLOG.md item 26). Off: the whole rules block every step. |
+| `guards.review_rounds_cap` | integer | `3` | Send-backs from `review` to `implement` a run may make. On the next review's send-back the run parks with the findings as the question (BACKLOG.md item 49). |
 | `max_autonomous_steps` | integer | `200` | Safety cap on consecutive autonomous steps (`Outcome::Continue`) before a run stops on its own. |
 
 ## Commands

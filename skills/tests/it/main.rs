@@ -15,6 +15,7 @@ mod infer_tool;
 mod no_green;
 mod no_green_runs_test;
 mod no_green_think;
+mod permission_ask;
 mod plan_ask_handoff;
 mod plan_done;
 mod plan_options;

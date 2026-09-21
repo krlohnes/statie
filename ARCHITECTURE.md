@@ -2274,3 +2274,29 @@ leave the refusal unchanged) and one end-to-end run in
 `skills/tests/it/premature_done.rs` (the step closes and
 `implement_no_green_runs_test` then substitutes the test call).
 
+
+
+## Milestone 57: a permission ask is not a question (BACKLOG.md item 51)
+
+`ask_user_permission_note` (`skills/src/coding/mod.rs`) is the third
+sibling in the ask chain, reached from `ask_user_statement_note` when
+the message does contain a `?`. `question_sentences` splits the
+message at each `?`, with `.` and `!` ending a sentence only when
+whitespace follows (so `src/lib.rs` does not split one). A sentence
+that starts with one of `PERMISSION_ASK_PREFIXES` ("would you like me
+to", "do you want me to", "shall i ", ...) or contains one of
+`PERMISSION_ASK_MARKERS` (" proceed", "go ahead", " want me to") makes
+the ask a permission ask: the action becomes a harness `Continue` with
+`PERMISSION_ASK_NOTE`, the patch kept and `next_skill` stripped, the
+same mechanics as the empty and statement rules. Real questions
+("Should the default be 3 or 5?") are untouched. The second in a row
+is item 47's refusal think.
+
+Evidence: three Qwen parks on builds 32 and 33, each "Would you like
+me to proceed ...?" right after one tool error. Tests: ten unit tests
+(the three live messages, two real questions untouched, the no-`?`
+message still the statement rule's, case and whitespace, a dotted
+path, the mid-sentence phrase) and `skills/tests/it/permission_ask.rs`
+(after a tool error the ask commits as `continued` with the exact note
+and the next `edit_file` runs; a real question still parks).
+\n

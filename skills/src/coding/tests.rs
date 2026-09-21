@@ -6261,3 +6261,210 @@ fn implement_leaves_an_unguessable_empty_name_call_alone() {
         step.notes()
     );
 }
+
+// ---------------------------------------------------------------------
+// Unit 51: `ask_user_permission_note`, case (b'') of the
+// `ask_user_empty_note`/`ask_user_statement_note`/`ask_user_permission_note`
+// chain -- a real question (contains `?`, so the first two siblings leave
+// it alone) that only asks permission to do the work the task already
+// asked for. Called directly through `super::ask_user_empty_note`, the
+// chain's entry point every caller (`plan`/`review` directly, `implement`
+// via `premature_done_note`'s fallthrough) uses -- isolating exactly the
+// unit this brief specifies, the same way the `premature_done_note` tests
+// above call that function directly.
+// ---------------------------------------------------------------------
+
+/// Builds an `AskUser` `ParsedOutput` with `next_skill` present in the raw
+/// patch (so a real conversion's stripping is observable) plus an
+/// unrelated patch field (so "patch otherwise kept" is observable too).
+fn ask_user_output(message: &str) -> ParsedOutput<CodingWorkspace> {
+    parsed_output(json!({
+        "patch": {"recent_summary": "kept", "next_skill": "review"},
+        "action": {"type": "ask_user", "message": message},
+        "ack_inbox": []
+    }))
+}
+
+/// Acceptance (a): each of the three live messages converts through
+/// `ask_user_empty_note`'s chain to `PERMISSION_ASK_NOTE` exactly,
+/// `next_skill` is stripped from the raw patch, and the rest of the patch
+/// (`recent_summary`) is kept untouched.
+#[test]
+fn permission_ask_converts_would_you_like_me_to_proceed_with_this_change() {
+    let mut out = ask_user_output("Would you like me to proceed with this change now?");
+    let note =
+        super::ask_user_empty_note(&mut out).expect("a permission ask must convert to Continue");
+    assert_eq!(
+        note,
+        super::PERMISSION_ASK_NOTE,
+        "note text must match exactly"
+    );
+    assert_eq!(
+        out.patch().0.get("next_skill"),
+        None,
+        "next_skill must be stripped"
+    );
+    assert_eq!(
+        out.patch().0.get("recent_summary"),
+        Some(&json!("kept")),
+        "the rest of the patch must be kept"
+    );
+}
+
+#[test]
+fn permission_ask_converts_when_the_sentence_holds_a_dotted_path() {
+    // The `.` in `src/lib.rs` is not a sentence end: the question sentence
+    // is the whole "Would you like me to edit src/lib.rs now?".
+    let mut out = ask_user_output("Would you like me to edit src/lib.rs now?");
+    let note =
+        super::ask_user_empty_note(&mut out).expect("a permission ask must convert to Continue");
+    assert_eq!(note, super::PERMISSION_ASK_NOTE);
+    assert_eq!(out.patch().0.get("next_skill"), None);
+}
+
+#[test]
+fn permission_ask_converts_do_you_want_me_to_in_mid_sentence() {
+    // The live third message: the permission phrase sits after "or", so
+    // it is the " want me to" marker, not a prefix, that catches it.
+    let mut out = ask_user_output(
+        "Should I create it now with the required functions, or do you want me to first \
+         check what specific implementation details are needed?",
+    );
+    let note =
+        super::ask_user_empty_note(&mut out).expect("a permission ask must convert to Continue");
+    assert_eq!(note, super::PERMISSION_ASK_NOTE);
+}
+
+#[test]
+fn permission_ask_converts_would_you_like_me_to_proceed_with_adding_arms() {
+    let mut out = ask_user_output("Would you like me to proceed with adding these missing arms?");
+    let note =
+        super::ask_user_empty_note(&mut out).expect("a permission ask must convert to Continue");
+    assert_eq!(
+        note,
+        super::PERMISSION_ASK_NOTE,
+        "note text must match exactly"
+    );
+    assert_eq!(
+        out.patch().0.get("next_skill"),
+        None,
+        "next_skill must be stripped"
+    );
+    assert_eq!(
+        out.patch().0.get("recent_summary"),
+        Some(&json!("kept")),
+        "the rest of the patch must be kept"
+    );
+}
+
+/// The third live message: no listed prefix matches at the sentence start
+/// ("should i create it now..." is not `should i proceed`/`should i go
+/// ahead"), so this one converts only via the `" proceed"` marker inside
+/// the sentence -- exercising `PERMISSION_ASK_MARKERS` rather than
+/// `PERMISSION_ASK_PREFIXES`.
+#[test]
+fn permission_ask_converts_should_i_create_it_now_via_proceed_marker() {
+    let mut out = ask_user_output(
+        "Should I create it now with the required functions, or do you want me to first \
+         check the existing tests before I proceed?",
+    );
+    let note =
+        super::ask_user_empty_note(&mut out).expect("a permission ask must convert to Continue");
+    assert_eq!(
+        note,
+        super::PERMISSION_ASK_NOTE,
+        "note text must match exactly"
+    );
+    assert_eq!(
+        out.patch().0.get("next_skill"),
+        None,
+        "next_skill must be stripped"
+    );
+    assert_eq!(
+        out.patch().0.get("recent_summary"),
+        Some(&json!("kept")),
+        "the rest of the patch must be kept"
+    );
+}
+
+/// Acceptance (b): a genuine question the harness cannot answer itself --
+/// matches neither a prefix nor a marker -- stays `AskUser`, untouched.
+#[test]
+fn permission_ask_leaves_a_real_config_question_alone() {
+    let mut out = ask_user_output("Which of the two configs is the production one?");
+    let note = super::ask_user_empty_note(&mut out);
+    assert_eq!(note, None, "a real question must not be converted");
+    assert!(
+        matches!(
+            out.action(),
+            statie_core::Action::AskUser { message }
+                if message == "Which of the two configs is the production one?"
+        ),
+        "action must stay AskUser, got {:?}",
+        out.action()
+    );
+    assert_eq!(
+        out.patch().0.get("next_skill"),
+        Some(&json!("review")),
+        "next_skill must be left in place when nothing converts"
+    );
+}
+
+#[test]
+fn permission_ask_leaves_a_real_default_choice_question_alone() {
+    let mut out = ask_user_output("Should the default be 3 or 5?");
+    let note = super::ask_user_empty_note(&mut out);
+    assert_eq!(note, None, "a real question must not be converted");
+    assert!(
+        matches!(
+            out.action(),
+            statie_core::Action::AskUser { message } if message == "Should the default be 3 or 5?"
+        ),
+        "action must stay AskUser, got {:?}",
+        out.action()
+    );
+    assert_eq!(
+        out.patch().0.get("next_skill"),
+        Some(&json!("review")),
+        "next_skill must be left in place when nothing converts"
+    );
+}
+
+/// Acceptance (c): a message with no `?` at all still gets
+/// `ask_user_statement_note`'s note (case (b')), not
+/// `PERMISSION_ASK_NOTE` -- the permission check never runs on it, since
+/// `ask_user_statement_note` already converted the step before falling
+/// through.
+#[test]
+fn permission_ask_note_does_not_fire_for_a_message_with_no_question_mark() {
+    let mut out = ask_user_output("Would you like me to proceed with this change now");
+    let note = super::ask_user_empty_note(&mut out).expect("a non-question must convert");
+    assert_ne!(
+        note,
+        super::PERMISSION_ASK_NOTE,
+        "a message with no `?` must get ask_user_statement_note's note, not this one"
+    );
+    assert!(
+        note.contains("carried a statement of what you will do next"),
+        "expected ask_user_statement_note's note text, got {note:?}"
+    );
+}
+
+/// Acceptance (d): the prefix match is case-insensitive and tolerates
+/// leading whitespace.
+#[test]
+fn permission_ask_prefix_match_is_case_insensitive_and_tolerates_leading_whitespace() {
+    let mut out = ask_user_output("  Would You Like Me To add it?");
+    let note =
+        super::ask_user_empty_note(&mut out).expect("a permission ask must convert to Continue");
+    assert_eq!(
+        note,
+        super::PERMISSION_ASK_NOTE,
+        "note text must match exactly"
+    );
+    assert_eq!(
+        out.patch().0.get("next_skill"),
+        None,
+        "next_skill must be stripped"
+    );
+}

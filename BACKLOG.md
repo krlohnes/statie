@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 51. A permission ask is not a question
-- **Status.** Proposed. Evidence: three Qwen parks on builds 32 and
+- **Status.** Committed (Milestone 57). Measured next on build 34, Qwen short. Evidence: three Qwen parks on builds 32 and
   33 (`new_module`, `add_struct_field`, `match_arms`), each an
   `ask_user` proposing the next edit and asking leave to make it
   ("Would you like me to proceed with this change now?"), each right

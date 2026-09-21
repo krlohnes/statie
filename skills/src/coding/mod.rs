@@ -4053,7 +4053,10 @@ fn review_grounded_findings(
 ///
 /// Falls through to `ask_user_statement_note` when the message is
 /// non-empty, covering case (b'): a non-empty `ask_user` that is not
-/// actually a question either.
+/// actually a question either. `ask_user_statement_note` itself falls
+/// through to `ask_user_permission_note` (case (b'')) when its own check
+/// (no `?` in `message`) does not fire, so every caller of this chain gets
+/// all three conversions.
 fn ask_user_empty_note(out: &mut statie_core::ParsedOutput<CodingWorkspace>) -> Option<String> {
     if let statie_core::Action::AskUser { message } = out.action()
         && message.trim().is_empty()
@@ -4089,6 +4092,10 @@ fn ask_user_empty_note(out: &mut statie_core::ParsedOutput<CodingWorkspace>) -> 
 /// Same mechanics as `ask_user_empty_note`: patch kept, `next_skill`
 /// stripped from the raw patch so the now-`Continue` step is not rejected
 /// by `core/src/session.rs`'s step 7.5.
+///
+/// Falls through to `ask_user_permission_note` when the message does
+/// contain a `?`, covering case (b''): a real question that nonetheless
+/// only asks permission for work the task already asked for.
 fn ask_user_statement_note(out: &mut statie_core::ParsedOutput<CodingWorkspace>) -> Option<String> {
     if let statie_core::Action::AskUser { message } = out.action()
         && !message.contains('?')
@@ -4104,7 +4111,125 @@ fn ask_user_statement_note(out: &mut statie_core::ParsedOutput<CodingWorkspace>)
                 .to_string(),
         );
     }
-    None
+    ask_user_permission_note(out)
+}
+
+/// Sentence-start prefixes (case-insensitive, matched after trimming
+/// leading whitespace) that mark a question sentence as asking permission
+/// to do the work rather than asking something the harness cannot answer
+/// itself. Shared by [`ask_user_permission_note`]. `pub const` (D13) so
+/// tests import the exact list instead of duplicating it.
+pub const PERMISSION_ASK_PREFIXES: &[&str] = &[
+    "would you like me to",
+    "do you want me to",
+    "want me to",
+    "shall i ",
+    "may i ",
+    "can i ",
+    "should i proceed",
+    "should i go ahead",
+    "is it ok if i",
+    "is it okay if i",
+    "is it okay to",
+    "is it ok to",
+];
+
+/// Substrings (matched anywhere in a question sentence, case-insensitive)
+/// that also mark it as a permission ask, independent of how the sentence
+/// starts -- e.g. "Should I create it now with the required functions, or
+/// do you want me to first check the existing tests before I proceed?" has
+/// its permission-seeking clause after a comma, not at the sentence start,
+/// so [`PERMISSION_ASK_PREFIXES`] alone would miss it. Shared by
+/// [`ask_user_permission_note`]. `pub const` (D13) so tests import the
+/// exact list instead of duplicating it.
+pub const PERMISSION_ASK_MARKERS: &[&str] = &[" proceed", "go ahead", " want me to"];
+
+/// Case (b''), sibling of case (b) ([`ask_user_empty_note`]) and case (b')
+/// ([`ask_user_statement_note`]) above, called from `ask_user_empty_note`
+/// right after `ask_user_statement_note` returns `None` -- so every caller
+/// of the chain (`implement` via `premature_done_note`'s fallthrough;
+/// `plan`/`review` directly) gets this too. Covers a third live shape: an
+/// `ask_user` message that IS a real question (contains `?`, so the two
+/// siblings above leave it alone) but the question itself only asks leave
+/// to make the very change the task already asked for -- "Would you like
+/// me to proceed with this change now?", "Would you like me to proceed
+/// with adding these missing arms?", "Should I create it now with the
+/// required functions, or do you want me to first check the existing
+/// tests before I proceed?" -- each parking the run on a human who already
+/// asked for the work, right after a single tool error.
+///
+/// The message is split into question sentences: the text from one
+/// sentence end (`.`/`!`/`?`) or the start of the message, up to the next
+/// `?`. A sentence with no following `?` (a trailing statement after the
+/// last question, or the whole message when it has no `?` at all -- never
+/// reached here, since `ask_user_statement_note` already converted that
+/// case) is not a question sentence and is not considered. Each question
+/// sentence is trimmed and lowercased, then checked against
+/// [`PERMISSION_ASK_PREFIXES`] (sentence-start match) and
+/// [`PERMISSION_ASK_MARKERS`] (substring match anywhere in the sentence).
+/// A genuine question the harness cannot answer itself -- "Which of the
+/// two configs is the production one?", "Should the default be 3 or 5?"
+/// -- matches neither list and is left alone.
+///
+/// Same mechanics as the two siblings: patch kept, `next_skill` stripped
+/// from the raw patch so the now-`Continue` step is not rejected by
+/// `core/src/session.rs`'s step 7.5.
+fn ask_user_permission_note(
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    let statie_core::Action::AskUser { message } = out.action() else {
+        return None;
+    };
+    if !question_sentences(message).any(|sentence| {
+        PERMISSION_ASK_PREFIXES
+            .iter()
+            .any(|prefix| sentence.starts_with(prefix))
+            || PERMISSION_ASK_MARKERS
+                .iter()
+                .any(|marker| sentence.contains(marker))
+    }) {
+        return None;
+    }
+
+    if let Some(obj) = out.patch_mut().0.as_object_mut() {
+        obj.remove("next_skill");
+    }
+    Some(PERMISSION_ASK_NOTE.to_string())
+}
+
+/// The note [`ask_user_permission_note`] attaches. `pub const` (D13) so
+/// tests import the exact text instead of duplicating it.
+pub const PERMISSION_ASK_NOTE: &str = "`ask_user` asked permission for what the task already \
+     asks of you; nothing was asked and your patch was kept. You do not need permission: make \
+     the call you proposed. Ask the user only for a decision you cannot make yourself.";
+
+/// Splits `message` into question sentences for [`ask_user_permission_note`]:
+/// each item is the trimmed, lowercased text running from the char right
+/// after a `.`/`!`/`?` (or the start of `message`) up to and including the
+/// next `?`, with that boundary punctuation excluded from both ends. Text
+/// after the last `?` (with no further `?` to close it) is not a question
+/// sentence and is not yielded.
+fn question_sentences(message: &str) -> impl Iterator<Item = String> + '_ {
+    let mut start = 0usize;
+    message.char_indices().filter_map(move |(i, c)| {
+        if c == '?' {
+            let sentence = message[start..i].trim().to_lowercase();
+            start = i + c.len_utf8();
+            Some(sentence)
+        } else {
+            // A `.` or `!` ends a sentence only when whitespace follows
+            // it: the dot in `src/lib.rs` must not split "Would you like
+            // me to edit src/lib.rs now?" into "rs now".
+            let next_is_space = message[i + c.len_utf8()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace);
+            if (c == '.' || c == '!') && next_is_space {
+                start = i + c.len_utf8();
+            }
+            None
+        }
+    })
 }
 
 /// Plan-step regression guard shared by `plan`/`implement`/`review`: once a

@@ -2001,6 +2001,25 @@ either a default or a config knob:
   two runs between builds with nothing changed on that path (6, 8, 6),
   so two seeds do not separate a long-task change either way.
 
+  Build 36 (items 54, 55: the eviction loop bounded, the router's bare
+  `done` routed by state): Qwen short 16 of 16, gemma short 15 of 16,
+  Qwen long 7 of 10. The router routed the bare `done` in 15 of 16
+  short runs and 10 of 10 long, and the batteries' rejection counts
+  fell from 18 to 1 (short) and to 3 (long): one model call and one
+  retry back per Qwen run. Eviction: 62 `working_set_shrunk` entries
+  on the long battery, at most 5 rounds on a step, against 714 events
+  on one run of build 34. Long misses: `refactor_signature` twice
+  (the no-green cap and the repeated `edit_file` error cap; 26 "old
+  text not found" errors on the battery, item 56 next) and one
+  `multi_file_feature` at 124 steps. gemma's miss is a mixed-shape
+  walk, a refused `done` on the "run cargo test" step alternating
+  with the failing test skipped as redundant; the mixed shape is one
+  park per several batteries and is noted, not itemised. On Qwen the
+  `maintainer_error` count (47 to 88 a battery) is mostly the harness
+  dropping a `next` the maintainer proposed for a non-mutating or
+  inactive tool, which costs the log line and nothing else; the only
+  retried case, notes over budget, is 3 to 7 a battery.
+
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

@@ -359,7 +359,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Qwen long: `edit_file` error caps at zero; landing up.
 
 ### 55. The router's bare `done` is routed by state
-- **Status.** Committed (Milestone 61). Measured next on build 36, Qwen. Evidence: Qwen opens 15 of 16 short runs on
+- **Status.** Committed (Milestone 61). Build 36: routed in 15 of 16 short and 10 of 10 long runs; rejections 1 and 3 a battery against 18. Evidence: Qwen opens 15 of 16 short runs on
   each of builds 33 to 35, and 9 of 10 long runs on build 34, with
   `done` carrying the task and no `next_skill`; rejected, retried
   with `plan`. One burnt retry and one wasted call per run, against a
@@ -375,7 +375,7 @@ moves the metric it was built for. Ordered within each tier.
   run.
 
 ### 54. The eviction loop cuts by what the working set gives up, and is bounded
-- **Status.** Committed (Milestone 60). Measured next on build 36, Qwen long. Evidence: build 34 Qwen long `refactor_signature`
+- **Status.** Committed (Milestone 60). Build 36, Qwen long: 62 shrink entries, at most 5 rounds on a step, against 714 events on one build 34 run; 7 of 10 landed. Evidence: build 34 Qwen long `refactor_signature`
   seed 1, 714 `working_set_shrunk` entries over 166 steps, 36 rounds on
   one step with the overage unchanged at 44 each round: the working
   set is whole windows, a cut of `overage + 64` often frees nothing,

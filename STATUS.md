@@ -55,10 +55,11 @@ Unpushed since: items 49 to 56 (Milestones 55 to 62), the item 49
   unlanded by statie with any model.
 
 ## Running now
-Build 36 (items 54, 55): Qwen short 16 of 16 with the router's bare
-`done` routed in 15 runs and one rejection in the battery; gemma 15 of
-16; Qwen long running. Build 37 (item 56, the anchored `old` match)
-queued behind it, Qwen long first. Gates must not run during a
+Build 36 (items 54, 55) done: Qwen short 16, gemma 15, Qwen long 7 of
+10; rejections down to 1 and 3 a battery; eviction rounds at most 5.
+Build 37 (item 56, the anchored `old` match) on the host, Qwen long
+first. Check: "old text not found" and its cap well down; long at or
+above 7 of 10. Gates must not run during a
 battery when time is the question: the sandboxes' cargo shares this
 machine.
 

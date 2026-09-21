@@ -1358,7 +1358,7 @@ fn implement_findings_open_note_fires_on_bare_done_with_open_findings_and_no_too
         0,
     );
     let content = json!({
-        "patch": {},
+        "patch": {"next_skill": "review", "recent_summary": "handing off"},
         "action": {"type": "done"},
         "ack_inbox": []
     });
@@ -1376,6 +1376,16 @@ fn implement_findings_open_note_fires_on_bare_done_with_open_findings_and_no_too
         patch.next().findings,
         vec!["a.rs:1 duplicated doc-comment line".to_string()],
         "the patch must be left untouched -- findings still carried on the committed workspace"
+    );
+    assert_eq!(
+        patch.next().next_skill,
+        None,
+        "next_skill must be stripped: a Continue carrying a changed next_skill is rejected by core"
+    );
+    assert_eq!(
+        patch.next().recent_summary,
+        "handing off",
+        "the rest of the patch is kept"
     );
 }
 

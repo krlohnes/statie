@@ -415,7 +415,7 @@ moves the metric it was built for. Ordered within each tier.
   alternating walks at zero.
 
 ### 49. Cap the implement-review round trip
-- **Status.** Committed (Milestone 55). Build 33: never fired on 32 gemma and 26 Qwen runs; activations per run at most 6. The backstop stands for the shape build 32 showed. Evidence: build 32 gemma `rename_across_files`
+- **Status.** Committed (Milestone 55). Build 33: never fired on 32 gemma and 26 Qwen runs; activations per run at most 6. Build 34: fired on gemma `rename_across_files` seed 2 and Qwen once, and the refusal left `next_skill: review` in the patch, so core rejected the converted step four times to the retry cap (landed, green on disk). Fixed after build 34: the refusal strips `next_skill`. Evidence: build 32 gemma `rename_across_files`
   seed 2, 188 steps, 148 activations: review handed back findings
   (a duplicated doc-comment line) 75 times; implement handed straight
   back to review each time with an empty `files` patch and no tool

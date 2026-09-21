@@ -2235,7 +2235,10 @@ this activation) becomes a harness `Continue` with
 kept. Item 47's refusal think covers the second strike. The rule
 exists because re-activation keeps `green_step` and zeroes
 `tool_calls`, so `green_done_note` accepted implement's immediate
-`done` after every hand-back.
+`done` after every hand-back. The refusal strips `next_skill` from the
+patch, as every refusal does: a `Continue` carrying a changed
+`next_skill` is rejected by core's handoff rule, and build 34 burnt a
+retry cap on exactly that before the strip was added.
 
 `CodingWorkspace.review_rounds` (harness-owned) counts review
 activations: `ReviewSkill::on_activate` writes `review_rounds + 1`

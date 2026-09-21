@@ -5872,7 +5872,15 @@ impl Skill for ImplementSkill {
             // Unit 49: review sent findings back and nothing has touched
             // them this activation -- park the `done` as a harness `Continue`
             // before any of the green/bare-done/no-green-test conversions
-            // below get a look, patch untouched.
+            // below get a look, patch otherwise untouched. `next_skill` is
+            // stripped, as every refusal here strips it: a `Continue`
+            // carrying a changed `next_skill` is rejected by
+            // `core/src/session.rs`'s handoff rule, and build 34 (gemma
+            // `rename_across_files` seed 2) burnt the retry cap on exactly
+            // that, four rejections of the converted `done` in a row.
+            if let Some(obj) = out.patch_mut().0.as_object_mut() {
+                obj.remove("next_skill");
+            }
             out.set_action(statie_core::Action::Continue { note });
         } else if let Some(note) = green_done_note(cur, &mut out) {
             // Action stays `Done`: verification already passed, so this is

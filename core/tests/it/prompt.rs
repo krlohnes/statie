@@ -1035,6 +1035,11 @@ async fn working_set_shrunk_lets_an_otherwise_over_budget_step_build() {
         .get("to")
         .and_then(Value::as_u64)
         .unwrap();
+    let rounds = entries[0]
+        .payload
+        .get("rounds")
+        .and_then(Value::as_u64)
+        .unwrap();
     let overage = entries[0]
         .payload
         .get("overage")
@@ -1047,7 +1052,14 @@ async fn working_set_shrunk_lets_an_otherwise_over_budget_step_build() {
     assert_eq!(
         to,
         from.saturating_sub(overage + 64),
-        "`to` must equal the spec's exact formula: budget.saturating_sub(overage + 64)"
+        "`to` must equal the spec's exact formula: budget.saturating_sub(overage + 64) \
+         (round 1's plain cut drops the single window entirely and fits, so \
+         no halving is needed)"
+    );
+    assert_eq!(
+        rounds, 1,
+        "the single window is dropped whole on the first cut, which frees \
+         far more than the overage, so exactly one round is needed"
     );
     assert!(overage > 0, "expected a nonzero measured overage");
 
@@ -1228,6 +1240,287 @@ async fn observation_shrunk_lets_an_otherwise_over_budget_step_build() {
     let prompts = model.prompts();
     assert_eq!(prompts.len(), 2);
     let final_tokens = tok.count(&prompts[1]);
+    assert!(
+        final_tokens <= budgets.total,
+        "expected the rebuilt prompt to fit within total ({}), got {}",
+        budgets.total,
+        final_tokens
+    );
+}
+
+/// (a2) Item 54: a working set of two whole windows (a big one and a
+/// medium one, ~1023 tokens together) sits comfortably under its budget
+/// (1200) on its own -- only the *other* sections pushed step 3's prompt
+/// over `total`. The first `overage + 64` cut (round 1: 1200 -> 1066)
+/// still leaves enough room for both windows (1023 <= 1066), so it frees
+/// nothing and the measured working-set size is unchanged; round 2 must
+/// therefore escalate to halving (`min(plain_cut, budget / 2)`) rather
+/// than repeat the same ineffective `overage + 64` cut. Exactly one
+/// `working_set_shrunk` entry is logged for the whole step, carrying the
+/// exact round count and the first overage.
+#[tokio::test]
+async fn working_set_shrunk_halves_the_budget_when_a_cut_frees_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
+    let tok = HeuristicTokenizer;
+
+    // Two windows of very different sizes: a big one and a medium one,
+    // both comfortably under the working_set budget on their own (~1023
+    // tokens together vs. a 1200-token budget) so a small cut
+    // (overage + 64) doesn't cross the threshold needed to drop either
+    // window whole.
+    let a_body = "a".repeat(3600); // 900 tokens
+    let d_body = "d".repeat(400); // 100 tokens
+    let files: &[(&str, &str)] = &[
+        ("a.txt", &a_body),
+        ("d.txt", &d_body),
+        ("b.txt", "hi"),
+        ("c.txt", "yo"),
+    ];
+
+    let model = RecordingModel::new(vec![
+        eviction_step_output(serde_json::json!({}), read_action("a.txt")), // step 1
+        eviction_step_output(serde_json::json!({}), read_action("d.txt")), // step 2
+        eviction_step_output(serde_json::json!({}), read_action("b.txt")), // step 3
+        eviction_step_output(serde_json::json!({}), read_action("c.txt")), // step 4
+    ]);
+
+    // Fixed sections plus `total` dialed (by measurement, since the exact
+    // rendered size of fixed sections isn't hand-computable) so step 3's
+    // prompt -- working set of both windows at their full 1200-token
+    // budget, pending observation d.txt's tiny output -- overflows `total`
+    // by exactly 70 tokens.
+    let instructions = "small instructions".to_string();
+    let budgets = Budgets {
+        total: 1450,
+        observation: 100,
+        augmentation: 500,
+        notes: 400,
+        working_set: 1200,
+    };
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        eviction_tool_set(files),
+        Box::new(HeuristicTokenizer),
+        eviction_session_config(&root, budgets),
+    )
+    .with_working_set(WorkingSetConfig {
+        max_windows: 2,
+        recent_calls: 0,
+    });
+
+    let skill = Arc::new(EvictionSkill { instructions });
+    let mut active = session.activate(skill).await.unwrap();
+
+    // Step 1: read a.txt (large). Its output is step 2's pending
+    // observation, not yet a working-set window.
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(shrink_entries(&rec1, "working_set_shrunk").is_empty());
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+
+    // Step 2: read d.txt (medium). Its own prompt observation is a.txt's
+    // output, clamped to the 100-token observation budget; no working set
+    // exists yet (a.txt is still the single newest output, excluded from
+    // windows), so this step builds cleanly.
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(shrink_entries(&rec2, "working_set_shrunk").is_empty());
+    SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+
+    // Step 3: read b.txt. Its prompt's pending observation is d.txt's
+    // tiny output, and its working set now renders both a.txt's and
+    // d.txt's windows (b.txt's own not-yet-committed output is excluded)
+    // at up to the full 1200-token budget -- fixed sections plus that
+    // exceed `total` (1450) by 70 tokens, and the working set alone
+    // (1023 tokens) doesn't shrink under the first cut.
+    let rec3 = active
+        .step(Event::Tick, &mut NullSink)
+        .await
+        .expect("step must succeed by evicting the working set, not fail OverBudget");
+
+    let entries = shrink_entries(&rec3, "working_set_shrunk");
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one working_set_shrunk entry for the whole step: {:?}",
+        rec3.entries()
+    );
+    let from = entries[0]
+        .payload
+        .get("from")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let to = entries[0]
+        .payload
+        .get("to")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let rounds = entries[0]
+        .payload
+        .get("rounds")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let overage = entries[0]
+        .payload
+        .get("overage")
+        .and_then(Value::as_u64)
+        .unwrap();
+    assert_eq!(
+        from, 1200,
+        "expected the shrink to start from the configured working_set budget"
+    );
+    assert_eq!(overage, 70, "expected the first measured overage");
+    assert_eq!(
+        rounds, 2,
+        "round 1's plain overage+64 cut (1200 -> 1066) still leaves room for \
+         both windows (1023 tokens), freeing nothing, so round 2 must escalate \
+         to halving"
+    );
+    // Round 1: plain cut, 1200 - (70 + 64) = 1066 (frees nothing: the
+    // working set is still 1023 tokens, well under 1066). Round 2:
+    // min(1066 - (70 + 64), 1066 / 2) = min(932, 533) = 533.
+    assert_eq!(
+        to, 533,
+        "expected round 2 to halve (533) rather than repeat the plain cut (932)"
+    );
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 3);
+    let final_tokens = tok.count(&prompts[2]);
+    assert!(
+        final_tokens <= budgets.total,
+        "expected the rebuilt prompt to fit within total ({}), got {}",
+        budgets.total,
+        final_tokens
+    );
+}
+
+/// (b) Item 54's bound: a working set whose content the eviction loop can
+/// never shrink to fit within `WORKING_SET_EVICTION_ROUNDS` rounds of pure
+/// halving (the budget starts at ~650x the working set's own content size,
+/// so 8 halvings only bring it down to ~2601 -- still well above the
+/// ~1023-token content, so every round frees nothing and none of them ever
+/// drops a window). The loop must stop at exactly
+/// `WORKING_SET_EVICTION_ROUNDS` rounds, log exactly one `working_set_shrunk`
+/// entry for the whole step, and fall through to the existing observation
+/// clamp -- which, with the remaining (small) overage, succeeds here.
+#[tokio::test]
+async fn working_set_shrunk_stops_at_the_round_bound_and_falls_through() {
+    let root = tempfile::tempdir().unwrap();
+    let log: Arc<dyn SessionLog> = Arc::new(MemoryLog::new());
+    let tok = HeuristicTokenizer;
+
+    // Two windows summing to ~1023 tokens, plus a final read (c.txt) whose
+    // step is the one under test.
+    let a_body = "a".repeat(3600); // 900 tokens
+    let d_body = "d".repeat(400); // 100 tokens
+    let files: &[(&str, &str)] = &[("a.txt", &a_body), ("d.txt", &d_body), ("c.txt", "yo")];
+
+    let model = RecordingModel::new(vec![
+        eviction_step_output(serde_json::json!({}), read_action("a.txt")), // step 1
+        eviction_step_output(serde_json::json!({}), read_action("d.txt")), // step 2
+        eviction_step_output(serde_json::json!({}), read_action("c.txt")), // step 3
+    ]);
+
+    // `total` dialed (by measurement) so that after 8 rounds of halving
+    // (666_000 -> ... -> 5202, never dropping a window) the remaining
+    // overage (30 tokens) is small enough for the fallback observation
+    // clamp to absorb by shrinking the 100-token pending observation.
+    let instructions = "small instructions".to_string();
+    let budgets = Budgets {
+        total: 1490,
+        observation: 100,
+        augmentation: 500,
+        notes: 400,
+        working_set: 666_000,
+    };
+
+    let mut session = Session::new(
+        Box::new(TestStore::<Workspace>::new()),
+        Arc::clone(&log),
+        Arc::clone(&model) as Arc<dyn Model>,
+        eviction_tool_set(files),
+        Box::new(HeuristicTokenizer),
+        eviction_session_config(&root, budgets),
+    )
+    .with_working_set(WorkingSetConfig {
+        max_windows: 2,
+        recent_calls: 0,
+    });
+
+    let skill = Arc::new(EvictionSkill { instructions });
+    let mut active = session.activate(skill).await.unwrap();
+
+    let rec1 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(shrink_entries(&rec1, "working_set_shrunk").is_empty());
+    SessionLogExt::append_record(log.as_ref(), rec1).unwrap();
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    assert!(shrink_entries(&rec2, "working_set_shrunk").is_empty());
+    SessionLogExt::append_record(log.as_ref(), rec2).unwrap();
+
+    // Step 3: working set is both windows (~1023 tokens) at up to the
+    // 666_000-token budget; 8 rounds of halving never gets the budget
+    // below the content size, so the loop stops at the bound and falls
+    // through to the observation clamp, which succeeds.
+    let rec3 = active
+        .step(Event::Tick, &mut NullSink)
+        .await
+        .expect("step must succeed via the observation-clamp fallback after the round bound");
+
+    let ws_entries = shrink_entries(&rec3, "working_set_shrunk");
+    assert_eq!(
+        ws_entries.len(),
+        1,
+        "expected exactly one working_set_shrunk entry for the whole step: {:?}",
+        rec3.entries()
+    );
+    let from = ws_entries[0]
+        .payload
+        .get("from")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let to = ws_entries[0]
+        .payload
+        .get("to")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let rounds = ws_entries[0]
+        .payload
+        .get("rounds")
+        .and_then(Value::as_u64)
+        .unwrap();
+    let overage = ws_entries[0]
+        .payload
+        .get("overage")
+        .and_then(Value::as_u64)
+        .unwrap();
+    assert_eq!(from, 666_000, "expected the configured working_set budget");
+    assert_eq!(
+        rounds,
+        statie_core::WORKING_SET_EVICTION_ROUNDS as u64,
+        "the loop must stop at exactly the round bound, never fitting by pure halving"
+    );
+    assert_eq!(to, 5202, "expected the exact budget after 8 halving rounds");
+    assert_eq!(overage, 30, "expected the first measured overage");
+
+    // The bound alone didn't close the gap: the working set section is
+    // still logically "over" relative to what would be needed, so the
+    // existing observation clamp fallback ran once and closed it.
+    let obs_entries = shrink_entries(&rec3, "observation_shrunk");
+    assert_eq!(
+        obs_entries.len(),
+        1,
+        "expected the observation clamp fallback to run exactly once after \
+         the working-set round bound was hit: {:?}",
+        rec3.entries()
+    );
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 3);
+    let final_tokens = tok.count(&prompts[2]);
     assert!(
         final_tokens <= budgets.total,
         "expected the rebuilt prompt to fit within total ({}), got {}",

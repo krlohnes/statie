@@ -136,6 +136,17 @@ const READ_HEADER_LOOKUP_LIMIT: usize = 1_000_000;
 /// `next`).
 const COMMITMENT_READ_CAP: u32 = 2;
 
+/// Unit 54: the item 44 working-set eviction loop (below, search
+/// `working_set_shrunk`) rebuilds `WorkingSet::from_log` with a smaller
+/// budget while the assembled prompt is over budget, cutting by
+/// `overage + 64` each time. The working set is made of whole windows, so a
+/// small cut often drops nothing and the overage is unchanged -- the loop
+/// then halves the budget instead (spec item 1) rather than repeat the same
+/// ineffective cut. This bounds the number of rebuild-and-reassemble rounds
+/// regardless: after this many, fall through to the existing observation
+/// clamp and the final `result?` as before.
+pub const WORKING_SET_EVICTION_ROUNDS: usize = 8;
+
 /// Result of `Active::apply_trusted_patch`: the new version, the harness
 /// step it committed at, and the sorted top-level workspace keys the patch
 /// actually changed.
@@ -2052,29 +2063,49 @@ where
         // working set is at zero -- a truncated observation (spec item 2),
         // before giving up and returning the error as a real configuration
         // failure (spec item 3: the fixed sections alone exceed `total`).
-        let mut ws_budget = cur.harness.budgets.working_set;
+        let ws_budget_start = cur.harness.budgets.working_set;
+        let mut ws_budget = ws_budget_start;
         let mut result = assemble(working_set.as_ref(), pending_obs.as_ref());
+        let mut eviction_rounds: usize = 0;
+        let mut first_overage: Option<usize> = None;
+        // Item 54: the working set is made of whole windows (item 19), so a
+        // budget cut of `overage + 64` often drops no window at all -- the
+        // rebuilt working set is the same size, the overage is unchanged,
+        // and repeating that cut walks the budget down in tiny, ineffective
+        // steps (live evidence: 36-46 iterations on a single step, spec
+        // background). Track how many tokens the *previous* cut actually
+        // freed (measured on the rebuilt working set's own rendered size,
+        // not assumed from the budget delta) and, once a cut freed less
+        // than the overage it was meant to cover, escalate to halving the
+        // budget instead of repeating a cut that isn't working.
+        let mut prev_ws_tokens: Option<usize> = working_set
+            .as_ref()
+            .map(|ws| self.session.tokenizer.count(ws.as_str()));
+        let mut last_cut_freed_enough = true;
         while let Err(err) = &result {
             // Only a working set that was actually rendered (spec item 1:
             // "rendered with a non-zero budget") can be shrunk further --
             // `None` means the section is disabled (`WorkingSetConfig`
             // with both counts zero) or the log had nothing to show, and
             // re-rendering at a smaller budget would still produce `None`.
-            if working_set.is_none() || ws_budget == 0 {
+            if working_set.is_none()
+                || ws_budget == 0
+                || eviction_rounds >= WORKING_SET_EVICTION_ROUNDS
+            {
                 break;
             }
             let overage = err.tokens - err.limit;
-            let new_budget = ws_budget.saturating_sub(overage + 64);
-            entries.push(system_entry(
-                step_at_start,
-                "working_set_shrunk",
-                serde_json::json!({
-                    "from": ws_budget,
-                    "to": new_budget,
-                    "overage": overage,
-                }),
-            ));
+            if first_overage.is_none() {
+                first_overage = Some(overage);
+            }
+            let plain_cut = ws_budget.saturating_sub(overage + 64);
+            let new_budget = if last_cut_freed_enough {
+                plain_cut
+            } else {
+                plain_cut.min(ws_budget / 2)
+            };
             ws_budget = new_budget;
+            eviction_rounds += 1;
             working_set = WorkingSet::from_log(
                 self.session.log.as_ref(),
                 self.session.tokenizer.as_ref(),
@@ -2082,7 +2113,30 @@ where
                 &self.session.working_set,
                 step_at_start,
             );
+            let new_ws_tokens = working_set
+                .as_ref()
+                .map(|ws| self.session.tokenizer.count(ws.as_str()));
+            last_cut_freed_enough = match (prev_ws_tokens, new_ws_tokens) {
+                (Some(prev), Some(new)) => prev.saturating_sub(new) >= overage,
+                // A working set that vanished entirely, or one that didn't
+                // exist to measure against, freed everything it could.
+                (Some(_), None) => true,
+                _ => true,
+            };
+            prev_ws_tokens = new_ws_tokens;
             result = assemble(working_set.as_ref(), pending_obs.as_ref());
+        }
+        if eviction_rounds > 0 {
+            entries.push(system_entry(
+                step_at_start,
+                "working_set_shrunk",
+                serde_json::json!({
+                    "from": ws_budget_start,
+                    "to": ws_budget,
+                    "rounds": eviction_rounds,
+                    "overage": first_overage.unwrap_or(0),
+                }),
+            ));
         }
         // Working set is at zero (or was never rendered) and the prompt
         // still overflows: truncate the observation section once (spec

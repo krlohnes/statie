@@ -2347,3 +2347,21 @@ the second is `think` with `REFUSAL_QUESTION`; an out-of-range line is
 the same refusal); `skills/tests/it/review_looks.rs` (the identical
 approval walk parks one step later, its second refusal now a think).
 
+## Milestone 60: the eviction loop is bounded and cuts by what it frees (BACKLOG.md item 54)
+
+Item 44's loop in `Active::step` (`core/src/session.rs`) measures the
+rebuilt working set's tokens each round; when a cut freed less than
+the overage (whole windows often give up nothing for a cut of
+`overage + 64`), the next cut is at least half the budget. At most
+`WORKING_SET_EVICTION_ROUNDS` (8) rounds, then the observation clamp
+and the final result as before. One `working_set_shrunk` entry per
+step, after the loop, with `from`, `to`, `rounds` and the first
+`overage`; none when nothing shrank.
+
+Evidence: build 34 Qwen long `refactor_signature`, 714 and 391 rounds
+over two runs, 36 on one step with the overage unchanged. Tests in
+`core/tests/it/prompt.rs`: item 44's single-window case now asserts
+`rounds` 1; a two-window set whose first cut frees nothing halves on
+the second round (exact budgets); a budget that cannot fit in eight
+rounds stops at eight and falls through to the observation clamp.
+

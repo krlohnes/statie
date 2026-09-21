@@ -359,7 +359,7 @@ moves the metric it was built for. Ordered within each tier.
   run.
 
 ### 54. The eviction loop cuts by what the working set gives up, and is bounded
-- **Status.** Proposed. Evidence: build 34 Qwen long `refactor_signature`
+- **Status.** Committed (Milestone 60). Measured next on build 36, Qwen long. Evidence: build 34 Qwen long `refactor_signature`
   seed 1, 714 `working_set_shrunk` entries over 166 steps, 36 rounds on
   one step with the overage unchanged at 44 each round: the working
   set is whole windows, a cut of `overage + 64` often frees nothing,

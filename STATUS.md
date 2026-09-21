@@ -2,8 +2,8 @@
 
 ## Where the code is
 Pushed through `099c130` (items 28 to 48, builds through 32 short).
-Unpushed since: items 49 to 53 (Milestones 55 to 59), the item 49
-`next_skill` fix, builds 33 and 34. Items 36 and 41 were committed and reverted
+Unpushed since: items 49 to 56 (Milestones 55 to 62), the item 49
+`next_skill` fix, builds 33 to 36. Items 36 and 41 were committed and reverted
 (D26, D28). Tree clean. Gate: 16 binaries, 12 to 19 minutes.
 
 ## Committed since the pause
@@ -55,9 +55,10 @@ Unpushed since: items 49 to 53 (Milestones 55 to 59), the item 49
   unlanded by statie with any model.
 
 ## Running now
-Build 35 done: Qwen short 15, gemma 16, Qwen long 6 of 10, no
-`failure` park. Build 36 (items 54 and 55) queued. Items 56 (drifted
-`old` matched by its anchors) in flight. Gates must not run during a
+Build 36 (items 54, 55): Qwen short 16 of 16 with the router's bare
+`done` routed in 15 runs and one rejection in the battery; gemma 15 of
+16; Qwen long running. Build 37 (item 56, the anchored `old` match)
+queued behind it, Qwen long first. Gates must not run during a
 battery when time is the question: the sandboxes' cargo shares this
 machine.
 

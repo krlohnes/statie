@@ -380,7 +380,7 @@ moves the metric it was built for. Ordered within each tier.
   those runs.
 
 ### 50. A plan step that only reads a file already in the working set cannot be finished
-- **Status.** Committed (Milestone 56): a `done` after a redundant read of the first open step's file marks that step done instead of refusing. Measured next on build 33. Evidence: build 32 gemma `trap_rounding` seed
+- **Status.** Committed (Milestone 56). Build 33: never fired; `trap_rounding` landed 4 of 4 on gemma. Evidence: build 32 gemma `trap_rounding` seed
   2, parked at the mixed-shape cap after six alternations of a
   redundant `read_file src/tax.rs` (skipped, 7.8) and `done` on the
   open step "examine `src/tax.rs`" (refused, item 37). The file was
@@ -399,7 +399,7 @@ moves the metric it was built for. Ordered within each tier.
   alternating walks at zero.
 
 ### 49. Cap the implement-review round trip
-- **Status.** Committed (Milestone 55): implement's `done` with open findings and no tool call this activation is refused; `guards.review_rounds_cap` (default 3) parks the next send-back with the findings as the question. Measured next on build 33. Evidence: build 32 gemma `rename_across_files`
+- **Status.** Committed (Milestone 55). Build 33: never fired on 32 gemma and 26 Qwen runs; activations per run at most 6. The backstop stands for the shape build 32 showed. Evidence: build 32 gemma `rename_across_files`
   seed 2, 188 steps, 148 activations: review handed back findings
   (a duplicated doc-comment line) 75 times; implement handed straight
   back to review each time with an empty `files` patch and no tool
@@ -437,7 +437,7 @@ moves the metric it was built for. Ordered within each tier.
   to 16 of 16; Qwen short unchanged.
 
 ### 47. The second consecutive refusal becomes a `think`; the walk ends there
-- **Status.** Committed (Milestone 54); build 32 short: gemma 15 of 16, Qwen 14 of 16, neither separable from builds 30 and 31 (one gemma run ping-ponged implement and review for 188 steps, item 49; the miss is an alternating walk, item 50); the trigger fired four times, twice followed by a productive call. Second gemma battery pending. Thinker-agnostic: the substitution does not gate on a configured thinker (an unconfigured `think` answers "decide from what you have", like every other trigger), and a committed `think` is neutral for the three refusal counters so the third strike still parks. Measured next on build 32, gemma short (overlap off), Qwen short and long. Evidence: runs with three or more consecutive
+- **Status.** Committed (Milestone 54). Build 33, gemma short twice: 32 of 32 with no refusal walk, the trigger firing 6 and 7 times per battery and a tool call following each time; build 32 had been 15 of 16 with a walk of a shape it cannot see (item 50). Qwen: fires on the plan skill's no-action refusals; landing unchanged. Kept. Thinker-agnostic: the substitution does not gate on a configured thinker (an unconfigured `think` answers "decide from what you have", like every other trigger), and a committed `think` is neutral for the three refusal counters so the third strike still parks. Measured next on build 32, gemma short (overlap off), Qwen short and long. Evidence: runs with three or more consecutive
   `done`/`ask_user`/`continue` actions: gemma 1, 2, 3, 5, 5 on builds
   23, 25, 26, 27, 30; three of build 30's four gemma misses and one of
   its two Qwen misses are such walks to the non-progress cap, six

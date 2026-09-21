@@ -1952,6 +1952,25 @@ either a default or a config knob:
   build follows Qwen long, since 15 and 16 on one battery each do not
   separate.
 
+  Build 33 (items 47, 49, 50: the refusal think, the implement-review
+  cap, a redundant read finishes a read-only step): gemma short 16 of
+  16 twice, 32 of 32 runs, no refusal walk and no ping-pong; the cap
+  and the read-step rule never fired (activations per run at most 6,
+  then 4); the refusal think fired 6 and 7 times and was followed by a
+  tool call each time. Time: 88 and 83 s a run against 66 on build 31,
+  but the host is the difference, not the harness: the median prompt
+  is 6.1k tokens against 6.3k while prompt eval per step went from
+  0.49 s to 0.77 s and generation from 1.01 to 1.13 s, on the same
+  model and the same config, from build 32 on. Time across builds is
+  read with `peval` from here. Qwen short: 14 of 16, both misses an
+  `ask_user` asking leave to make the edit it had just described, right
+  after one tool error (item 51). Qwen long: 6 of 10 at 231 s a run
+  against 261 on build 28, same landing; two of the four parks are a
+  call named by its file path with nothing but the path in its args,
+  repeated to the not-a-tool cap (item 52); the other two are the
+  `refactor_signature` read stall and `trap_interest` at the no-green
+  cap. Build 34 carries items 51 and 52.
+
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

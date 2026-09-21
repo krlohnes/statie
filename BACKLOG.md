@@ -342,8 +342,24 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 56. `edit_file` locates a drifted `old` by its first and last lines
+- **Status.** Proposed. Evidence: "old text not found" 17, 35 and 23
+  times on the Qwen long batteries of builds 33 to 35, in 4 to 6 of
+  10 runs; three of build 35's four long misses ended at the repeated
+  `edit_file` error cap on it. The model reproduces a long block with
+  a wrapped doc line or a trailing space; its first and last lines
+  are right. `new` replaces the block, so `old`'s interior only
+  locates it.
+- **What.** Before failing: match after whitespace normalisation; then
+  match by first and last lines when the pair is unique and the span
+  is within three lines of `old`'s length. The success output says
+  which, and how many interior lines differed.
+- **Why.** The stall think does not fix a transcription error; the
+  harness can.
+- **Measure.** Qwen long: `edit_file` error caps at zero; landing up.
+
 ### 55. The router's bare `done` is routed by state
-- **Status.** Proposed. Evidence: Qwen opens 15 of 16 short runs on
+- **Status.** Committed (Milestone 61). Measured next on build 36, Qwen. Evidence: Qwen opens 15 of 16 short runs on
   each of builds 33 to 35, and 9 of 10 long runs on build 34, with
   `done` carrying the task and no `next_skill`; rejected, retried
   with `plan`. One burnt retry and one wasted call per run, against a
@@ -373,7 +389,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** rounds per step at most 8; landing unchanged.
 
 ### 53. All-uncited findings are a refusal, not a rejection
-- **Status.** Committed (Milestone 59). Measured next on build 35. Evidence: build 34 Qwen short, `python_method`
+- **Status.** Committed (Milestone 59). Build 35: `failure` parks 0 on 42 runs (2 and 1 on build 34); the refusal never had to fire. Evidence: build 34 Qwen short, `python_method`
   seed 1 and `rename_across_files` seed 1, each rejected three times
   for findings with no `file:line` citation and parked as `failure`
   with the crate green on disk; build 32 gemma `rename_across_files`

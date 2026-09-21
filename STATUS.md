@@ -55,9 +55,11 @@ Unpushed since: items 49 to 53 (Milestones 55 to 59), the item 49
   unlanded by statie with any model.
 
 ## Running now
-Build 35 (item 53 and the item 49 fix) on the host: Qwen short, gemma
-short, Qwen long. Check: `parked(failure)` with the crate green at
-zero on both models; long at or above 8 of 10.
+Build 35 done: Qwen short 15, gemma 16, Qwen long 6 of 10, no
+`failure` park. Build 36 (items 54 and 55) queued. Items 56 (drifted
+`old` matched by its anchors) in flight. Gates must not run during a
+battery when time is the question: the sandboxes' cargo shares this
+machine.
 
 ## Open threads
 - Push is yours.

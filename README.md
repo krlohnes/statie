@@ -1988,6 +1988,19 @@ either a default or a config knob:
   cap, at 1,100 and 1,300 s. Time: Qwen short 99 s a run, long 433 s,
   with `peval` 0.39 and 0.60 (0.40 on build 33): the host again.
 
+  Build 35 (item 53 and the item 49 `next_skill` fix): Qwen short 15
+  of 16, gemma short 16 of 16 with zero rejections, Qwen long 6 of 10.
+  No `failure` park on 42 runs against three on build 34, which is
+  what the two changes were for. Qwen long's misses: three runs at the
+  repeated `edit_file` error cap, `old` reproduced with drift inside a
+  long block (item 56), and one `trap_interest` timeout with model
+  calls of 300 s. Time is unreadable on this build: gates ran on this
+  machine during the batteries, and the sandboxes' `cargo test` shares
+  it; gemma's median step gap was 4.1 s against 3.7 on build 31 while
+  the battery took twice as long. Landing on the long tasks moves by
+  two runs between builds with nothing changed on that path (6, 8, 6),
+  so two seeds do not separate a long-task change either way.
+
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

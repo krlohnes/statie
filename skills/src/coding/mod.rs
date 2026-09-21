@@ -4526,6 +4526,104 @@ fn done_not_ours_note(
     Some(note.to_string())
 }
 
+/// The prefix of [`router_bare_done_routes`]'s returned note, followed by
+/// the chosen skill in backticks, a colon and space, and one of that
+/// function's four reason strings. `pub const` (D13) so tests import the
+/// exact text instead of duplicating it.
+pub const ROUTER_ROUTED_NOTE_PREFIX: &str =
+    "`done` named no skill; the harness routed it by state to ";
+
+/// Item 55: Qwen's first router step in nearly every run sent `{"patch":
+/// {"task": "..."}, "action": {"type": "done"}}` -- a bare `done`, no
+/// `next_skill` at all. `validate_default`'s handoff rule
+/// (`core/src/skill.rs`) rejects that outright ("action `done` is only
+/// valid when the workspace is terminal or hands off"), burning a retry and
+/// a model call before the retry resent the same patch with `next_skill:
+/// "plan"` added: 15 of 16 Qwen short runs on each of builds 33, 34 and 35,
+/// 9 of 10 Qwen long runs on build 34 (gemma 0). The router's own spec
+/// already tells the model exactly how to pick the next skill from the
+/// workspace (`RouterSkill::spec`'s "Decide the next skill" bullet) --
+/// there is no ambiguity to ask the model to resolve, so the harness routes
+/// a bare `done` by that same rule itself instead of spending a retry on
+/// it.
+///
+/// Called in `RouterSkill::validate` AFTER `router_done_not_ours_note` (so
+/// a `done: true` case is already resolved -- either stripped-and-converted
+/// to `Continue`, in which case the action is no longer `Done` and this
+/// does not fire, or stripped-with-a-named-handoff, which already has a
+/// `next_skill` and so also does not match this function's guard) and
+/// BEFORE `validate_default` (so a bare `done` never reaches the rejection
+/// this function exists to avoid).
+///
+/// Fires when all of these hold:
+/// - `out.action()` is `Action::Done`.
+/// - The merged (post-patch) workspace's `done` is `false` (a `done: true`
+///   case is `router_done_not_ours_note`'s alone; by the time this runs
+///   that function has already stripped `done` from the raw patch, so the
+///   merge recomputed here always reads `false` in practice -- this guard
+///   just keeps the two functions' contracts independent).
+/// - The merged `next_skill` is `None` or `Some("router")` (a self-handoff
+///   is not a real one -- `has_named_handoff` gives it the same "strip and
+///   treat as absent" treatment `implement_bare_done` relies on elsewhere).
+///   Any other named skill is a real handoff already, so this leaves it
+///   alone.
+///
+/// Effect: inserts `next_skill` into the RAW patch, choosing the target
+/// from the merged workspace in the same order the router's spec
+/// describes:
+/// 1. `plan` is empty -> `"plan"`, reason "the plan is empty."
+/// 2. Otherwise, the first step that is `pending`/`in_progress` (plan
+///    order) -> `"implement"`, reason "plan step {id} is open." with that
+///    step's own id.
+/// 3. Otherwise (every step `done`/`skipped`), `findings` is non-empty ->
+///    `"implement"`, reason "findings are open."
+/// 4. Otherwise -> `"review"`, reason "the plan is done and unreviewed."
+///
+/// The action stays `Done` -- this is a real handoff, not a refusal; only
+/// `implement`/`review` get to decide what happens next. Returns
+/// [`ROUTER_ROUTED_NOTE_PREFIX`] plus the chosen skill in backticks, a
+/// colon and space, and the reason.
+///
+/// A patch that fails to deserialize/apply is left alone (`None`): it falls
+/// straight through to `validate_default`, which reports the real error.
+fn router_bare_done_routes(
+    cur: &CodingWorkspace,
+    out: &mut statie_core::ParsedOutput<CodingWorkspace>,
+) -> Option<String> {
+    if !matches!(out.action(), statie_core::Action::Done) {
+        return None;
+    }
+    let merged = merged_workspace(cur, out)?;
+    if merged.done {
+        return None;
+    }
+    if has_named_handoff("router", &merged, out) {
+        return None;
+    }
+
+    let (target, reason) = if merged.plan.is_empty() {
+        ("plan", "the plan is empty.".to_string())
+    } else if let Some(open) = merged
+        .plan
+        .iter()
+        .find(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))
+    {
+        ("implement", format!("plan step {} is open.", open.id))
+    } else if !merged.findings.is_empty() {
+        ("implement", "findings are open.".to_string())
+    } else {
+        ("review", "the plan is done and unreviewed.".to_string())
+    };
+
+    let obj = out.patch_mut().0.as_object_mut()?;
+    obj.insert(
+        "next_skill".to_string(),
+        serde_json::Value::String(target.to_string()),
+    );
+
+    Some(format!("{ROUTER_ROUTED_NOTE_PREFIX}`{target}`: {reason}"))
+}
+
 /// `absorb_report` shared by every coding skill: insert the finished child's
 /// `Report` under its own agent name, overwriting any earlier report for
 /// that same child. The workspace is otherwise untouched -- the model reads
@@ -4878,7 +4976,9 @@ impl Skill for RouterSkill {
              When to hand off: always, in a single step. Ack every inbox item you read, \
              then set action `done`. Do not leave the router activation without a \
              `next_skill` set. The router cannot ask the user anything; if the task is \
-             unclear, hand off to `plan`, which can.\n\n\
+             unclear, hand off to `plan`, which can. A `done` with no `next_skill` is still \
+             routed by the harness using the same rule, so a missed field costs a note, not \
+             a retry.\n\n\
              History is searchable with the `recall` tool, but the router has no tools \
              and should not need it. `recent_summary` is the only memory that survives \
              across steps and across skill handoffs -- keep it current if you touch it."
@@ -4966,7 +5066,10 @@ impl Skill for RouterSkill {
     /// the raw patch, and convert a bare `done` (no `next_skill`) to
     /// `Action::Continue` with the note; a `done` that already names a
     /// `next_skill` keeps handing off, just without ever committing
-    /// `done: true`.
+    /// `done: true`. After that, item 55's `router_bare_done_routes` routes
+    /// any remaining bare `done` (no `next_skill`, or a self-referential
+    /// `"router"`) by state instead of letting `validate_default` reject
+    /// it: see that function's doc for the exact ordering.
     fn validate(
         &self,
         cur: &CommittedState<Self::Workspace>,
@@ -4975,9 +5078,11 @@ impl Skill for RouterSkill {
         let mut notes = strip_harness_owned(&self.harness_owned_fields(), &mut out);
         let note = strip_malformed_next(&cur.agent, &mut out);
         let not_ours_note = router_done_not_ours_note(&cur.agent, &mut out);
+        let routed_note = router_bare_done_routes(&cur.agent, &mut out);
         let step = validate_default::<Self::Workspace, Self::Patch>(self, cur, out)?;
         notes.extend(note);
         notes.extend(not_ours_note);
+        notes.extend(routed_note);
         Ok(if notes.is_empty() {
             step
         } else {

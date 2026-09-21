@@ -11,8 +11,8 @@ use statie_patch::JsonMergePatch;
 use super::{
     CodingWorkspace, Decision, FINDINGS_OPEN_NOTE_PREFIX, FileNote, GroundedFindingsCase,
     INFERRED_TOOL_NOTE_PREFIX, ImplementSkill, OPEN_STEP_NOTE_FIRST, OPEN_STEP_NOTE_REPEAT,
-    PlanSkill, PlanStep, REVIEW_ROUNDS_CAP_QUESTION, ReadFileArgs, ReviewSkill, RouterSkill,
-    STEP_READ_ALREADY_NOTE_PREFIX, SeenFile, StepStatus, TestRecord,
+    PlanSkill, PlanStep, REVIEW_ROUNDS_CAP_QUESTION, ROUTER_ROUTED_NOTE_PREFIX, ReadFileArgs,
+    ReviewSkill, RouterSkill, STEP_READ_ALREADY_NOTE_PREFIX, SeenFile, StepStatus, TestRecord,
     UNGROUNDED_FINDINGS_NOTE_PREFIX, coding_skills, coding_skills_with_delegates,
     common_after_tool, count_lines, failing_test_names, finding_is_grounded, first_error_line,
     has_named_handoff, infer_tool_name, merge_range, parse_edit_header, parse_finding_location,
@@ -565,6 +565,191 @@ fn router_done_true_with_next_skill_keeps_handoff_but_strips_done() {
         "done must not have committed as true even alongside a real handoff"
     );
     assert_eq!(patch.next().next_skill.as_deref(), Some("plan"));
+}
+
+// ---------------------------------------------------------------------
+// Item 55: the router's bare `done` (no `next_skill`, or a self-
+// referential `"router"`) is routed by state instead of being rejected by
+// `validate_default`'s handoff rule. See `router_bare_done_routes`
+// (`skills/src/coding/mod.rs`) for the exact ordering and reasons.
+// ---------------------------------------------------------------------
+
+#[test]
+fn router_bare_done_with_empty_plan_routes_to_plan() {
+    // The live shape: `{"patch": {"task": "..."}, "action": {"type":
+    // "done"}}`, no `next_skill` at all.
+    let skill = RouterSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {"task": "fix the bug"},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("bare done with an empty plan must route, not reject");
+    assert!(
+        matches!(step.action(), Action::Done),
+        "a routed done is a real handoff, not a Continue: {:?}",
+        step.action()
+    );
+    assert_eq!(
+        step.notes(),
+        [format!(
+            "{ROUTER_ROUTED_NOTE_PREFIX}`plan`: the plan is empty."
+        )]
+    );
+    let (patch, _, _) = step.into_parts();
+    assert_eq!(patch.next().next_skill.as_deref(), Some("plan"));
+    assert_eq!(
+        patch.next().task,
+        "fix the bug",
+        "the rest of the patch must have landed"
+    );
+}
+
+#[test]
+fn router_bare_done_with_step_two_open_routes_to_implement_and_notes_step_two() {
+    let skill = RouterSkill::new();
+    let cur = committed(CodingWorkspace {
+        plan: vec![
+            PlanStep {
+                id: 1,
+                text: "first step".to_string(),
+                status: StepStatus::Done,
+            },
+            PlanStep {
+                id: 2,
+                text: "second step".to_string(),
+                status: StepStatus::Pending,
+            },
+        ],
+        ..Default::default()
+    });
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("bare done with an open step must route, not reject");
+    assert!(matches!(step.action(), Action::Done));
+    assert_eq!(
+        step.notes(),
+        [format!(
+            "{ROUTER_ROUTED_NOTE_PREFIX}`implement`: plan step 2 is open."
+        )]
+    );
+    let (patch, _, _) = step.into_parts();
+    assert_eq!(patch.next().next_skill.as_deref(), Some("implement"));
+}
+
+#[test]
+fn router_bare_done_with_all_steps_done_and_findings_open_routes_to_implement() {
+    let skill = RouterSkill::new();
+    let cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 1,
+            text: "only step".to_string(),
+            status: StepStatus::Done,
+        }],
+        findings: vec!["a.rs:1 duplicated doc-comment line".to_string()],
+        ..Default::default()
+    });
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("bare done with open findings must route, not reject");
+    assert!(matches!(step.action(), Action::Done));
+    assert_eq!(
+        step.notes(),
+        [format!(
+            "{ROUTER_ROUTED_NOTE_PREFIX}`implement`: findings are open."
+        )]
+    );
+    let (patch, _, _) = step.into_parts();
+    assert_eq!(patch.next().next_skill.as_deref(), Some("implement"));
+}
+
+#[test]
+fn router_bare_done_with_all_done_and_no_findings_routes_to_review() {
+    let skill = RouterSkill::new();
+    let cur = committed(CodingWorkspace {
+        plan: vec![PlanStep {
+            id: 1,
+            text: "only step".to_string(),
+            status: StepStatus::Done,
+        }],
+        ..Default::default()
+    });
+    let content = json!({
+        "patch": {},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("bare done with a finished plan and no findings must route, not reject");
+    assert!(matches!(step.action(), Action::Done));
+    assert_eq!(
+        step.notes(),
+        [format!(
+            "{ROUTER_ROUTED_NOTE_PREFIX}`review`: the plan is done and unreviewed."
+        )]
+    );
+    let (patch, _, _) = step.into_parts();
+    assert_eq!(patch.next().next_skill.as_deref(), Some("review"));
+}
+
+#[test]
+fn router_done_with_next_skill_already_implement_is_untouched() {
+    let skill = RouterSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {"next_skill": "implement"},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("a done that already names a valid next_skill must validate unchanged");
+    assert!(matches!(step.action(), Action::Done));
+    assert!(
+        step.notes().is_empty(),
+        "no routing note when next_skill was already named: {:?}",
+        step.notes()
+    );
+    let (patch, _, _) = step.into_parts();
+    assert_eq!(patch.next().next_skill.as_deref(), Some("implement"));
+}
+
+#[test]
+fn router_done_with_merged_done_true_keeps_router_done_not_ours_note_unchanged() {
+    // `done: true` is `router_done_not_ours_note`'s case, not this unit's:
+    // that function strips `done` and converts the step to `Continue`
+    // before `router_bare_done_routes` ever sees an action that is still
+    // `Done`, so this test is the regression guard that the new routing
+    // logic left that existing behaviour alone.
+    let skill = RouterSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {"done": true},
+        "action": {"type": "done"},
+        "ack_inbox": []
+    });
+    let step = parse_and_validate(&skill, &cur, content)
+        .expect("router done:true with no next_skill must continue, not reject");
+    let (patch, action, _) = step.into_parts();
+    match action {
+        Action::Continue { note } => {
+            assert!(
+                note.contains("not the router's to set"),
+                "expected the router not-ours note, got: {note}"
+            );
+        }
+        other => panic!("expected Action::Continue, got {other:?}"),
+    }
+    assert!(!patch.next().done, "done must not have committed as true");
 }
 
 #[test]

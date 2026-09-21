@@ -342,6 +342,20 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 54. The eviction loop cuts by what the working set gives up, and is bounded
+- **Status.** Proposed. Evidence: build 34 Qwen long `refactor_signature`
+  seed 1, 714 `working_set_shrunk` entries over 166 steps, 36 rounds on
+  one step with the overage unchanged at 44 each round: the working
+  set is whole windows, a cut of `overage + 64` often frees nothing,
+  and the loop walks the budget down in steps of 108 with a full
+  rebuild each time. Seed 2: 391. `design_fork`: 71 and 158.
+- **What.** When a cut frees less than the overage, the next cut is at
+  least half the budget; at most 8 rounds; one log entry per step
+  with `from`, `to`, `rounds`, `overage`.
+- **Why.** Time and log noise on the runs that already have the least
+  room; the loop's shape, not its purpose.
+- **Measure.** rounds per step at most 8; landing unchanged.
+
 ### 53. All-uncited findings are a refusal, not a rejection
 - **Status.** Committed (Milestone 59). Measured next on build 35. Evidence: build 34 Qwen short, `python_method`
   seed 1 and `rename_across_files` seed 1, each rejected three times

@@ -6263,6 +6263,186 @@ fn implement_leaves_an_unguessable_empty_name_call_alone() {
 }
 
 // ---------------------------------------------------------------------
+// Unit 52: `infer_empty_tool_name`'s path-named branch, bare-path fallback
+// -- a path-named call whose `args`, after the `path` insertion, has `path`
+// as its only key infers `read_file`. Exercised the same way as the unit
+// 32/42 tests above, through `validate` directly.
+// ---------------------------------------------------------------------
+
+#[test]
+fn implement_infers_read_file_from_a_bare_path_named_call() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "src/error.rs",
+            "args": {"path": "src/error.rs"},
+        },
+        "ack_inbox": [],
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "read_file");
+            assert_eq!(args, &json!({"path": "src/error.rs"}));
+        }
+        other => panic!("expected a read_file tool call, got {other:?}"),
+    }
+    assert_eq!(
+        step.notes(),
+        &[format!(
+            "{INFERRED_TOOL_NOTE_PREFIX}`read_file` (the name was `src/error.rs`)."
+        )]
+    );
+}
+
+#[test]
+fn implement_infers_read_file_from_a_path_named_call_with_empty_args() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "src/error.rs",
+            "args": {},
+        },
+        "ack_inbox": [],
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "read_file");
+            assert_eq!(
+                args,
+                &json!({"path": "src/error.rs"}),
+                "path must be inserted from the original name"
+            );
+        }
+        other => panic!("expected a read_file tool call, got {other:?}"),
+    }
+    assert_eq!(
+        step.notes(),
+        &[format!(
+            "{INFERRED_TOOL_NOTE_PREFIX}`read_file` (the name was `src/error.rs`)."
+        )]
+    );
+}
+
+#[test]
+fn implement_leaves_a_path_named_call_with_an_extra_key_unguessed() {
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "src/error.rs",
+            "args": {"path": "src/error.rs", "cmd": "ls"},
+        },
+        "ack_inbox": [],
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(
+                name, "src/error.rs",
+                "an extra key must leave the action untouched"
+            );
+            assert_eq!(args, &json!({"path": "src/error.rs", "cmd": "ls"}));
+        }
+        other => panic!("expected the untouched tool call, got {other:?}"),
+    }
+    assert!(
+        step.notes().iter().all(|n| !n.contains("had no name")),
+        "an unguessable path-named call must get no INFERRED note, got {:?}",
+        step.notes()
+    );
+}
+
+#[test]
+fn implement_leaves_an_empty_name_call_with_a_bare_path_unguessed() {
+    // Unit 52's fallback only applies to the path-named branch (case 2 of
+    // `infer_empty_tool_name`); the empty-name branch (case 1) and
+    // `infer_tool_name` itself are unchanged -- a bare `{"path"}` with an
+    // empty `name` still infers nothing, since it could be a `write_file`
+    // missing `content`.
+    let skill = ImplementSkill::new();
+    let cur = committed(CodingWorkspace::default());
+    let content = json!({
+        "patch": {},
+        "action": {
+            "type": "tool",
+            "name": "",
+            "args": {"path": "src/error.rs"},
+        },
+        "ack_inbox": [],
+    });
+    let step = parse_and_validate(&skill, &cur, content).expect("should not be rejected");
+    match step.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "", "an empty name with a bare path must stay empty");
+            assert_eq!(args, &json!({"path": "src/error.rs"}));
+        }
+        other => panic!("expected a tool call with an empty name, got {other:?}"),
+    }
+    assert!(
+        step.notes().iter().all(|n| !n.contains("had no name")),
+        "an unguessable call must not get the inferred-name note, got {:?}",
+        step.notes()
+    );
+}
+
+#[test]
+fn infer_empty_tool_name_infers_read_file_for_a_bare_path_call_with_no_active_tools() {
+    // `infer_empty_tool_name` never checks whether the INFERRED tool is
+    // active for this skill (only whether `name` itself already names one
+    // of `active`) -- the existing inactive-tool rejection (item 29,
+    // `core/src/session.rs`) handles that separately, at execution time,
+    // through `validate_default`, not here. `RouterSkill::tools()` is
+    // empty (router's `validate` doesn't even wire this function in -- see
+    // its impl), so an empty `active` list, the shape `router` would pass
+    // if it did, stands in for it directly: called with `active: &[]`, the
+    // bare-path fallback still fires the same way it does for `implement`.
+    assert!(
+        RouterSkill::new().tools().is_empty(),
+        "router must have no tools for this case to be meaningful"
+    );
+    let cur = committed(CodingWorkspace::default());
+    let mut out = ParsedOutput::<CodingWorkspace>::parse::<JsonMergePatch<CodingWorkspace>>(raw(
+        0,
+        json!({
+            "patch": {},
+            "action": {
+                "type": "tool",
+                "name": "src/error.rs",
+                "args": {"path": "src/error.rs"},
+            },
+            "ack_inbox": [],
+        }),
+    ))
+    .expect("should parse as valid StepOutput JSON");
+
+    let note = super::infer_empty_tool_name(&[], &cur, &mut out);
+
+    match out.action() {
+        Action::Tool { name, args } => {
+            assert_eq!(name, "read_file");
+            assert_eq!(args, &json!({"path": "src/error.rs"}));
+        }
+        other => panic!("expected a read_file tool call, got {other:?}"),
+    }
+    assert_eq!(
+        note,
+        Some(format!(
+            "{INFERRED_TOOL_NOTE_PREFIX}`read_file` (the name was `src/error.rs`)."
+        ))
+    );
+}
+
+// ---------------------------------------------------------------------
 // Unit 51: `ask_user_permission_note`, case (b'') of the
 // `ask_user_empty_note`/`ask_user_statement_note`/`ask_user_permission_note`
 // chain -- a real question (contains `?`, so the first two siblings leave

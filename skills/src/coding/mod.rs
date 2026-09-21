@@ -1285,10 +1285,24 @@ fn looks_like_path(name: &str) -> bool {
 ///    `{path}` call gets the shape [`infer_tool_name`] needs); inference
 ///    then runs on `args` as usual. If it returns a tool, the action's name
 ///    becomes that tool (the original `name` is preserved in the note, not
-///    overwritten) and the note names both; if it returns `None`, the
-///    action -- including `name` -- is left exactly as it was, so the
-///    existing empty/inactive-tool rejection (`core/src/session.rs`, item
-///    29) still fires on the untouched path-shaped name.
+///    overwritten) and the note names both. Unit 52: if [`infer_tool_name`]
+///    returns `None` here but `args`, after the `path` insertion, has
+///    `path` as its only key (a string) -- a bare path-named call with no
+///    other arguments -- `read_file` is inferred directly, same note
+///    format. Bench `qwen_json_long_b33`/`_b28`/`qwen_json_short_b33`: Qwen
+///    sends exactly `{"name": "src/error.rs", "args": {"path":
+///    "src/error.rs"}}` (12 calls in 4 of 10 runs, 11 in 5 runs, 5 in 3
+///    runs), and two of build 33's four long-task parks are
+///    `non_progress_cap: repeated tool error: <not a tool>` on this shape
+///    alone -- unlike the empty-name case, a path-named bare `{path}` call
+///    can't plausibly be anything other than a read: the model already
+///    spent the name slot on the path, so there is no ambiguity with
+///    `write_file` the way there is for an empty name (see
+///    [`infer_tool_name`]'s doc for that case). If `args` carries any other
+///    key and inference still finds nothing, the action -- including
+///    `name` -- is left exactly as it was, so the existing
+///    empty/inactive-tool rejection (`core/src/session.rs`, item 29) still
+///    fires on the untouched path-shaped name.
 ///
 /// Neither case checks whether the inferred tool itself is active for this
 /// skill -- the existing inactive-tool rejection (item 29) handles that,
@@ -1326,7 +1340,22 @@ fn infer_empty_tool_name(
             serde_json::Value::String(original.clone()),
         );
     }
-    let inferred = infer_tool_name(&args)?;
+    let inferred = match infer_tool_name(&args) {
+        Some(t) => t,
+        None => {
+            // Unit 52: a bare path-named call -- `args` (after the `path`
+            // insertion above) has `path` as its only key, and that key's
+            // value is a string -- can only be a read.
+            let is_bare_path = args.as_object().is_some_and(|obj| {
+                obj.len() == 1 && obj.get("path").is_some_and(serde_json::Value::is_string)
+            });
+            if is_bare_path {
+                "read_file"
+            } else {
+                return None;
+            }
+        }
+    };
     out.set_action(statie_core::Action::Tool {
         name: inferred.to_string(),
         args,

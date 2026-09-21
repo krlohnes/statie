@@ -2300,3 +2300,22 @@ path, the mid-sentence phrase) and `skills/tests/it/permission_ask.rs`
 (after a tool error the ask commits as `continued` with the exact note
 and the next `edit_file` runs; a real question still parks).
 \n
+
+## Milestone 58: a path-named call with only a path is a read (BACKLOG.md item 52)
+
+In `infer_empty_tool_name`'s path-named branch (`skills/src/coding/mod.rs`),
+when `infer_tool_name` names nothing and the args, after the name has
+been inserted as `path`, hold `path` as their only key with a string
+value, the call is `read_file`, with the branch's existing
+`INFERRED_TOOL_NOTE_PREFIX` note. The empty-name branch and
+`infer_tool_name` are unchanged: an empty name with a lone path still
+infers nothing, since it could be a `write_file` missing its content.
+
+Evidence: Qwen's `{"name": "src/error.rs", "args": {"path": ...}}`,
+12 calls in 4 runs on build 33's long battery and two of its four
+parks. Tests: five unit tests (the bare shape, empty args, an extra
+key stays unnamed, the empty-name shape stays unnamed, an empty active
+list) and the end-to-end test in `skills/tests/it/infer_tool.rs`,
+whose bare-path case now asserts the read and the file's contents in
+the next prompt instead of the item 29 rejection it asserted before.
+

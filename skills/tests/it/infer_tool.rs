@@ -554,18 +554,24 @@ async fn implement_path_named_call_with_its_own_path_key_runs_edit_file() {
     );
 }
 
-// (c) `name: "src/lib.rs"`, `args: {}` is rejected with today's exact
-// item-29 not-available text: inference finds nothing to guess from an
-// empty `args` object even after a `path` would have been inserted (there
-// is nothing else in `args` for any rule to match), so the action --
-// including `name` -- is left exactly as sent, and no INFERRED note is
-// attached.
+// (c) Unit 52: `name: "src/lib.rs"`, `args: {}` now runs `read_file`: after
+// `path` is inserted from the original `name`, `args` is `{"path":
+// "src/lib.rs"}` -- `path` as its only key, a bare path-named call that can
+// only be a read (see `infer_empty_tool_name`'s doc, unit 52) -- so
+// inference no longer falls through to the item-29 rejection the way it
+// used to when this shape returned `None`. The committed action is
+// `read_file` and the observation is the file's contents.
 
 #[tokio::test]
-async fn implement_path_named_call_with_empty_args_gets_the_item_29_rejection_unchanged() {
+async fn implement_path_named_call_with_empty_args_infers_read_file() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "fn lib() {}\n").unwrap();
 
-    let turns = vec![path_named_tool_turn("src/lib.rs", json!({}))];
+    let turns = vec![
+        path_named_tool_turn("src/lib.rs", json!({})),
+        ask_user_turn(),
+    ];
     let model = Arc::new(MockModel::new(turns));
     let (mut session, log) = make_file_tools_session(Arc::clone(&model), config(&root));
 
@@ -576,28 +582,42 @@ async fn implement_path_named_call_with_empty_args_gets_the_item_29_rejection_un
     let outcome = log.append_record(rec).unwrap();
     assert!(matches!(outcome, Outcome::Continue), "got {outcome:?}");
 
-    let payload = tool_rejected_payload(&log).expect("expected a tool_rejected system log entry");
+    let (name, args) = last_action(&log);
     assert_eq!(
-        payload.get("name").and_then(Value::as_str),
-        Some("src/lib.rs")
+        name, "read_file",
+        "the bare path-named call must run as read_file"
     );
-    assert_eq!(payload.get("skill_with_tool"), Some(&Value::Null));
+    assert_eq!(args, json!({"path": "src/lib.rs"}));
 
-    let active_tools = ImplementSkill::new().tools();
-    let expected = format!(
-        "tool `src/lib.rs` is not available in skill `implement`; available tools: \
-         {active_tools:?}. There is no tool by that name; if `src/lib.rs` is a path, it belongs \
-         in `args`."
-    );
-    assert_eq!(
-        payload.get("reason").and_then(Value::as_str),
-        Some(expected.as_str())
-    );
-
-    let notes = note_texts(&log);
+    let sys_entries = log.entries(Some(LogKind::System), 10_000);
+    let tool_error = sys_entries
+        .iter()
+        .any(|e| e.payload.get("event").and_then(Value::as_str) == Some("tool_error"));
     assert!(
-        notes.is_empty(),
-        "an unguessable path-named call must get no INFERRED note, got {notes:?}"
+        !tool_error,
+        "the inferred read_file must not be refused: {sys_entries:?}"
+    );
+    let tool_rejected = tool_rejected_payload(&log);
+    assert!(
+        tool_rejected.is_none(),
+        "read_file is active for implement, so no rejection: {tool_rejected:?}"
+    );
+
+    let rec2 = active.step(Event::Tick, &mut NullSink).await.unwrap();
+    log.append_record(rec2).unwrap();
+
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 2, "expected two model calls");
+    let second = &prompts[1].user;
+    let expected_note =
+        format!("{INFERRED_TOOL_NOTE_PREFIX}`read_file` (the name was `src/lib.rs`).");
+    assert!(
+        second.contains(&expected_note),
+        "expected the exact INFERRED note in the second prompt:\n{second}\n\nnote:\n{expected_note}"
+    );
+    assert!(
+        second.contains("fn lib() {}"),
+        "expected the observation to carry the file's contents:\n{second}"
     );
 }
 

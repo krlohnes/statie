@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 52. A path-named call with only a path is a read
-- **Status.** Proposed. Evidence: Qwen sends `{"name": "src/error.rs",
+- **Status.** Committed (Milestone 58). Measured next on build 34, Qwen short and long. Evidence: Qwen sends `{"name": "src/error.rs",
   "args": {"path": "src/error.rs"}}`: 12 such calls in 4 of 10 runs on
   build 33's long battery, 11 in 5 on build 28's, 5 in 3 runs on
   build 33's short one. Item 42 named the path-plus-offset shape and

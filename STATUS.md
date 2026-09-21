@@ -1,4 +1,4 @@
-# Status, 2026-09-21, morning
+# Status, 2026-09-21, paused mid-morning
 
 ## Where the code is
 Pushed through `099c130` (items 28 to 48, builds through 32 short).
@@ -55,11 +55,20 @@ Unpushed since: items 49 to 56 (Milestones 55 to 62), the item 49
   unlanded by statie with any model.
 
 ## Running now
-Build 36 (items 54, 55) done: Qwen short 16, gemma 15, Qwen long 7 of
-10; rejections down to 1 and 3 a battery; eviction rounds at most 5.
-Build 37 (item 56, the anchored `old` match) on the host, Qwen long
-first. Check: "old text not found" and its cap well down; long at or
-above 7 of 10. Gates must not run during a
+Nothing on the host. Build 37 (item 56, the anchored `old` match) was
+stopped at the pause after 9 of its 10 Qwen long runs: 6 landed of 9
+(the tenth, `trap_interest` seed 2, never ran), kept as
+`bench-runs/qwen_json_long_b37_partial`. "old text not found" errors
+7 on those 9 runs against 26 on build 36's 10, the anchored match
+fired 3 time(s); parks: no green in 16 test runs. Item 56 is not yet written up in
+README.md.
+
+## Resume with
+1. Write build 37's partial into README.md and BACKLOG.md item 56;
+   decide whether to rerun the long battery whole.
+2. Build 37 short batteries (Qwen, gemma) for item 56 on the short
+   tasks, `$S/statie-b37` is the binary.
+3. Push is yours: main is ahead of `099c130` by items 49 to 56. Gates must not run during a
 battery when time is the question: the sandboxes' cargo shares this
 machine.
 

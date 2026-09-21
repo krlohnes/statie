@@ -342,6 +342,22 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 55. The router's bare `done` is routed by state
+- **Status.** Proposed. Evidence: Qwen opens 15 of 16 short runs on
+  each of builds 33 to 35, and 9 of 10 long runs on build 34, with
+  `done` carrying the task and no `next_skill`; rejected, retried
+  with `plan`. One burnt retry and one wasted call per run, against a
+  cap of three. gemma never does it.
+- **What.** In the router, a `done` naming no skill on an unfinished
+  workspace is routed by state: empty plan to `plan`, an open step to
+  `implement`, open findings to `implement`, a finished plan to
+  `review`, with a note saying so. A `done` that names a skill is
+  untouched.
+- **Why.** The router exists to make that decision; when the model
+  leaves it blank the state answers it.
+- **Measure.** router rejections at zero on Qwen; one fewer call per
+  run.
+
 ### 54. The eviction loop cuts by what the working set gives up, and is bounded
 - **Status.** Proposed. Evidence: build 34 Qwen long `refactor_signature`
   seed 1, 714 `working_set_shrunk` entries over 166 steps, 36 rounds on

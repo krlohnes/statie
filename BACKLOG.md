@@ -359,7 +359,7 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** review `parked(failure)` at zero on both models.
 
 ### 52. A path-named call with only a path is a read
-- **Status.** Committed (Milestone 58). Measured next on build 34, Qwen short and long. Evidence: Qwen sends `{"name": "src/error.rs",
+- **Status.** Committed (Milestone 58). Build 34, Qwen long: 8 of 10 against 6 of 10, not-a-tool parks 0 against 2; both misses `refactor_signature`. Evidence: Qwen sends `{"name": "src/error.rs",
   "args": {"path": "src/error.rs"}}`: 12 such calls in 4 of 10 runs on
   build 33's long battery, 11 in 5 on build 28's, 5 in 3 runs on
   build 33's short one. Item 42 named the path-plus-offset shape and
@@ -376,7 +376,7 @@ moves the metric it was built for. Ordered within each tier.
   those runs.
 
 ### 51. A permission ask is not a question
-- **Status.** Committed (Milestone 57). Measured next on build 34, Qwen short. Evidence: three Qwen parks on builds 32 and
+- **Status.** Committed (Milestone 57). Build 34: never fired on 42 runs (Qwen sent no permission ask); Qwen short 16 of 16. Kept for the shape build 33 showed. Evidence: three Qwen parks on builds 32 and
   33 (`new_module`, `add_struct_field`, `match_arms`), each an
   `ask_user` proposing the next edit and asking leave to make it
   ("Would you like me to proceed with this change now?"), each right

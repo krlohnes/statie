@@ -1,9 +1,9 @@
-# Status, 2026-09-21, early morning
+# Status, 2026-09-21, morning
 
 ## Where the code is
 Pushed through `099c130` (items 28 to 48, builds through 32 short).
-Unpushed since: items 49 to 52 (Milestones 55 to 58), build 33, and
-the item 51 and 52 briefs. Items 36 and 41 were committed and reverted
+Unpushed since: items 49 to 53 (Milestones 55 to 59), the item 49
+`next_skill` fix, builds 33 and 34. Items 36 and 41 were committed and reverted
 (D26, D28). Tree clean. Gate: 16 binaries, 12 to 19 minutes.
 
 ## Committed since the pause
@@ -33,24 +33,31 @@ the item 51 and 52 briefs. Items 36 and 41 were committed and reverted
 - Item 51 (Milestone 57): a permission ask ("Would you like me to
   proceed?") is a refusal, not a park. Item 52 (Milestone 58): a call
   named by its file path with only the path is a read. Both from
-  build 33's Qwen parks; measured on build 34.
+  build 33's Qwen parks. Build 34: Qwen short 16 of 16, gemma 16 of
+  16, Qwen long 8 of 10 (best yet; not-a-tool parks 0 against 2).
+- Item 53 (Milestone 59): all-uncited review findings are a refusal,
+  not a rejection; review runs the refusal think. From build 34's two
+  Qwen `failure` parks with the crate green. Measured on build 35.
 - Item 33's 8-window rows at 16k: landing unmoved; default stays
   4 windows at 6,000; 24k rows not run.
 
 ## Where statie stands against OpenCode
-- Short tasks, 16k: gemma 16 of 16 on three batteries running
-  (OpenCode 16); Qwen 14 to 16 of 16 (OpenCode 14). Time: gemma 66 to
-  88 s a run against 21; Qwen 54 to 71 s against 15. The host's prompt
-  eval got half again slower for gemma from build 32 on at unchanged
-  prompt size, so time is read with `peval` now.
+- Short tasks, 16k: gemma 16 of 16 on four batteries running
+  (OpenCode 16); Qwen 16 of 16 on build 34 (OpenCode 14). Time: gemma
+  66 to 88 s a run against 21; Qwen 54 to 99 s against 15. The host's
+  prompt eval varies by half across batteries at unchanged prompt
+  size, so time is read with `peval`.
+- Long tasks, Qwen, 16k: 8 of 10 on build 34 (OpenCode 6 of 10 at
+  16k, 10 of 10 at 32k). `refactor_signature` is the only unlanded
+  task, at the no-green and step caps.
 - Long tasks, Qwen, 16k: 6 of 10 (OpenCode 6 of 10 at a 16k limit,
   10 of 10 at 32k). Time: 261 s against 53. `refactor_signature` is
   unlanded by statie with any model.
 
 ## Running now
-Build 34 (items 51 and 52) on the host: Qwen short, then gemma short,
-then Qwen long. Check: Qwen short permission parks at zero; Qwen long
-not-a-tool parks at zero.
+Build 35 (item 53 and the item 49 fix) on the host: Qwen short, gemma
+short, Qwen long. Check: `parked(failure)` with the crate green at
+zero on both models; long at or above 8 of 10.
 
 ## Open threads
 - Push is yours.

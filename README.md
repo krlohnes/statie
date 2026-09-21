@@ -1971,6 +1971,23 @@ either a default or a config knob:
   `refactor_signature` read stall and `trap_interest` at the no-green
   cap. Build 34 carries items 51 and 52.
 
+  Build 34 (items 51, 52: a permission ask is a refusal, a path-named
+  call with only a path is a read): Qwen short 16 of 16, the first
+  full Qwen battery since build 29; gemma short 16 of 16; Qwen long 8
+  of 10, the best long result so far (6 of 10 on builds 28 and 33,
+  OpenCode 6 of 10 at the same 16k). The bare-path rule's target is
+  gone: not-a-tool parks 2 on build 33, 0 here. Neither new rule
+  fired on the short batteries (Qwen sent no permission ask this
+  time), so the two extra Qwen short landings are the model's
+  variance, not the rules. Two runs on each short battery parked as
+  `failure` with the crate green on disk: the review's all-uncited
+  findings rejected three times (item 53), and, on gemma, item 49's
+  refusal rejected four times because it left `next_skill` in the
+  patch (fixed after this build). Qwen long's two misses are both
+  `refactor_signature`, one at the no-green cap and one at the step
+  cap, at 1,100 and 1,300 s. Time: Qwen short 99 s a run, long 433 s,
+  with `peval` 0.39 and 0.60 (0.40 on build 33): the host again.
+
 
 With those in place, the toy task "add `multiply` to a two-function Python
 module so `make test` passes" went from 32+ steps and a killed run to 8 steps

@@ -2365,3 +2365,20 @@ over two runs, 36 on one step with the overage unchanged. Tests in
 the second round (exact budgets); a budget that cannot fit in eight
 rounds stops at eight and falls through to the observation clamp.
 
+## Milestone 61: the router's bare `done` is routed by state (BACKLOG.md item 55)
+
+`router_bare_done_routes` (`skills/src/coding/mod.rs`) runs in
+`RouterSkill::validate` after `router_done_not_ours_note`: a `done`
+on an unfinished workspace with no named handoff gets `next_skill`
+from the merged state, in order: empty plan to `plan`, an open step to
+`implement`, open findings to `implement`, otherwise `review`. The
+action stays `done`; the note is `ROUTER_ROUTED_NOTE_PREFIX`, the
+skill, and the reason. The router's spec says so in one sentence.
+
+Evidence: Qwen opened 15 of 16 short runs on builds 33 to 35 and 9 of
+10 long runs on build 34 with that shape, each a rejection and a
+retry. Tests: six unit tests (the four routes with exact notes, a
+named handoff untouched, a `done: true` still the not-ours rule) and
+`skills/tests/it/router.rs`, whose bare-`done` case now asserts the
+handoff to `plan` with no rejection and a second activation in `plan`.
+

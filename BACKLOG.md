@@ -342,6 +342,22 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 53. All-uncited findings are a refusal, not a rejection
+- **Status.** Proposed. Evidence: build 34 Qwen short, `python_method`
+  seed 1 and `rename_across_files` seed 1, each rejected three times
+  for findings with no `file:line` citation and parked as `failure`
+  with the crate green on disk; build 32 gemma `rename_across_files`
+  seed 2 twice. The rejection discards the patch and burns a retry;
+  the model sends the same uncited findings again.
+- **What.** When every finding is uncited, keep the patch minus the
+  findings, refuse with a note quoting the dropped findings and the
+  `path:line:` form, and strip `next_skill`. Wire item 47's refusal
+  think into `review`, so the second strike is a question and the
+  third the cap.
+- **Why.** Every other shape the model repeats gets a note with its
+  patch kept; this one alone still gets the retry cap.
+- **Measure.** review `parked(failure)` at zero on both models.
+
 ### 52. A path-named call with only a path is a read
 - **Status.** Committed (Milestone 58). Measured next on build 34, Qwen short and long. Evidence: Qwen sends `{"name": "src/error.rs",
   "args": {"path": "src/error.rs"}}`: 12 such calls in 4 of 10 runs on

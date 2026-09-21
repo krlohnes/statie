@@ -342,6 +342,23 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 52. A path-named call with only a path is a read
+- **Status.** Proposed. Evidence: Qwen sends `{"name": "src/error.rs",
+  "args": {"path": "src/error.rs"}}`: 12 such calls in 4 of 10 runs on
+  build 33's long battery, 11 in 5 on build 28's, 5 in 3 runs on
+  build 33's short one. Item 42 named the path-plus-offset shape and
+  deliberately left the bare path unnamed; two of build 33's four
+  long-task parks are `repeated tool error: <not a tool>` on the bare
+  shape, repeated to the cap.
+- **What.** In the path-named branch of `infer_empty_tool_name`
+  only: a call whose name is a path and whose args are a lone `path`
+  is `read_file`. An empty name with a lone path stays unnamed (it
+  could be a `write_file` missing its content).
+- **Why.** Reading is the only thing a call with nothing but a path
+  can mean when the model has put the file where the tool goes.
+- **Measure.** Qwen long: `<not a tool>` parks at zero; landing up by
+  those runs.
+
 ### 51. A permission ask is not a question
 - **Status.** Committed (Milestone 57). Measured next on build 34, Qwen short. Evidence: three Qwen parks on builds 32 and
   33 (`new_module`, `add_struct_field`, `match_arms`), each an

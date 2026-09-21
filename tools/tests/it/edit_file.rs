@@ -2,7 +2,10 @@ use super::support;
 
 use serde_json::json;
 use statie_core::{Tool, ToolError};
-use statie_tools::{EditFile, OLD_NOT_FOUND_PREFIX, OLD_NOT_FOUND_SUFFIX, WRONG_FORM_MSG};
+use statie_tools::{
+    EditFile, OLD_MATCHED_BY_ANCHORS_PREFIX, OLD_NOT_FOUND_PREFIX, OLD_NOT_FOUND_SUFFIX,
+    WRONG_FORM_MSG,
+};
 
 fn edit_tool() -> EditFile {
     EditFile {
@@ -2305,4 +2308,156 @@ async fn old_not_found_error_matches_the_consts_the_description_quotes() {
         }
         other => panic!("expected ExecutionFailed, got: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn old_with_interior_drift_matches_by_first_and_last_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("drift.rs");
+    // File's line 3 ("let y = 99;") differs in content (not just
+    // whitespace) from `old`'s line 3 ("let y = 2;"), so exact, per-line
+    // whitespace-tolerant and collapsed-whitespace matching all fail. The
+    // first and last lines are exact, so the anchored (tier (b)) fallback
+    // finds a unique 6-line span.
+    let content = "fn example() {\n    let x = 1;\n    let y = 99;\n    let z = 3;\n    println!(\"{}\", x);\n}\n";
+    std::fs::write(&file, content).unwrap();
+
+    let old = "fn example() {\n    let x = 1;\n    let y = 2;\n    let z = 3;\n    println!(\"{}\", x);\n}";
+    let new = "fn example() {\n    let x = 1;\n    let y = 42;\n    let z = 3;\n    println!(\"{}\", x);\n}";
+
+    let out = edit_tool()
+        .call(json!({"path": "drift.rs", "old": old, "new": new}), &ctx)
+        .await
+        .unwrap();
+    let text = out.to_string();
+
+    let expected_suffix =
+        format!("{OLD_MATCHED_BY_ANCHORS_PREFIX}1-6; 1 interior line(s) differed from the file)");
+    assert!(
+        text.ends_with(&expected_suffix),
+        "output did not end with the expected anchors suffix.\nexpected suffix: {expected_suffix}\ngot: {text}"
+    );
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    let expected = "fn example() {\n    let x = 1;\n    let y = 42;\n    let z = 3;\n    println!(\"{}\", x);\n}\n";
+    assert_eq!(on_disk, expected);
+}
+
+#[tokio::test]
+async fn old_anchored_match_with_two_candidate_spans_is_todays_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("ambiguous_anchors.rs");
+    // Two separate 4-line blocks share the same first and last (trimmed)
+    // lines, so the anchored fallback finds two candidate spans and must
+    // fall through to today's not-found error rather than guess.
+    let content = "    let x = 1;\n    let y = 2;\n    let q = 111;\n    println!(\"{}\", x);\n    let x = 1;\n    let y = 2;\n    let q = 222;\n    println!(\"{}\", x);\n";
+    std::fs::write(&file, content).unwrap();
+
+    // Interior line drifted so exact/whitespace-tolerant/collapsed
+    // matching all fail, leaving only the anchored tier to consider -- and
+    // it finds both blocks as candidates.
+    let old = "    let x = 1;\n    let y = 2;\n    let q = 999;\n    println!(\"{}\", x);";
+    let new = "    let x = 1;\n    let y = 2;\n    let q = 999;\n    println!(\"{}\", x2);";
+
+    let err = edit_tool()
+        .call(
+            json!({"path": "ambiguous_anchors.rs", "old": old, "new": new}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => {
+            let expected_fixed =
+                format!("{OLD_NOT_FOUND_PREFIX}ambiguous_anchors.rs{OLD_NOT_FOUND_SUFFIX}");
+            assert!(
+                msg.starts_with(&expected_fixed),
+                "got: {msg}, expected prefix: {expected_fixed}"
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content, "file must be unchanged on ambiguity");
+}
+
+#[tokio::test]
+async fn old_of_two_lines_with_drift_is_todays_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("two_line_drift.rs");
+    // `old` has only 2 lines, below tier (b)'s 3-line minimum, so a
+    // content (not whitespace) drift on one of them cannot be recovered by
+    // either fallback tier and must report today's error.
+    let content = "fn f() {\n    let y = 99;\n}\n";
+    std::fs::write(&file, content).unwrap();
+
+    let old = "fn f() {\n    let y = 2;";
+    let new = "fn f() {\n    let y = 42;";
+
+    let err = edit_tool()
+        .call(
+            json!({"path": "two_line_drift.rs", "old": old, "new": new}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => {
+            let expected_fixed =
+                format!("{OLD_NOT_FOUND_PREFIX}two_line_drift.rs{OLD_NOT_FOUND_SUFFIX}");
+            assert!(
+                msg.starts_with(&expected_fixed),
+                "got: {msg}, expected prefix: {expected_fixed}"
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content, "file must be unchanged on error");
+}
+
+#[tokio::test]
+async fn old_anchored_match_span_length_outside_tolerance_is_todays_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = support::ctx_for(dir.path());
+    let file = dir.path().join("span_too_long.rs");
+    // `old` is 4 lines (min tolerated span = 4 - 3 = 1, max = 4 + 3 = 7).
+    // The file's matching first/last-line span is 9 lines wide -- outside
+    // the tolerance -- so the anchored fallback must not match, even
+    // though the first and last lines agree.
+    let content = "fn f() {\n    let a = 1;\n    let b = 1;\n    let c = 1;\n    let d = 1;\n    let e = 1;\n    let g = 1;\n    let h = 1;\n}\n";
+    std::fs::write(&file, content).unwrap();
+
+    let old = "fn f() {\n    let a = 1;\n    let ZZZ = 1;\n}";
+    let new = "fn f() {\n    let a = 1;\n    let ZZZ = 2;\n}";
+
+    let err = edit_tool()
+        .call(
+            json!({"path": "span_too_long.rs", "old": old, "new": new}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        ToolError::ExecutionFailed(msg) => {
+            let expected_fixed =
+                format!("{OLD_NOT_FOUND_PREFIX}span_too_long.rs{OLD_NOT_FOUND_SUFFIX}");
+            assert!(
+                msg.starts_with(&expected_fixed),
+                "got: {msg}, expected prefix: {expected_fixed}"
+            );
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(on_disk, content, "file must be unchanged on error");
 }

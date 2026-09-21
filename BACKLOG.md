@@ -343,7 +343,7 @@ moves the metric it was built for. Ordered within each tier.
   landing rows.
 
 ### 56. `edit_file` locates a drifted `old` by its first and last lines
-- **Status.** Proposed. Evidence: "old text not found" 17, 35 and 23
+- **Status.** Committed (Milestone 62), the anchored match only: the whitespace-normalised match already existed as the tool's tolerant tiers. Measured next on build 37, Qwen long. Evidence: "old text not found" 17, 35 and 23
   times on the Qwen long batteries of builds 33 to 35, in 4 to 6 of
   10 runs; three of build 35's four long misses ended at the repeated
   `edit_file` error cap on it. The model reproduces a long block with

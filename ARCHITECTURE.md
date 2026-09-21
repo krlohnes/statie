@@ -2382,3 +2382,22 @@ named handoff untouched, a `done: true` still the not-ours rule) and
 `skills/tests/it/router.rs`, whose bare-`done` case now asserts the
 handoff to `plan` with no rejection and a second activation in `plan`.
 
+## Milestone 62: `edit_file` locates a drifted `old` by its anchors (BACKLOG.md item 56)
+
+In `tools/src/edit_file.rs`, after the verbatim and whitespace-tolerant
+tiers fail, `anchor_first_last_replace` takes `old`'s first and last
+non-empty lines (trimmed) and finds every pair of file lines (i, j)
+matching them whose span is within three lines of `old`'s length;
+exactly one pair replaces lines i..=j with `new`. The success output
+ends with `OLD_MATCHED_BY_ANCHORS_PREFIX`, the span, and how many
+interior lines of `old` differed from the file. `old` under three
+lines, no pair, or more than one pair fall through to today's error.
+The tool description says a drifted `old` is matched by its first and
+last lines, within the 130-word cap.
+
+Evidence: "old text not found" 17, 35, 23 times on three Qwen long
+batteries; three of build 35's four long misses ended at that error's
+cap. Tests in `tools/tests/it/edit_file.rs`: an interior-drift block
+matches at the right span with the exact suffix; two candidate spans,
+a two-line `old`, and a span outside the tolerance keep today's error.
+

@@ -23,7 +23,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use statie_core::ToolSet;
 
-pub use edit_file::{EditFile, OLD_NOT_FOUND_PREFIX, OLD_NOT_FOUND_SUFFIX, WRONG_FORM_MSG};
+pub use edit_file::{
+    EditFile, OLD_MATCHED_BY_ANCHORS_PREFIX, OLD_NOT_FOUND_PREFIX, OLD_NOT_FOUND_SUFFIX,
+    WRONG_FORM_MSG,
+};
 pub use filter_last::FilterLastToolCall;
 pub use list_files::ListFiles;
 pub use probe::{Probe, ProbeArgs};

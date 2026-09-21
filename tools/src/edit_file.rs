@@ -28,6 +28,16 @@ pub const OLD_NOT_FOUND_PREFIX: &str = "old text not found in ";
 pub const OLD_NOT_FOUND_SUFFIX: &str =
     "; re-read the file and copy the text exactly (whitespace matters)";
 
+/// Prefix of the line appended to the end of the success output when `old`
+/// matched only by its first and last (trimmed) non-empty lines (the
+/// anchor-match fallback, tried after the existing whitespace-tolerant
+/// tiers fail). Followed by `"{start}-{end}"` (the matched file span,
+/// 1-based inclusive) and then
+/// `"; {n} interior line(s) differed from the file)"`, where `n` is the
+/// count of `old`'s interior lines that do not equal (trimmed) the
+/// corresponding file line.
+pub const OLD_MATCHED_BY_ANCHORS_PREFIX: &str = " (old matched by its first and last lines at ";
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EditFileArgs {
     /// Path to the file, relative to the sandbox root. Must already exist
@@ -80,11 +90,11 @@ impl Tool for EditFile {
         static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         DESCRIPTION.get_or_init(|| {
             format!(
-                "Edit part of an existing text file. Give path and new, plus exactly one of: \
-                 old (exact text to replace, occurring once), after or before (a unique anchor \
-                 line new is inserted after/before), or lines (\"START-END\", 1-based, replaced \
-                 by new). Copy old and anchors byte-exact from a read_file window, leading \
-                 whitespace included; an anchor must match exactly one line. content is not an \
+                "Edit part of an existing text file. Give path and new, plus one of: old \
+                 (exact text to replace), after/before (a unique anchor line new goes after/ \
+                 before), or lines (\"START-END\", 1-based). Copy old and anchors byte-exact \
+                 from read_file, leading whitespace included; an anchor must match one line. A \
+                 drifted old is still matched by its first/last lines. content is not an \
                  argument; a whole-file rewrite is write_file. A miss returns \
                  \"{OLD_NOT_FOUND_PREFIX}`path`{OLD_NOT_FOUND_SUFFIX}\". new alone returns \
                  \"{WRONG_FORM_MSG}\""
@@ -210,7 +220,9 @@ impl Tool for EditFile {
         let content = String::from_utf8(bytes)
             .map_err(|_| ToolError::ExecutionFailed(format!("not valid utf-8: {}", args.path)))?;
 
-        let (new_content, start_line, end_line, header) = if let Some(lines_arg) = &args.lines {
+        let (new_content, start_line, end_line, header, tolerant_suffix) = if let Some(lines_arg) =
+            &args.lines
+        {
             let (start, end) = parse_lines_range(lines_arg)?;
             let file_lines: Vec<&str> = content.lines().collect();
             let total = file_lines.len();
@@ -248,6 +260,7 @@ impl Tool for EditFile {
                 start,
                 start + new.matches('\n').count(),
                 header,
+                None,
             )
         } else if let Some(old) = &args.old {
             let match_positions: Vec<usize> = content
@@ -281,6 +294,7 @@ impl Tool for EditFile {
                             format!(
                                 "note: matched `old` ignoring whitespace differences (lines {start_line}-{end_line}); {header}"
                             ),
+                            None,
                         )
                     }
                     WhitespaceMatch::Multiple(n) => {
@@ -335,6 +349,7 @@ impl Tool for EditFile {
                                 format!(
                                     "note: matched `old` ignoring line breaks and whitespace (lines {start_line}-{end_line}); {header}"
                                 ),
+                                None,
                             )
                         }
                         CollapsedMatch::Multiple(ranges) => {
@@ -356,11 +371,39 @@ impl Tool for EditFile {
                             )));
                         }
                         CollapsedMatch::None => {
-                            let hint = closest_line_hint(&content, old);
-                            return Err(ToolError::ExecutionFailed(format!(
-                                "{OLD_NOT_FOUND_PREFIX}{}{OLD_NOT_FOUND_SUFFIX}{hint}",
-                                args.path
-                            )));
+                            match anchor_first_last_replace(&content, old, &new) {
+                                AnchorMatch::Unique {
+                                    new_content,
+                                    start_line,
+                                    end_line,
+                                } => {
+                                    let header = if new.is_empty() {
+                                        let deleted = end_line - start_line + 1;
+                                        format!(
+                                            "edited {}: deleted {deleted} line(s) (lines {start_line}-{end_line})",
+                                            args.path
+                                        )
+                                    } else {
+                                        format!(
+                                            "edited {}: replaced 1 occurrence (lines {start_line}-{end_line})",
+                                            args.path
+                                        )
+                                    };
+                                    let n =
+                                        interior_diff_count(&content, old, start_line, end_line);
+                                    let suffix = format!(
+                                        "{OLD_MATCHED_BY_ANCHORS_PREFIX}{start_line}-{end_line}; {n} interior line(s) differed from the file)"
+                                    );
+                                    (new_content, start_line, end_line, header, Some(suffix))
+                                }
+                                AnchorMatch::None | AnchorMatch::Multiple => {
+                                    let hint = closest_line_hint(&content, old);
+                                    return Err(ToolError::ExecutionFailed(format!(
+                                        "{OLD_NOT_FOUND_PREFIX}{}{OLD_NOT_FOUND_SUFFIX}{hint}",
+                                        args.path
+                                    )));
+                                }
+                            }
                         }
                     },
                 },
@@ -387,7 +430,7 @@ impl Tool for EditFile {
                             "edited {}: deleted {old_line_count} line(s) (lines {start_line}-{end_line})",
                             args.path
                         );
-                        (new_content, start_line, end_line, header)
+                        (new_content, start_line, end_line, header, None)
                     } else {
                         // The new text spans this many lines (at least 1).
                         let new_line_count = new.matches('\n').count() + 1;
@@ -396,7 +439,7 @@ impl Tool for EditFile {
                             "edited {}: replaced 1 occurrence (lines {start_line}-{end_line})",
                             args.path
                         );
-                        (new_content, start_line, end_line, header)
+                        (new_content, start_line, end_line, header, None)
                     }
                 }
                 n => {
@@ -426,6 +469,7 @@ impl Tool for EditFile {
                     Some(note) => format!("{note}; {header}"),
                     None => header,
                 },
+                None,
             )
         };
 
@@ -452,6 +496,12 @@ impl Tool for EditFile {
         if let Some(note) = brace_balance_note(&args.path, &content, &new_content) {
             out.push_str(&note);
             out.push('\n');
+        }
+        if let Some(suffix) = &tolerant_suffix {
+            if out.ends_with('\n') {
+                out.pop();
+            }
+            out.push_str(suffix);
         }
 
         Ok(ToolOutputFull::new(cap_output(out, self.max_output_bytes)))
@@ -954,6 +1004,151 @@ fn collapsed_whitespace_find(content: &str, needle: &str) -> CollapsedMatch {
 /// collapse internal runs of whitespace to a single space.
 fn normalize_line(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Result of the item-56 `old`-anchor fallback (tried only after exact,
+/// per-line-whitespace-tolerant and collapsed-whitespace matching have all
+/// failed to find a unique window).
+enum AnchorMatch {
+    /// Exactly one match; carries the already-substituted file content and
+    /// the matched window's 1-based (start, end) line range in the
+    /// *original* file.
+    Unique {
+        new_content: String,
+        start_line: usize,
+        end_line: usize,
+    },
+    /// More than one candidate window/pair matched.
+    Multiple,
+    /// No candidate window/pair matched.
+    None,
+}
+
+/// Replace `content`'s lines `start_line..=end_line` (1-based, inclusive)
+/// with `new`, preserving every line outside the span exactly and matching
+/// the trailing-newline behaviour used by the other replace tiers in this
+/// file.
+fn replace_line_span(content: &str, start_line: usize, end_line: usize, new: &str) -> String {
+    let file_lines: Vec<&str> = content.lines().collect();
+    let ends_with_newline = content.ends_with('\n');
+    let mut new_content = String::new();
+    for line in &file_lines[..start_line - 1] {
+        new_content.push_str(line);
+        new_content.push('\n');
+    }
+    new_content.push_str(new);
+    if end_line < file_lines.len() {
+        if !new.ends_with('\n') {
+            new_content.push('\n');
+        }
+        for (i, line) in file_lines[end_line..].iter().enumerate() {
+            new_content.push_str(line);
+            if i + 1 < file_lines[end_line..].len() || ends_with_newline {
+                new_content.push('\n');
+            }
+        }
+    } else if ends_with_newline && !new.ends_with('\n') {
+        new_content.push('\n');
+    }
+    new_content
+}
+
+/// Item-56 fallback: `old` must have at least 3 lines. Let `first`
+/// and `last` be `old`'s first and last non-empty lines, trimmed. Finds
+/// every pair `(i, j)`, `i < j`, of 1-based file line numbers where file
+/// line `i` trimmed equals `first`, file line `j` trimmed equals `last`,
+/// and the span length `j - i + 1` is within `old`'s line count minus 3 to
+/// plus 3 (inclusive, and at least 1). Exactly one such pair replaces file
+/// lines `i..=j` with `new`; zero or more than one yields
+/// [`AnchorMatch::None`] / [`AnchorMatch::Multiple`].
+fn anchor_first_last_replace(content: &str, old: &str, new: &str) -> AnchorMatch {
+    let old_lines: Vec<&str> = old.lines().collect();
+    if old_lines.len() < 3 {
+        return AnchorMatch::None;
+    }
+    let (Some(first), Some(last)) = (
+        old_lines.iter().map(|l| l.trim()).find(|l| !l.is_empty()),
+        old_lines
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty()),
+    ) else {
+        return AnchorMatch::None;
+    };
+    if first.is_empty() || last.is_empty() {
+        return AnchorMatch::None;
+    }
+
+    let file_lines: Vec<&str> = content.lines().collect();
+    let old_len = old_lines.len();
+    let min_span = old_len.saturating_sub(3).max(1);
+    let max_span = old_len + 3;
+
+    let mut candidates: Vec<(usize, usize)> = Vec::new(); // 1-based (i, j)
+    for (i, line_i) in file_lines.iter().enumerate() {
+        if line_i.trim() != first {
+            continue;
+        }
+        for (j, line_j) in file_lines.iter().enumerate().skip(i) {
+            if line_j.trim() != last {
+                continue;
+            }
+            if i == j {
+                continue;
+            }
+            let span = j - i + 1;
+            if span >= min_span && span <= max_span {
+                candidates.push((i + 1, j + 1));
+            }
+        }
+    }
+
+    match candidates.len() {
+        0 => AnchorMatch::None,
+        1 => {
+            let (start_line, end_line) = candidates[0];
+            AnchorMatch::Unique {
+                new_content: replace_line_span(content, start_line, end_line, new),
+                start_line,
+                end_line,
+            }
+        }
+        _ => AnchorMatch::Multiple,
+    }
+}
+
+/// Count of `old`'s interior lines (all lines except the first and last)
+/// that do not equal, trimmed, the corresponding file line in the matched
+/// span `start_line..=end_line`. Lines are paired positionally starting
+/// after the first line on both sides; any of `old`'s interior lines beyond
+/// the matched span's interior length (or vice versa) also count as
+/// differing.
+fn interior_diff_count(content: &str, old: &str, start_line: usize, end_line: usize) -> usize {
+    let old_lines: Vec<&str> = old.lines().collect();
+    if old_lines.len() < 2 {
+        return 0;
+    }
+    let old_interior = &old_lines[1..old_lines.len() - 1];
+
+    let file_lines: Vec<&str> = content.lines().collect();
+    let span_lines = &file_lines[(start_line - 1)..end_line];
+    let span_interior: &[&str] = if span_lines.len() < 2 {
+        &[]
+    } else {
+        &span_lines[1..span_lines.len() - 1]
+    };
+
+    let common = old_interior.len().min(span_interior.len());
+    let mut diff = 0usize;
+    for k in 0..common {
+        if old_interior[k].trim() != span_interior[k].trim() {
+            diff += 1;
+        }
+    }
+    diff += old_interior.len().saturating_sub(common);
+    diff += span_interior.len().saturating_sub(common);
+    diff
 }
 
 /// Try to find a window of lines in `content` whose line count matches

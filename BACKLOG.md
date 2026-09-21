@@ -342,6 +342,26 @@ moves the metric it was built for. Ordered within each tier.
 - **Measure.** Steps to park on `refactor_signature`; no change on the
   landing rows.
 
+### 51. A permission ask is not a question
+- **Status.** Proposed. Evidence: three Qwen parks on builds 32 and
+  33 (`new_module`, `add_struct_field`, `match_arms`), each an
+  `ask_user` proposing the next edit and asking leave to make it
+  ("Would you like me to proceed with this change now?"), each right
+  after one tool error. The message has a `?`, so the statement rule
+  lets it through and the run parks on a human who already asked for
+  the work. 2 of Qwen's 2 misses on build 33.
+- **What.** A third sibling of the empty-ask and statement-ask rules:
+  a question sentence that opens with a permission phrase ("would you
+  like me to", "do you want me to", "shall I", "may I") or asks to
+  proceed is converted to a harness `Continue` with a note saying no
+  permission is needed. Real questions ("Should the default be 3 or
+  5?") are untouched. The second in a row is item 47's.
+- **Why.** The user asked for the work; asking again is a park with
+  nothing to answer, the same shape the statement rule closed for 14
+  of 15 parks on the first live runs.
+- **Measure.** Qwen short: permission parks at zero; landing up by
+  those runs.
+
 ### 50. A plan step that only reads a file already in the working set cannot be finished
 - **Status.** Committed (Milestone 56): a `done` after a redundant read of the first open step's file marks that step done instead of refusing. Measured next on build 33. Evidence: build 32 gemma `trap_rounding` seed
   2, parked at the mixed-shape cap after six alternations of a
